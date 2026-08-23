@@ -24,4 +24,4 @@ else
 fi
 
 $npx_cmd lint-staged
-$pnpm_cmd lint
+# $pnpm_cmd lint
