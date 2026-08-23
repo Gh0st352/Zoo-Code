@@ -6,6 +6,7 @@ type ProviderStubFields = {
 	delegationTransitionLocks?: Map<string, Promise<void>>
 	cancelledDelegationChildIds?: Set<string>
 	log?: ReturnType<typeof vi.fn>
+	syncFocusedTaskToWebview?: ReturnType<typeof vi.fn>
 	taskHistoryStore?: { get: (id: string) => unknown }
 	taskRegistry?: TaskRegistry
 	clineStack?: Task[]
@@ -37,6 +38,7 @@ export function makeProviderStub<T extends object>(stub: T): ClineProvider {
 	s.delegationTransitionLocks ??= new Map()
 	s.cancelledDelegationChildIds ??= new Set()
 	s.log ??= vi.fn()
+	s.syncFocusedTaskToWebview ??= vi.fn().mockResolvedValue(undefined)
 	s.taskHistoryStore ??= { get: () => undefined }
 
 	// Convert legacy clineStack array into a TaskRegistry
