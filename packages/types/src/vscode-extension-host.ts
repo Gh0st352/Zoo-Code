@@ -437,10 +437,9 @@ export type ExtensionState = Pick<
 	arch?: string
 
 	/**
-	 * Monotonically increasing sequence number for clineMessages state pushes.
-	 * When present, the frontend should only apply clineMessages from a state push
-	 * if its seq is greater than the last applied seq. This prevents stale state
-	 * (captured during async getStateToPostToWebview) from overwriting newer messages.
+	 * Last sequence applied by the dedicated task-scoped transcript transport.
+	 * Generic `state` messages intentionally omit this field and `clineMessages`;
+	 * snapshots and append/update messages carry both transcript data and sequence.
 	 */
 	clineMessagesSeq?: number
 }

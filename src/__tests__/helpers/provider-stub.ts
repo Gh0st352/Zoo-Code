@@ -5,6 +5,7 @@ import { type Task } from "../../core/task/Task"
 type ProviderStubFields = {
 	cancelledDelegationChildIds?: Set<string>
 	log?: ReturnType<typeof vi.fn>
+	syncFocusedTaskToWebview?: ReturnType<typeof vi.fn>
 	taskHistoryStore?: { get: (id: string) => unknown; invalidate?: (id: string) => Promise<void> }
 	taskScheduler?: { schedule: (task: Task, run: () => Promise<void>) => Promise<void> }
 	taskRegistry?: TaskRegistry
@@ -36,6 +37,7 @@ export function makeProviderStub<T extends object>(stub: T): ClineProvider {
 	const proto = ClineProvider.prototype as unknown as PrivateProviderMethods
 	s.cancelledDelegationChildIds ??= new Set()
 	s.log ??= vi.fn()
+	s.syncFocusedTaskToWebview ??= vi.fn().mockResolvedValue(undefined)
 	s.taskHistoryStore ??= { get: () => undefined }
 	s.taskHistoryStore.invalidate ??= async () => {}
 	s.taskScheduler ??= { schedule: async (_task, run) => run() }
