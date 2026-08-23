@@ -37,7 +37,12 @@ export interface ExtensionMessage {
 		| "theme"
 		| "workspaceUpdated"
 		| "invoke"
-		| "messageUpdated"
+		| "clineMessageAppended"
+		| "clineMessageUpdated"
+		| "clineMessagesSnapshotStart"
+		| "clineMessagesSnapshotChunk"
+		| "clineMessagesSnapshotEnd"
+		| "messageUpdated" // Legacy: a patched webview requests a full resync instead of applying this.
 		| "mcpServers"
 		| "enhancedPrompt"
 		| "commitSearchResults"
@@ -138,7 +143,13 @@ export interface ExtensionMessage {
 		isActive: boolean
 		path?: string
 	}>
+	taskId?: string
 	clineMessage?: ClineMessage
+	clineMessages?: ClineMessage[]
+	clineMessagesSeq?: number
+	snapshotId?: string
+	snapshotStartIndex?: number
+	snapshotTotal?: number
 	routerModels?: RouterModels
 	openAiModels?: string[]
 	ollamaModels?: ModelRecord
@@ -646,8 +657,11 @@ export interface WebviewMessage {
 		| "openRuleFile"
 		| "openRulesDirectory"
 		| "themeFixtureProbeResponse"
+		| "requestClineMessagesResync"
 	text?: string
 	taskId?: string
+	expectedSeq?: number
+	receivedSeq?: number
 	editedMessageContent?: string
 	tab?: "settings" | "history" | "mcp" | "modes" | "chat" | "marketplace" | "cloud"
 	disabled?: boolean
