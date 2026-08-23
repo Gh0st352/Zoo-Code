@@ -5,6 +5,7 @@ import {
 	type ProviderSettings,
 	type ExperimentId,
 	type ExtensionState,
+	type ExtensionMessage,
 	type ClineMessage,
 	type MarketplaceItem,
 	type MarketplaceInstalledMetadata,
@@ -14,6 +15,13 @@ import {
 } from "@roo-code/types"
 
 import { ExtensionStateContextProvider, useExtensionState, mergeExtensionState } from "../ExtensionStateContext"
+import { vscode } from "@/utils/vscode"
+
+const dispatchExtensionMessage = (message: ExtensionMessage) => {
+	window.dispatchEvent(new MessageEvent("message", { data: message }))
+}
+
+const makeMessage = (ts: number, text: string): ClineMessage => ({ ts, type: "say", say: "text", text })
 
 const TestComponent = () => {
 	const { allowedCommands, setAllowedCommands, soundEnabled, showRooIgnoredFiles, setShowRooIgnoredFiles } =
@@ -98,6 +106,16 @@ const InitialStateTestComponent = () => {
 				marketplaceItems,
 				marketplaceInstalledMetadata,
 			})}
+		</div>
+	)
+}
+
+const TranscriptTestComponent = () => {
+	const { currentTaskId, clineMessages, clineMessagesSeq } = useExtensionState()
+
+	return (
+		<div data-testid="transcript-state">
+			{JSON.stringify({ currentTaskId, clineMessages, clineMessagesSeq: clineMessagesSeq ?? 0 })}
 		</div>
 	)
 }
@@ -396,6 +414,136 @@ describe("ExtensionStateContext", () => {
 			}),
 		)
 	})
+
+	describe("dedicated transcript transport", () => {
+		const readTranscript = () => JSON.parse(screen.getByTestId("transcript-state").textContent!)
+
+		it("reconstructs a snapshot and applies contiguous append and update deltas", () => {
+			render(
+				<ExtensionStateContextProvider initialState={{ currentTaskId: "task-1" }}>
+					<TranscriptTestComponent />
+				</ExtensionStateContextProvider>,
+			)
+
+			const first = makeMessage(1, "first")
+			const second = makeMessage(2, "second")
+			act(() => {
+				dispatchExtensionMessage({
+					type: "clineMessagesSnapshotStart",
+					taskId: "task-1",
+					clineMessagesSeq: 4,
+					snapshotId: "snapshot-1",
+					snapshotTotal: 1,
+				})
+				dispatchExtensionMessage({
+					type: "clineMessagesSnapshotChunk",
+					taskId: "task-1",
+					clineMessagesSeq: 4,
+					snapshotId: "snapshot-1",
+					snapshotStartIndex: 0,
+					clineMessages: [first],
+				})
+				dispatchExtensionMessage({
+					type: "clineMessagesSnapshotEnd",
+					taskId: "task-1",
+					clineMessagesSeq: 4,
+					snapshotId: "snapshot-1",
+					snapshotTotal: 1,
+				})
+				dispatchExtensionMessage({
+					type: "clineMessageAppended",
+					taskId: "task-1",
+					clineMessagesSeq: 5,
+					clineMessage: second,
+				})
+				dispatchExtensionMessage({
+					type: "clineMessageUpdated",
+					taskId: "task-1",
+					clineMessagesSeq: 6,
+					clineMessage: { ...second, text: "updated" },
+				})
+			})
+
+			expect(readTranscript()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: [first, { ...second, text: "updated" }],
+				clineMessagesSeq: 6,
+			})
+		})
+
+		it("ignores transcript fields in generic state and clears transport state on task switch", () => {
+			const existing = makeMessage(1, "existing")
+			render(
+				<ExtensionStateContextProvider
+					initialState={{ currentTaskId: "task-1", clineMessages: [existing], clineMessagesSeq: 3 }}>
+					<TranscriptTestComponent />
+				</ExtensionStateContextProvider>,
+			)
+
+			act(() => {
+				dispatchExtensionMessage({
+					type: "state",
+					state: { clineMessages: [makeMessage(2, "stale")], clineMessagesSeq: 99 },
+				})
+			})
+			expect(readTranscript().clineMessages).toEqual([existing])
+			expect(readTranscript().clineMessagesSeq).toBe(3)
+
+			act(() => {
+				dispatchExtensionMessage({ type: "state", state: { currentTaskId: "task-2" } })
+				dispatchExtensionMessage({
+					type: "clineMessageAppended",
+					taskId: "task-1",
+					clineMessagesSeq: 4,
+					clineMessage: makeMessage(3, "wrong task"),
+				})
+			})
+
+			expect(readTranscript()).toEqual({ currentTaskId: "task-2", clineMessages: [], clineMessagesSeq: 0 })
+		})
+
+		it("requests one resync when a delta sequence has a gap", () => {
+			const postMessage = vi.spyOn(vscode, "postMessage").mockImplementation(() => undefined)
+			try {
+				render(
+					<ExtensionStateContextProvider
+						initialState={{
+							currentTaskId: "task-1",
+							clineMessages: [makeMessage(1, "first")],
+							clineMessagesSeq: 1,
+						}}>
+						<TranscriptTestComponent />
+					</ExtensionStateContextProvider>,
+				)
+				postMessage.mockClear() // Ignore webviewDidLaunch.
+
+				act(() => {
+					dispatchExtensionMessage({
+						type: "clineMessageAppended",
+						taskId: "task-1",
+						clineMessagesSeq: 3,
+						clineMessage: makeMessage(3, "gap"),
+					})
+					dispatchExtensionMessage({
+						type: "clineMessageAppended",
+						taskId: "task-1",
+						clineMessagesSeq: 4,
+						clineMessage: makeMessage(4, "another gap"),
+					})
+				})
+
+				expect(postMessage).toHaveBeenCalledTimes(1)
+				expect(postMessage).toHaveBeenCalledWith({
+					type: "requestClineMessagesResync",
+					taskId: "task-1",
+					expectedSeq: 2,
+					receivedSeq: 3,
+				})
+			} finally {
+				postMessage.mockRestore()
+			}
+		})
+	})
 })
 
 describe("mergeExtensionState", () => {
@@ -466,154 +614,6 @@ describe("mergeExtensionState", () => {
 			imageGeneration: false,
 			runSlashCommand: false,
 			customTools: false,
-		})
-	})
-
-	describe("clineMessagesSeq protection", () => {
-		const baseState: ExtensionState = {
-			version: "",
-			mcpEnabled: false,
-			clineMessages: [],
-			taskHistory: [],
-			shouldShowAnnouncement: false,
-			enableCheckpoints: true,
-			writeDelayMs: 1000,
-			mode: "default",
-			experiments: {} as Record<ExperimentId, boolean>,
-			customModes: [],
-			maxOpenTabsContext: 20,
-			maxWorkspaceFiles: 100,
-			apiConfiguration: {},
-			telemetrySetting: "unset",
-			showRooIgnoredFiles: true,
-			enableSubfolderRules: false,
-			renderContext: "sidebar",
-			cloudUserInfo: null,
-			organizationAllowList: { allowAll: true, providers: {} },
-			autoCondenseContext: true,
-			autoCondenseContextPercent: 100,
-			cloudIsAuthenticated: false,
-			sharingEnabled: false,
-			publicSharingEnabled: false,
-			profileThresholds: {},
-			hasOpenedModeSelector: false,
-			maxImageFileSize: 5,
-			maxTotalImageSize: 20,
-			taskSyncEnabled: false,
-			checkpointTimeout: DEFAULT_CHECKPOINT_TIMEOUT_SECONDS,
-			maxReadFileLine: -1,
-			diffFuzzyThreshold: DEFAULT_DIFF_FUZZY_THRESHOLD,
-		}
-
-		const makeMessage = (ts: number, text: string): ClineMessage =>
-			({ ts, type: "say", say: "text", text }) as ClineMessage
-
-		it("rejects stale clineMessages when seq is not newer", () => {
-			const newerMessages = [makeMessage(1, "hello"), makeMessage(2, "world")]
-			const staleMessages = [makeMessage(1, "hello")]
-
-			const prevState: ExtensionState = {
-				...baseState,
-				clineMessages: newerMessages,
-				clineMessagesSeq: 5,
-			}
-
-			const result = mergeExtensionState(prevState, {
-				clineMessages: staleMessages,
-				clineMessagesSeq: 3, // stale seq
-			})
-
-			// Should keep the newer messages
-			expect(result.clineMessages).toBe(newerMessages)
-			expect(result.clineMessagesSeq).toBe(5)
-		})
-
-		it("rejects clineMessages when seq equals current (not strictly greater)", () => {
-			const currentMessages = [makeMessage(1, "hello"), makeMessage(2, "world")]
-			const sameSeqMessages = [makeMessage(1, "hello")]
-
-			const prevState: ExtensionState = {
-				...baseState,
-				clineMessages: currentMessages,
-				clineMessagesSeq: 5,
-			}
-
-			const result = mergeExtensionState(prevState, {
-				clineMessages: sameSeqMessages,
-				clineMessagesSeq: 5, // same seq, not strictly greater
-			})
-
-			expect(result.clineMessages).toBe(currentMessages)
-			expect(result.clineMessagesSeq).toBe(5)
-		})
-
-		it("accepts clineMessages when seq is strictly greater", () => {
-			const oldMessages = [makeMessage(1, "hello")]
-			const newMessages = [makeMessage(1, "hello"), makeMessage(2, "world")]
-
-			const prevState: ExtensionState = {
-				...baseState,
-				clineMessages: oldMessages,
-				clineMessagesSeq: 3,
-			}
-
-			const result = mergeExtensionState(prevState, {
-				clineMessages: newMessages,
-				clineMessagesSeq: 4, // newer seq
-			})
-
-			expect(result.clineMessages).toBe(newMessages)
-			expect(result.clineMessagesSeq).toBe(4)
-		})
-
-		it("preserves clineMessages when newState does not include them (cloud event path)", () => {
-			const existingMessages = [makeMessage(1, "hello"), makeMessage(2, "world")]
-
-			const prevState: ExtensionState = {
-				...baseState,
-				clineMessages: existingMessages,
-				clineMessagesSeq: 5,
-			}
-
-			// Simulate a cloud event push that omits clineMessages and clineMessagesSeq
-			const result = mergeExtensionState(prevState, {
-				cloudIsAuthenticated: true,
-			})
-
-			expect(result.clineMessages).toBe(existingMessages)
-			expect(result.clineMessagesSeq).toBe(5)
-		})
-
-		it("applies clineMessages normally when neither state has seq (backward compat)", () => {
-			const oldMessages = [makeMessage(1, "hello")]
-			const newMessages = [makeMessage(1, "hello"), makeMessage(2, "world")]
-
-			const prevState: ExtensionState = {
-				...baseState,
-				clineMessages: oldMessages,
-			}
-
-			const result = mergeExtensionState(prevState, {
-				clineMessages: newMessages,
-			})
-
-			expect(result.clineMessages).toBe(newMessages)
-		})
-
-		it("applies clineMessages when prevState has no seq but newState does (first push)", () => {
-			const prevState: ExtensionState = {
-				...baseState,
-				clineMessages: [],
-			}
-
-			const newMessages = [makeMessage(1, "hello")]
-			const result = mergeExtensionState(prevState, {
-				clineMessages: newMessages,
-				clineMessagesSeq: 1,
-			})
-
-			expect(result.clineMessages).toBe(newMessages)
-			expect(result.clineMessagesSeq).toBe(1)
 		})
 	})
 })

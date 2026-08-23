@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useEffect, useState } from "react"
+import React, { createContext, useCallback, useEffect, useRef, useState } from "react"
 
 import {
 	type ProviderSettings,
@@ -12,6 +12,7 @@ import {
 	type CloudOrganizationMembership,
 	type ExtensionMessage,
 	type ExtensionState,
+	type ClineMessage,
 	type MarketplaceInstalledMetadata,
 	type SkillMetadata,
 	type RuleMetadata,
@@ -155,6 +156,14 @@ export interface ExtensionStateContextType extends ExtensionState {
 
 export const ExtensionStateContext = createContext<ExtensionStateContextType | undefined>(undefined)
 
+type ClineMessagesSnapshotBuffer = {
+	snapshotId: string
+	taskId?: string
+	seq: number
+	total: number
+	messages: ClineMessage[]
+}
+
 export const mergeExtensionState = (prevState: ExtensionState, newState: Partial<ExtensionState>) => {
 	const { customModePrompts: prevCustomModePrompts, experiments: prevExperiments, ...prevRest } = prevState
 
@@ -169,21 +178,6 @@ export const mergeExtensionState = (prevState: ExtensionState, newState: Partial
 	const customModePrompts = { ...prevCustomModePrompts, ...(newCustomModePrompts ?? {}) }
 	const experiments = { ...prevExperiments, ...(newExperiments ?? {}) }
 	const rest = { ...prevRest, ...newRest }
-
-	// Protect clineMessages from stale state pushes using sequence numbering.
-	// Multiple async event sources (cloud auth, settings, task streaming) can trigger
-	// concurrent state pushes. If a stale push arrives after a newer one, its clineMessages
-	// would overwrite the newer messages. The sequence number prevents this by only applying
-	// clineMessages when the incoming seq is strictly greater than the last applied seq.
-	if (
-		newState.clineMessagesSeq !== undefined &&
-		prevState.clineMessagesSeq !== undefined &&
-		newState.clineMessagesSeq <= prevState.clineMessagesSeq &&
-		newState.clineMessages !== undefined
-	) {
-		rest.clineMessages = prevState.clineMessages
-		rest.clineMessagesSeq = prevState.clineMessagesSeq
-	}
 
 	// Note that we completely replace the previous apiConfiguration and customSupportPrompts objects
 	// with new ones since the state that is broadcast is the entire objects so merging is not necessary.
@@ -286,6 +280,11 @@ export const ExtensionStateContextProvider: React.FC<{
 	const [state, setState] = useState<ExtensionState>(() =>
 		mergeExtensionState(createInitialExtensionState(), initialState ?? {}),
 	)
+	const activeTaskIdRef = useRef<string | undefined>(state.currentTaskId)
+	const clineMessagesSeqRef = useRef(state.clineMessagesSeq ?? 0)
+	const clineMessagesRef = useRef<ClineMessage[]>(state.clineMessages)
+	const activeSnapshotRef = useRef<ClineMessagesSnapshotBuffer | null>(null)
+	const resyncPendingRef = useRef(false)
 
 	const [didHydrateState, setDidHydrateState] = useState(false)
 	const [showWelcome, setShowWelcome] = useState(false)
@@ -335,13 +334,98 @@ export const ExtensionStateContextProvider: React.FC<{
 		}))
 	}, [])
 
+	const requestClineMessagesResync = useCallback((receivedSeq?: number) => {
+		if (resyncPendingRef.current) {
+			return
+		}
+		resyncPendingRef.current = true
+		vscode.postMessage({
+			type: "requestClineMessagesResync",
+			taskId: activeTaskIdRef.current,
+			expectedSeq: clineMessagesSeqRef.current + 1,
+			receivedSeq,
+		})
+	}, [])
+
+	const applyClineMessagesDelta = useCallback(
+		(message: ExtensionMessage, operation: "append" | "update") => {
+			const seq = message.clineMessagesSeq
+			const clineMessage = message.clineMessage
+			if (message.taskId !== activeTaskIdRef.current) {
+				return
+			}
+			if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0 || !clineMessage) {
+				requestClineMessagesResync(typeof seq === "number" ? seq : undefined)
+				return
+			}
+
+			const snapshot = activeSnapshotRef.current
+			if (snapshot) {
+				// The snapshot already includes all deltas through its sequence. A newer
+				// delta interleaved with it means the stream cannot be applied atomically.
+				if (seq <= snapshot.seq) {
+					return
+				}
+				activeSnapshotRef.current = null
+				requestClineMessagesResync(seq)
+				return
+			}
+			if (seq <= clineMessagesSeqRef.current) {
+				return
+			}
+			if (seq !== clineMessagesSeqRef.current + 1) {
+				requestClineMessagesResync(seq)
+				return
+			}
+
+			let nextMessages: ClineMessage[]
+			if (operation === "append") {
+				nextMessages = [...clineMessagesRef.current, clineMessage]
+			} else {
+				const index = findLastIndex(clineMessagesRef.current, (item) => item.ts === clineMessage.ts)
+				if (index === -1) {
+					requestClineMessagesResync(seq)
+					return
+				}
+				nextMessages = [...clineMessagesRef.current]
+				nextMessages[index] = clineMessage
+			}
+
+			clineMessagesRef.current = nextMessages
+			clineMessagesSeqRef.current = seq
+			setState((prevState) => ({
+				...prevState,
+				clineMessages: nextMessages,
+				clineMessagesSeq: seq,
+			}))
+		},
+		[requestClineMessagesResync],
+	)
+
 	const handleMessage = useCallback(
 		(event: MessageEvent) => {
 			const message: ExtensionMessage = event.data
 			switch (message.type) {
 				case "state": {
-					const newState = message.state ?? {}
-					setState((prevState) => mergeExtensionState(prevState, newState))
+					const {
+						clineMessages: _ignoredMessages,
+						clineMessagesSeq: _ignoredMessagesSeq,
+						...newState
+					} = message.state ?? {}
+					const hasCurrentTaskId = Object.prototype.hasOwnProperty.call(newState, "currentTaskId")
+					const nextTaskId = hasCurrentTaskId ? newState.currentTaskId : activeTaskIdRef.current
+					const taskChanged = hasCurrentTaskId && nextTaskId !== activeTaskIdRef.current
+					if (taskChanged) {
+						activeTaskIdRef.current = nextTaskId
+						clineMessagesSeqRef.current = 0
+						clineMessagesRef.current = []
+						activeSnapshotRef.current = null
+						resyncPendingRef.current = false
+					}
+					setState((prevState) => {
+						const merged = mergeExtensionState(prevState, newState)
+						return taskChanged ? { ...merged, clineMessages: [], clineMessagesSeq: 0 } : merged
+					})
 					setShowWelcome(!checkExistKey(newState.apiConfiguration, newState.zooCodeIsAuthenticated))
 					setDidHydrateState(true)
 					// Update alwaysAllowFollowupQuestions if present in state message
@@ -403,26 +487,142 @@ export const ExtensionStateContextProvider: React.FC<{
 					setCommands(message.commands ?? [])
 					break
 				}
-				case "messageUpdated": {
-					const clineMessage = message.clineMessage!
-					setState((prevState) => {
-						// worth noting it will never be possible for a more up-to-date message to be sent here or in normal messages post since the presentAssistantContent function uses lock
-						const lastIndex = findLastIndex(prevState.clineMessages, (msg) => msg.ts === clineMessage.ts)
-						if (lastIndex !== -1) {
-							const newClineMessages = [...prevState.clineMessages]
-							newClineMessages[lastIndex] = clineMessage
-							return { ...prevState, clineMessages: newClineMessages }
+				case "clineMessagesSnapshotStart": {
+					if (message.taskId !== activeTaskIdRef.current) {
+						break
+					}
+
+					const seq = message.clineMessagesSeq
+					if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) {
+						activeSnapshotRef.current = null
+						requestClineMessagesResync(typeof seq === "number" ? seq : undefined)
+						break
+					}
+					if (seq < clineMessagesSeqRef.current) {
+						break
+					}
+
+					const total = message.snapshotTotal
+					if (!message.snapshotId || typeof total !== "number" || !Number.isSafeInteger(total) || total < 0) {
+						activeSnapshotRef.current = null
+						requestClineMessagesResync(seq)
+						break
+					}
+
+					const activeSnapshot = activeSnapshotRef.current
+					if (activeSnapshot?.snapshotId === message.snapshotId && activeSnapshot.seq === seq) {
+						break
+					}
+					if (activeSnapshot && seq < activeSnapshot.seq) {
+						break
+					}
+
+					activeSnapshotRef.current = {
+						snapshotId: message.snapshotId,
+						taskId: message.taskId,
+						seq,
+						total,
+						messages: [],
+					}
+					break
+				}
+				case "clineMessagesSnapshotChunk": {
+					if (message.taskId !== activeTaskIdRef.current) {
+						break
+					}
+
+					const seq = message.clineMessagesSeq
+					const snapshot = activeSnapshotRef.current
+					if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) {
+						activeSnapshotRef.current = null
+						requestClineMessagesResync(typeof seq === "number" ? seq : undefined)
+						break
+					}
+					if (!snapshot) {
+						if (seq > clineMessagesSeqRef.current) {
+							requestClineMessagesResync(seq)
 						}
-						// Log a warning if messageUpdated arrives for a timestamp not in the
-						// frontend's clineMessages. With the seq guard and cloud event isolation
-						// (layers 1+2), this should not happen under normal conditions. If it
-						// does, it signals a state synchronization issue worth investigating.
-						console.warn(
-							`[messageUpdated] Received update for unknown message ts=${clineMessage.ts}, dropping. ` +
-								`Frontend has ${prevState.clineMessages.length} messages.`,
-						)
-						return prevState
-					})
+						break
+					}
+					if (message.snapshotId !== snapshot.snapshotId || seq !== snapshot.seq) {
+						if (seq > snapshot.seq) {
+							activeSnapshotRef.current = null
+							requestClineMessagesResync(seq)
+						}
+						break
+					}
+
+					const chunk = message.clineMessages
+					const startIndex = message.snapshotStartIndex
+					if (
+						!Array.isArray(chunk) ||
+						chunk.length === 0 ||
+						typeof startIndex !== "number" ||
+						!Number.isSafeInteger(startIndex) ||
+						startIndex !== snapshot.messages.length ||
+						snapshot.messages.length + chunk.length > snapshot.total
+					) {
+						activeSnapshotRef.current = null
+						requestClineMessagesResync(seq)
+						break
+					}
+
+					snapshot.messages.push(...chunk)
+					break
+				}
+				case "clineMessagesSnapshotEnd": {
+					if (message.taskId !== activeTaskIdRef.current) {
+						break
+					}
+
+					const seq = message.clineMessagesSeq
+					const snapshot = activeSnapshotRef.current
+					if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) {
+						activeSnapshotRef.current = null
+						requestClineMessagesResync(typeof seq === "number" ? seq : undefined)
+						break
+					}
+					if (!snapshot) {
+						if (seq > clineMessagesSeqRef.current) {
+							requestClineMessagesResync(seq)
+						}
+						break
+					}
+					if (message.snapshotId !== snapshot.snapshotId || seq !== snapshot.seq) {
+						if (seq > snapshot.seq) {
+							activeSnapshotRef.current = null
+							requestClineMessagesResync(seq)
+						}
+						break
+					}
+					if (message.snapshotTotal !== snapshot.total || snapshot.messages.length !== snapshot.total) {
+						activeSnapshotRef.current = null
+						requestClineMessagesResync(seq)
+						break
+					}
+
+					activeSnapshotRef.current = null
+					resyncPendingRef.current = false
+					clineMessagesRef.current = snapshot.messages
+					clineMessagesSeqRef.current = snapshot.seq
+					setState((prevState) => ({
+						...prevState,
+						clineMessages: snapshot.messages,
+						clineMessagesSeq: snapshot.seq,
+					}))
+					break
+				}
+				case "clineMessageAppended": {
+					applyClineMessagesDelta(message, "append")
+					break
+				}
+				case "clineMessageUpdated": {
+					applyClineMessagesDelta(message, "update")
+					break
+				}
+				case "messageUpdated": {
+					// An unsequenced legacy update cannot be applied safely.
+					requestClineMessagesResync(message.clineMessagesSeq)
 					break
 				}
 				case "skills": {
@@ -503,7 +703,7 @@ export const ExtensionStateContextProvider: React.FC<{
 				}
 			}
 		},
-		[setListApiConfigMeta],
+		[applyClineMessagesDelta, requestClineMessagesResync, setListApiConfigMeta],
 	)
 
 	useEffect(() => {

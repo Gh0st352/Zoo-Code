@@ -1034,20 +1034,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private async addToClineMessages(message: ClineMessage) {
 		this.clineMessages.push(message)
 		const provider = this.providerRef.deref()
-		// Unanswered asks must reach the webview before Message listeners can respond against its state.
-		const requiresImmediateState =
-			message.partial === true || (message.type === "ask" && message.isAnswered !== true)
 		try {
-			await provider?.postStateToWebviewThrottled()
+			await provider?.postClineMessageAppended(this.taskId, message)
 		} catch (error) {
-			console.error("[Task#addToClineMessages] postStateToWebviewThrottled failed:", error)
-		}
-		if (requiresImmediateState) {
-			try {
-				await provider?.flushPostStateToWebviewThrottled()
-			} catch (error) {
-				console.error("[Task#addToClineMessages] flushPostStateToWebviewThrottled failed:", error)
-			}
+			console.error("[Task#addToClineMessages] incremental post failed:", error)
 		}
 		this.emit(RooCodeEventName.Message, { action: "created", message })
 		await this.saveClineMessages()
@@ -1077,11 +1067,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				this.cloudSyncedMessageTimestamps.add(msg.ts)
 			}
 		}
+		await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, { bumpSeq: true })
 	}
 
 	private async updateClineMessage(message: ClineMessage) {
 		const provider = this.providerRef.deref()
-		await provider?.postMessageToWebview({ type: "messageUpdated", clineMessage: message })
+		await provider?.postClineMessageUpdated(this.taskId, message)
 		this.emit(RooCodeEventName.Message, { action: "updated", message })
 
 		// Check if we should sync to cloud and haven't already synced this message
@@ -1174,7 +1165,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		let askTs: number
 
-		// Resolve auto-approval before adding the message so the state snapshot
+		// Resolve auto-approval before adding the message so the incremental append
 		// sent to the webview already carries isAnswered:true when the ask will
 		// be immediately resolved. This eliminates the race between the state
 		// update (which shows approval buttons) and the former separate
@@ -1203,10 +1194,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					lastMessage.partial = partial
 					lastMessage.progressStatus = progressStatus
 					lastMessage.isProtected = isProtected
-					// TODO: Be more efficient about saving and posting only new
-					// data or one whole message at a time so ignore partial for
-					// saves, and only post parts of partial message instead of
-					// whole array in new listener.
+					// Persist partial messages only when they become complete; the
+					// dedicated transport can still update one in-memory message at a time.
 					// Fire-and-forget: the webview post is internally guarded, but
 					// the `RooCodeEventName.Message` emit can synchronously throw
 					// if any consumer-attached listener does, which would surface
@@ -1465,6 +1454,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			if (lastFollowUpIndex !== -1) {
 				// Mark this follow-up as answered
 				this.clineMessages[lastFollowUpIndex].isAnswered = true
+				void this.updateClineMessage(this.clineMessages[lastFollowUpIndex]).catch((error) => {
+					console.error("[Task#handleWebviewAskResponse] follow-up delta failed:", error)
+				})
 				// Save the updated messages
 				this.saveClineMessages().catch((error) => {
 					console.error("Failed to save answered follow-up state:", error)
@@ -1940,7 +1932,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// The todo list is already set in the constructor if initialTodos were provided
 			// No need to add any messages - the todoList property is already set
 
-			await this.providerRef.deref()?.postStateToWebviewWithoutTaskHistory()
+			await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, { bumpSeq: true })
 
 			await this.say("text", task, images)
 
@@ -2057,7 +2049,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			this.isInitialized = true
 
-			const { response, text, images } = await this.ask(askType) // Calls `postStateToWebview`.
+			const { response, text, images } = await this.ask(askType)
 
 			let responseText: string | undefined
 			let responseImages: string[] | undefined
@@ -2688,7 +2680,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			} satisfies ClineApiReqInfo)
 
 			await this.saveClineMessages()
-			await this.providerRef.deref()?.postStateToWebviewWithoutTaskHistory()
+			await this.updateClineMessage(this.clineMessages[lastApiReqIndex])
 
 			try {
 				let cacheWriteTokens = 0
@@ -2759,12 +2751,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					if (lastMessage && lastMessage.partial) {
 						// lastMessage.ts = Date.now() DO NOT update ts since it is used as a key for virtuoso list
 						lastMessage.partial = false
-						// instead of streaming partialMessage events, we do a save and post like normal to persist to disk
+						await this.updateClineMessage(lastMessage)
 					}
 
 					// Update `api_req_started` to have cancelled and cost, so that
 					// we can display the cost of the partial stream and the cancellation reason
 					updateApiReqMsg(cancelReason, streamingFailedMessage)
+					const apiRequestMessage = this.clineMessages[lastApiReqIndex]
+					if (apiRequestMessage) {
+						await this.updateClineMessage(apiRequestMessage)
+					}
 					await this.saveClineMessages()
 
 					// Signals to provider that it can retrieve the saved messages
@@ -3442,7 +3438,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				}
 
 				await this.saveClineMessages()
-				await this.providerRef.deref()?.postStateToWebviewWithoutTaskHistory()
 
 				// No legacy text-stream tool parser state to reset.
 
