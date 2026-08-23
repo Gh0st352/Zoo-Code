@@ -16,7 +16,7 @@ else
   fi
 fi
 
-#$pnpm_cmd run check-types
+$pnpm_cmd run check-types
 
 # Use dotenvx to securely load .env.local and run commands that depend on it
 if [ -f ".env.local" ]; then
