@@ -111,11 +111,27 @@ const InitialStateTestComponent = () => {
 }
 
 const TranscriptTestComponent = () => {
-	const { currentTaskId, clineMessages, clineMessagesSeq } = useExtensionState()
+	const {
+		currentTaskId,
+		currentTaskItem,
+		currentTaskTodos,
+		messageQueue,
+		currentCheckpoint,
+		clineMessages,
+		clineMessagesSeq,
+	} = useExtensionState()
 
 	return (
 		<div data-testid="transcript-state">
-			{JSON.stringify({ currentTaskId, clineMessages, clineMessagesSeq: clineMessagesSeq ?? 0 })}
+			{JSON.stringify({
+				currentTaskId: currentTaskId ?? null,
+				currentTaskItem: currentTaskItem ?? null,
+				currentTaskTodos: currentTaskTodos ?? [],
+				messageQueue: messageQueue ?? [],
+				currentCheckpoint: currentCheckpoint ?? null,
+				clineMessages,
+				clineMessagesSeq: clineMessagesSeq ?? 0,
+			})}
 		</div>
 	)
 }
@@ -417,6 +433,10 @@ describe("ExtensionStateContext", () => {
 
 	describe("dedicated transcript transport", () => {
 		const readTranscript = () => JSON.parse(screen.getByTestId("transcript-state").textContent!)
+		const readTranscriptFields = () => {
+			const { currentTaskId, clineMessages, clineMessagesSeq } = readTranscript()
+			return { currentTaskId, clineMessages, clineMessagesSeq }
+		}
 		const renderTranscript = (initialState: Partial<ExtensionState> = {}) =>
 			render(
 				<ExtensionStateContextProvider initialState={{ currentTaskId: "task-1", ...initialState }}>
@@ -470,7 +490,7 @@ describe("ExtensionStateContext", () => {
 				})
 			})
 
-			expect(readTranscript()).toEqual({
+			expect(readTranscriptFields()).toEqual({
 				currentTaskId: "task-1",
 				clineMessages: [first, { ...second, text: "updated" }],
 				clineMessagesSeq: 6,
@@ -505,7 +525,92 @@ describe("ExtensionStateContext", () => {
 				})
 			})
 
-			expect(readTranscript()).toEqual({ currentTaskId: "task-2", clineMessages: [], clineMessagesSeq: 0 })
+			expect(readTranscriptFields()).toEqual({ currentTaskId: "task-2", clineMessages: [], clineMessagesSeq: 0 })
+		})
+
+		it("clears task-scoped state for a JSON-round-tripped authoritative no-task transition", () => {
+			const existing = makeMessage(1, "existing")
+			const currentTaskItem = {
+				id: "task-1",
+				number: 1,
+				ts: 1,
+				task: "Existing task",
+				tokensIn: 0,
+				tokensOut: 0,
+				totalCost: 0,
+			}
+			renderTranscript({
+				clineMessages: [existing],
+				clineMessagesSeq: 3,
+				currentTaskItem,
+				currentTaskTodos: [{ id: "todo-1", content: "Existing todo", status: "in_progress" }],
+				messageQueue: [{ id: "queued-1", timestamp: 1, text: "Queued message" }],
+			})
+
+			act(() => {
+				dispatchExtensionMessage({ type: "currentCheckpointUpdated", text: "checkpoint-1" })
+				const clearState = JSON.parse(JSON.stringify({ currentTaskId: null })) as Partial<ExtensionState>
+				dispatchExtensionMessage({ type: "state", state: clearState })
+				dispatchExtensionMessage({
+					type: "clineMessagesSnapshotStart",
+					clineMessagesSeq: 0,
+					snapshotId: "no-task-snapshot",
+					snapshotTotal: 0,
+				})
+				dispatchExtensionMessage({
+					type: "clineMessagesSnapshotEnd",
+					clineMessagesSeq: 0,
+					snapshotId: "no-task-snapshot",
+					snapshotTotal: 0,
+				})
+			})
+
+			expect(readTranscript()).toEqual({
+				currentTaskId: null,
+				currentTaskItem: null,
+				currentTaskTodos: [],
+				messageQueue: [],
+				currentCheckpoint: null,
+				clineMessages: [],
+				clineMessagesSeq: 0,
+			})
+		})
+
+		it("preserves task-scoped state when a partial state update omits currentTaskId", () => {
+			const existing = makeMessage(1, "existing")
+			const currentTaskItem = {
+				id: "task-1",
+				number: 1,
+				ts: 1,
+				task: "Existing task",
+				tokensIn: 0,
+				tokensOut: 0,
+				totalCost: 0,
+			}
+			const currentTaskTodos = [{ id: "todo-1", content: "Existing todo", status: "pending" as const }]
+			const messageQueue = [{ id: "queued-1", timestamp: 1, text: "Queued message" }]
+			renderTranscript({
+				clineMessages: [existing],
+				clineMessagesSeq: 3,
+				currentTaskItem,
+				currentTaskTodos,
+				messageQueue,
+			})
+
+			act(() => {
+				dispatchExtensionMessage({ type: "currentCheckpointUpdated", text: "checkpoint-1" })
+				dispatchExtensionMessage({ type: "state", state: { version: "2.0.0" } })
+			})
+
+			expect(readTranscript()).toEqual({
+				currentTaskId: "task-1",
+				currentTaskItem,
+				currentTaskTodos,
+				messageQueue,
+				currentCheckpoint: "checkpoint-1",
+				clineMessages: [existing],
+				clineMessagesSeq: 3,
+			})
 		})
 
 		it("requests one resync when a delta sequence has a gap", () => {
@@ -621,7 +726,7 @@ describe("ExtensionStateContext", () => {
 					})
 				})
 
-				expect(readTranscript()).toEqual({
+				expect(readTranscriptFields()).toEqual({
 					currentTaskId: "task-1",
 					clineMessages: [first, recovered, makeMessage(4, "after recovery")],
 					clineMessagesSeq: 4,
@@ -736,7 +841,7 @@ describe("ExtensionStateContext", () => {
 				expect(postMessage).toHaveBeenCalledWith(
 					expect.objectContaining({ type: "requestClineMessagesResync", receivedSeq: 5 }),
 				)
-				expect(readTranscript()).toEqual({
+				expect(readTranscriptFields()).toEqual({
 					currentTaskId: "task-1",
 					clineMessages: [first],
 					clineMessagesSeq: 1,
@@ -895,7 +1000,11 @@ describe("ExtensionStateContext", () => {
 				})
 
 				expect(postMessage).toHaveBeenCalledTimes(5)
-				expect(readTranscript()).toEqual({ currentTaskId: "task-1", clineMessages: [], clineMessagesSeq: 1 })
+				expect(readTranscriptFields()).toEqual({
+					currentTaskId: "task-1",
+					clineMessages: [],
+					clineMessagesSeq: 1,
+				})
 			} finally {
 				postMessage.mockRestore()
 			}
@@ -936,7 +1045,7 @@ describe("ExtensionStateContext", () => {
 				})
 				appendClineMessage(makeMessage(3, "appended"), 5, "task-1")
 			})
-			expect(readTranscript()).toEqual({
+			expect(readTranscriptFields()).toEqual({
 				currentTaskId: "task-1",
 				clineMessages: [makeMessage(2, "hydrated"), makeMessage(3, "appended")],
 				clineMessagesSeq: 5,
@@ -945,7 +1054,7 @@ describe("ExtensionStateContext", () => {
 			act(() => {
 				hydrateExtensionState({ clineMessages: [] }, { taskId: "task-1", clineMessagesSeq: 6 })
 			})
-			expect(readTranscript()).toEqual({ currentTaskId: "task-1", clineMessages: [], clineMessagesSeq: 6 })
+			expect(readTranscriptFields()).toEqual({ currentTaskId: "task-1", clineMessages: [], clineMessagesSeq: 6 })
 		})
 	})
 })
