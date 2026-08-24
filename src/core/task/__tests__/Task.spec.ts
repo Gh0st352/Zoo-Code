@@ -1931,6 +1931,30 @@ describe("Cline", () => {
 	})
 
 	describe("webview transcript transport", () => {
+		it("posts a bumped snapshot after overwriting the transcript", async () => {
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const saveSpy = vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockResolvedValue(true)
+			const messages = [
+				{
+					ts: 1,
+					type: "say" as const,
+					say: "text" as const,
+					text: "replacement transcript",
+				},
+			]
+
+			await task.overwriteClineMessages(messages)
+
+			expect(saveSpy).toHaveBeenCalledOnce()
+			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledOnce()
+			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledWith(task.taskId, { bumpSeq: true })
+		})
+
 		it("posts a complete new message through the incremental transport", async () => {
 			const task = new Task({
 				provider: mockProvider,
@@ -2436,6 +2460,70 @@ describe("Cline", () => {
 				expect(cancelSpy).toHaveBeenCalled()
 			})
 			describe("abortSignal", () => {
+				it("finalizes partial transcript messages and the API request before persisting cancellation", async () => {
+					const task = new Task({
+						provider: mockProvider,
+						apiConfiguration: mockApiConfig,
+						task: "test task",
+						startTask: false,
+					})
+					const taskAccess = getTaskTestAccess(task)
+					const saveSpy = vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
+					vi.spyOn(taskAccess, "safeEnsureModelFetched").mockResolvedValue(undefined)
+					vi.spyOn(task.diffViewProvider, "reset").mockResolvedValue(undefined)
+					vi.spyOn(task, "abortTask").mockResolvedValue(undefined)
+					vi.spyOn(task.api, "getModel").mockReturnValue({
+						id: mockApiConfig.apiModelId!,
+						info: {
+							supportsImages: false,
+							supportsPromptCache: true,
+							contextWindow: 200000,
+							maxTokens: 4096,
+							inputPrice: 0.3,
+							outputPrice: 1.5,
+						} as ModelInfo,
+					})
+					const postedUpdates: import("@roo-code/types").ClineMessage[] = []
+					const updateSpy = vi
+						.mocked(mockProvider.postClineMessageUpdated)
+						.mockImplementation(async (_taskId, message) => {
+							postedUpdates.push(structuredClone(message))
+						})
+					const partialMessage: import("@roo-code/types").ClineMessage = {
+						ts: 2,
+						type: "say",
+						say: "text",
+						text: "partial response",
+						partial: true,
+					}
+					vi.spyOn(task, "attemptApiRequest").mockImplementation(() =>
+						(async function* (): AsyncGenerator<ApiStreamChunk> {
+							await taskAccess.addToClineMessages(partialMessage)
+							task.abort = true
+							yield { type: "usage", inputTokens: 0, outputTokens: 0 }
+						})(),
+					)
+
+					await expect(
+						task.recursivelyMakeClineRequests([{ type: "text", text: "cancel this request" }]),
+					).resolves.toBe(true)
+
+					expect(partialMessage.partial).toBe(false)
+					expect(postedUpdates).toContainEqual(
+						expect.objectContaining({ ts: partialMessage.ts, partial: false }),
+					)
+					expect(postedUpdates).toContainEqual(
+						expect.objectContaining({
+							say: "api_req_started",
+							text: expect.stringContaining('"cancelReason":"user_cancelled"'),
+						}),
+					)
+					expect(task.didFinishAbortingStream).toBe(true)
+					expect(Math.max(...updateSpy.mock.invocationCallOrder)).toBeLessThan(
+						Math.max(...saveSpy.mock.invocationCallOrder),
+					)
+				})
+
 				it("should pass AbortController signal to condenseContext metadata when a current request exists", async () => {
 					const task = new Task({
 						provider: mockProvider,
@@ -3763,6 +3851,36 @@ describe("Cline", () => {
 			expect(updateSpy).toHaveBeenCalled()
 			expect(consoleErrorSpy).toHaveBeenCalledWith(
 				"[Task#handleWebviewAskResponse] updateClineMessage failed:",
+				boom,
+			)
+		})
+
+		it("marks a follow-up answered and logs when its incremental update rejects", async () => {
+			const boom = new Error("follow-up update boom")
+			const updateSpy = vi.spyOn(getTaskTestAccess(Task.prototype), "updateClineMessage").mockRejectedValue(boom)
+			vi.spyOn(getTaskTestAccess(Task.prototype), "saveClineMessages").mockResolvedValue(true)
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const followUp: import("@roo-code/types").ClineMessage = {
+				ts: Date.now() - 1,
+				type: "ask" as const,
+				ask: "followup" as const,
+				text: "question",
+				partial: false,
+			}
+			task.clineMessages.push(followUp)
+
+			task.handleWebviewAskResponse("messageResponse", "answer")
+			await flushMicrotasks()
+
+			expect(followUp.isAnswered).toBe(true)
+			expect(updateSpy).toHaveBeenCalledWith(followUp)
+			expect(consoleErrorSpy).toHaveBeenCalledWith(
+				"[Task#handleWebviewAskResponse] follow-up delta failed:",
 				boom,
 			)
 		})
