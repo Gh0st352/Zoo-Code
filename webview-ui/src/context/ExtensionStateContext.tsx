@@ -164,6 +164,8 @@ type ClineMessagesSnapshotBuffer = {
 	messages: ClineMessage[]
 }
 
+const CLINE_MESSAGES_RESYNC_TIMEOUT_MS = 5_000
+
 export const mergeExtensionState = (prevState: ExtensionState, newState: Partial<ExtensionState>) => {
 	const { customModePrompts: prevCustomModePrompts, experiments: prevExperiments, ...prevRest } = prevState
 
@@ -285,6 +287,7 @@ export const ExtensionStateContextProvider: React.FC<{
 	const clineMessagesRef = useRef<ClineMessage[]>(state.clineMessages)
 	const activeSnapshotRef = useRef<ClineMessagesSnapshotBuffer | null>(null)
 	const resyncPendingRef = useRef(false)
+	const resyncTimeoutRef = useRef<number | undefined>(undefined)
 
 	const [didHydrateState, setDidHydrateState] = useState(false)
 	const [showWelcome, setShowWelcome] = useState(false)
@@ -334,11 +337,23 @@ export const ExtensionStateContextProvider: React.FC<{
 		}))
 	}, [])
 
+	const clearClineMessagesResync = useCallback(() => {
+		resyncPendingRef.current = false
+		if (resyncTimeoutRef.current !== undefined) {
+			window.clearTimeout(resyncTimeoutRef.current)
+			resyncTimeoutRef.current = undefined
+		}
+	}, [])
+
 	const requestClineMessagesResync = useCallback((receivedSeq?: number) => {
 		if (resyncPendingRef.current) {
 			return
 		}
 		resyncPendingRef.current = true
+		resyncTimeoutRef.current = window.setTimeout(() => {
+			resyncPendingRef.current = false
+			resyncTimeoutRef.current = undefined
+		}, CLINE_MESSAGES_RESYNC_TIMEOUT_MS)
 		vscode.postMessage({
 			type: "requestClineMessagesResync",
 			taskId: activeTaskIdRef.current,
@@ -346,6 +361,14 @@ export const ExtensionStateContextProvider: React.FC<{
 			receivedSeq,
 		})
 	}, [])
+
+	const retryClineMessagesResync = useCallback(
+		(receivedSeq?: number) => {
+			clearClineMessagesResync()
+			requestClineMessagesResync(receivedSeq)
+		},
+		[clearClineMessagesResync, requestClineMessagesResync],
+	)
 
 	const applyClineMessagesDelta = useCallback(
 		(message: ExtensionMessage, operation: "append" | "update") => {
@@ -367,7 +390,7 @@ export const ExtensionStateContextProvider: React.FC<{
 					return
 				}
 				activeSnapshotRef.current = null
-				requestClineMessagesResync(seq)
+				retryClineMessagesResync(seq)
 				return
 			}
 			if (seq <= clineMessagesSeqRef.current) {
@@ -399,7 +422,7 @@ export const ExtensionStateContextProvider: React.FC<{
 				clineMessagesSeq: seq,
 			}))
 		},
-		[requestClineMessagesResync],
+		[requestClineMessagesResync, retryClineMessagesResync],
 	)
 
 	const handleMessage = useCallback(
@@ -420,7 +443,7 @@ export const ExtensionStateContextProvider: React.FC<{
 						clineMessagesSeqRef.current = 0
 						clineMessagesRef.current = []
 						activeSnapshotRef.current = null
-						resyncPendingRef.current = false
+						clearClineMessagesResync()
 					}
 					setState((prevState) => {
 						const merged = mergeExtensionState(prevState, newState)
@@ -495,7 +518,7 @@ export const ExtensionStateContextProvider: React.FC<{
 					const seq = message.clineMessagesSeq
 					if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) {
 						activeSnapshotRef.current = null
-						requestClineMessagesResync(typeof seq === "number" ? seq : undefined)
+						retryClineMessagesResync(typeof seq === "number" ? seq : undefined)
 						break
 					}
 					if (seq < clineMessagesSeqRef.current) {
@@ -505,7 +528,7 @@ export const ExtensionStateContextProvider: React.FC<{
 					const total = message.snapshotTotal
 					if (!message.snapshotId || typeof total !== "number" || !Number.isSafeInteger(total) || total < 0) {
 						activeSnapshotRef.current = null
-						requestClineMessagesResync(seq)
+						retryClineMessagesResync(seq)
 						break
 					}
 
@@ -535,19 +558,19 @@ export const ExtensionStateContextProvider: React.FC<{
 					const snapshot = activeSnapshotRef.current
 					if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) {
 						activeSnapshotRef.current = null
-						requestClineMessagesResync(typeof seq === "number" ? seq : undefined)
+						retryClineMessagesResync(typeof seq === "number" ? seq : undefined)
 						break
 					}
 					if (!snapshot) {
 						if (seq > clineMessagesSeqRef.current) {
-							requestClineMessagesResync(seq)
+							retryClineMessagesResync(seq)
 						}
 						break
 					}
 					if (message.snapshotId !== snapshot.snapshotId || seq !== snapshot.seq) {
 						if (seq > snapshot.seq) {
 							activeSnapshotRef.current = null
-							requestClineMessagesResync(seq)
+							retryClineMessagesResync(seq)
 						}
 						break
 					}
@@ -563,7 +586,7 @@ export const ExtensionStateContextProvider: React.FC<{
 						snapshot.messages.length + chunk.length > snapshot.total
 					) {
 						activeSnapshotRef.current = null
-						requestClineMessagesResync(seq)
+						retryClineMessagesResync(seq)
 						break
 					}
 
@@ -579,30 +602,30 @@ export const ExtensionStateContextProvider: React.FC<{
 					const snapshot = activeSnapshotRef.current
 					if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) {
 						activeSnapshotRef.current = null
-						requestClineMessagesResync(typeof seq === "number" ? seq : undefined)
+						retryClineMessagesResync(typeof seq === "number" ? seq : undefined)
 						break
 					}
 					if (!snapshot) {
 						if (seq > clineMessagesSeqRef.current) {
-							requestClineMessagesResync(seq)
+							retryClineMessagesResync(seq)
 						}
 						break
 					}
 					if (message.snapshotId !== snapshot.snapshotId || seq !== snapshot.seq) {
 						if (seq > snapshot.seq) {
 							activeSnapshotRef.current = null
-							requestClineMessagesResync(seq)
+							retryClineMessagesResync(seq)
 						}
 						break
 					}
 					if (message.snapshotTotal !== snapshot.total || snapshot.messages.length !== snapshot.total) {
 						activeSnapshotRef.current = null
-						requestClineMessagesResync(seq)
+						retryClineMessagesResync(seq)
 						break
 					}
 
 					activeSnapshotRef.current = null
-					resyncPendingRef.current = false
+					clearClineMessagesResync()
 					clineMessagesRef.current = snapshot.messages
 					clineMessagesSeqRef.current = snapshot.seq
 					setState((prevState) => ({
@@ -703,15 +726,22 @@ export const ExtensionStateContextProvider: React.FC<{
 				}
 			}
 		},
-		[applyClineMessagesDelta, requestClineMessagesResync, setListApiConfigMeta],
+		[
+			applyClineMessagesDelta,
+			clearClineMessagesResync,
+			requestClineMessagesResync,
+			retryClineMessagesResync,
+			setListApiConfigMeta,
+		],
 	)
 
 	useEffect(() => {
 		window.addEventListener("message", handleMessage)
 		return () => {
 			window.removeEventListener("message", handleMessage)
+			clearClineMessagesResync()
 		}
-	}, [handleMessage])
+	}, [clearClineMessagesResync, handleMessage])
 
 	useEffect(() => {
 		vscode.postMessage({ type: "webviewDidLaunch" })

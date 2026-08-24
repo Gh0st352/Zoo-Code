@@ -118,6 +118,7 @@ const mockClineProvider = {
 	log: vi.fn(),
 	postStateToWebview: vi.fn(),
 	syncFocusedTaskToWebview: vi.fn().mockResolvedValue(undefined),
+	resyncClineMessagesToWebview: vi.fn().mockResolvedValue(undefined),
 	resolveWebviewThemeFixtureProbe: vi.fn(),
 	getCurrentTask: vi.fn(),
 	getTaskWithId: vi.fn(),
@@ -125,6 +126,24 @@ const mockClineProvider = {
 	getSkillsManager: vi.fn(),
 	cwd: "/mock/workspace",
 } as unknown as ClineProvider
+
+describe("webviewMessageHandler - transcript resync", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+	})
+
+	it("delegates a task-scoped transcript resync to the provider", async () => {
+		await webviewMessageHandler(mockClineProvider, {
+			type: "requestClineMessagesResync",
+			taskId: "task-1",
+			expectedSeq: 4,
+			receivedSeq: 7,
+		})
+
+		expect(mockClineProvider.resyncClineMessagesToWebview).toHaveBeenCalledOnce()
+		expect(mockClineProvider.resyncClineMessagesToWebview).toHaveBeenCalledWith("task-1")
+	})
+})
 
 describe("webviewMessageHandler - theme fixture probes", () => {
 	const originalProbeSetting = process.env.ROO_CODE_THEME_FIXTURE_PROBE

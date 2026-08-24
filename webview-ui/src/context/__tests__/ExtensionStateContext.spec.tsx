@@ -1,4 +1,4 @@
-import { render, screen, act } from "@/utils/test-utils"
+import { render, screen, act, appendClineMessage, hydrateExtensionState } from "@/utils/test-utils"
 import React from "react"
 
 import {
@@ -417,6 +417,12 @@ describe("ExtensionStateContext", () => {
 
 	describe("dedicated transcript transport", () => {
 		const readTranscript = () => JSON.parse(screen.getByTestId("transcript-state").textContent!)
+		const renderTranscript = (initialState: Partial<ExtensionState> = {}) =>
+			render(
+				<ExtensionStateContextProvider initialState={{ currentTaskId: "task-1", ...initialState }}>
+					<TranscriptTestComponent />
+				</ExtensionStateContextProvider>,
+			)
 
 		it("reconstructs a snapshot and applies contiguous append and update deltas", () => {
 			render(
@@ -542,6 +548,404 @@ describe("ExtensionStateContext", () => {
 			} finally {
 				postMessage.mockRestore()
 			}
+		})
+
+		it("retires a failed resync and recovers from a replacement snapshot", () => {
+			const first = makeMessage(1, "first")
+			const recovered = makeMessage(2, "recovered")
+			const postMessage = vi.spyOn(vscode, "postMessage").mockImplementation(() => undefined)
+			try {
+				renderTranscript({ clineMessages: [first], clineMessagesSeq: 1 })
+				postMessage.mockClear()
+
+				act(() => {
+					dispatchExtensionMessage({
+						type: "clineMessageAppended",
+						taskId: "task-1",
+						clineMessagesSeq: 3,
+						clineMessage: makeMessage(3, "gap"),
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: 3,
+						snapshotId: "invalid-snapshot",
+						snapshotTotal: 2,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotChunk",
+						taskId: "task-1",
+						clineMessagesSeq: 3,
+						snapshotId: "invalid-snapshot",
+						snapshotStartIndex: 1,
+						clineMessages: [first],
+					})
+				})
+
+				expect(postMessage).toHaveBeenCalledTimes(2)
+				expect(postMessage).toHaveBeenLastCalledWith({
+					type: "requestClineMessagesResync",
+					taskId: "task-1",
+					expectedSeq: 2,
+					receivedSeq: 3,
+				})
+
+				act(() => {
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: 3,
+						snapshotId: "replacement-snapshot",
+						snapshotTotal: 2,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotChunk",
+						taskId: "task-1",
+						clineMessagesSeq: 3,
+						snapshotId: "replacement-snapshot",
+						snapshotStartIndex: 0,
+						clineMessages: [first, recovered],
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotEnd",
+						taskId: "task-1",
+						clineMessagesSeq: 3,
+						snapshotId: "replacement-snapshot",
+						snapshotTotal: 2,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessageAppended",
+						taskId: "task-1",
+						clineMessagesSeq: 4,
+						clineMessage: makeMessage(4, "after recovery"),
+					})
+				})
+
+				expect(readTranscript()).toEqual({
+					currentTaskId: "task-1",
+					clineMessages: [first, recovered, makeMessage(4, "after recovery")],
+					clineMessagesSeq: 4,
+				})
+			} finally {
+				postMessage.mockRestore()
+			}
+		})
+
+		it("allows another resync when a response is lost", async () => {
+			vi.useFakeTimers()
+			const postMessage = vi.spyOn(vscode, "postMessage").mockImplementation(() => undefined)
+			try {
+				renderTranscript({ clineMessagesSeq: 1 })
+				postMessage.mockClear()
+
+				act(() => {
+					appendClineMessage(makeMessage(3, "gap"), 3, "task-1")
+					appendClineMessage(makeMessage(4, "suppressed while pending"), 4, "task-1")
+				})
+				expect(postMessage).toHaveBeenCalledTimes(1)
+
+				await act(async () => {
+					await vi.advanceTimersByTimeAsync(5_000)
+				})
+				act(() => appendClineMessage(makeMessage(5, "retry"), 5, "task-1"))
+
+				expect(postMessage).toHaveBeenCalledTimes(2)
+				expect(postMessage).toHaveBeenLastCalledWith(
+					expect.objectContaining({
+						type: "requestClineMessagesResync",
+						expectedSeq: 2,
+						receivedSeq: 5,
+					}),
+				)
+			} finally {
+				postMessage.mockRestore()
+				vi.useRealTimers()
+			}
+		})
+
+		it("rejects malformed deltas and updates to unknown messages", () => {
+			const first = makeMessage(1, "first")
+			const postMessage = vi.spyOn(vscode, "postMessage").mockImplementation(() => undefined)
+			try {
+				renderTranscript({ clineMessages: [first], clineMessagesSeq: 1 })
+				postMessage.mockClear()
+
+				act(() => {
+					dispatchExtensionMessage({ type: "clineMessageAppended", taskId: "task-1" })
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: 1,
+						snapshotId: "same-sequence",
+						snapshotTotal: 1,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotChunk",
+						taskId: "task-1",
+						clineMessagesSeq: 1,
+						snapshotId: "same-sequence",
+						snapshotStartIndex: 0,
+						clineMessages: [first],
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotEnd",
+						taskId: "task-1",
+						clineMessagesSeq: 1,
+						snapshotId: "same-sequence",
+						snapshotTotal: 1,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessageUpdated",
+						taskId: "task-1",
+						clineMessagesSeq: 2,
+						clineMessage: makeMessage(99, "unknown"),
+					})
+				})
+
+				expect(postMessage).toHaveBeenCalledTimes(2)
+				expect(postMessage).toHaveBeenLastCalledWith(
+					expect.objectContaining({ type: "requestClineMessagesResync", receivedSeq: 2 }),
+				)
+				expect(readTranscript().clineMessages).toEqual([first])
+			} finally {
+				postMessage.mockRestore()
+			}
+		})
+
+		it("ignores covered and stale deltas but restarts after a newer delta interleaves", () => {
+			const first = makeMessage(1, "first")
+			const postMessage = vi.spyOn(vscode, "postMessage").mockImplementation(() => undefined)
+			try {
+				renderTranscript({ clineMessages: [first], clineMessagesSeq: 1 })
+				postMessage.mockClear()
+
+				act(() => {
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: 4,
+						snapshotId: "in-flight",
+						snapshotTotal: 1,
+					})
+					appendClineMessage(makeMessage(4, "already covered"), 4, "task-1")
+					appendClineMessage(makeMessage(5, "interleaved"), 5, "task-1")
+					appendClineMessage(makeMessage(1, "stale"), 1, "task-1")
+				})
+
+				expect(postMessage).toHaveBeenCalledTimes(1)
+				expect(postMessage).toHaveBeenCalledWith(
+					expect.objectContaining({ type: "requestClineMessagesResync", receivedSeq: 5 }),
+				)
+				expect(readTranscript()).toEqual({
+					currentTaskId: "task-1",
+					clineMessages: [first],
+					clineMessagesSeq: 1,
+				})
+			} finally {
+				postMessage.mockRestore()
+			}
+		})
+
+		it("validates snapshot starts and ignores stale or duplicate starts", () => {
+			const postMessage = vi.spyOn(vscode, "postMessage").mockImplementation(() => undefined)
+			try {
+				renderTranscript({ clineMessagesSeq: 1 })
+				postMessage.mockClear()
+
+				act(() => {
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "other-task",
+						clineMessagesSeq: 2,
+						snapshotId: "wrong-task",
+						snapshotTotal: 0,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: -1,
+						snapshotId: "invalid-sequence",
+						snapshotTotal: 0,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: 1,
+						snapshotId: "stale",
+						snapshotTotal: 0,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: 4,
+						snapshotId: "newest",
+						snapshotTotal: 0,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: 4,
+						snapshotId: "newest",
+						snapshotTotal: 0,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: 3,
+						snapshotId: "older-active",
+						snapshotTotal: 0,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: 5,
+						snapshotId: "",
+						snapshotTotal: -1,
+					})
+				})
+
+				expect(postMessage).toHaveBeenCalledTimes(2)
+				expect(postMessage.mock.calls.map(([message]) => message.receivedSeq)).toEqual([-1, 5])
+			} finally {
+				postMessage.mockRestore()
+			}
+		})
+
+		it("rejects missing, mismatched, and incomplete snapshot chunks and endings", () => {
+			const postMessage = vi.spyOn(vscode, "postMessage").mockImplementation(() => undefined)
+			try {
+				renderTranscript({ clineMessagesSeq: 1 })
+				postMessage.mockClear()
+
+				act(() => {
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotChunk",
+						taskId: "other-task",
+						clineMessagesSeq: 2,
+						snapshotId: "ignored",
+						snapshotStartIndex: 0,
+						clineMessages: [makeMessage(1, "ignored")],
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotChunk",
+						taskId: "task-1",
+						clineMessagesSeq: 2,
+						snapshotId: "missing-start",
+						snapshotStartIndex: 0,
+						clineMessages: [makeMessage(1, "missing")],
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: 3,
+						snapshotId: "chunk-check",
+						snapshotTotal: 1,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotChunk",
+						taskId: "task-1",
+						clineMessagesSeq: 4,
+						snapshotId: "newer-mismatch",
+						snapshotStartIndex: 0,
+						clineMessages: [makeMessage(1, "mismatch")],
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: 5,
+						snapshotId: "bad-chunk",
+						snapshotTotal: 1,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotChunk",
+						taskId: "task-1",
+						clineMessagesSeq: 5,
+						snapshotId: "bad-chunk",
+						snapshotStartIndex: 1,
+						clineMessages: [makeMessage(1, "bad index")],
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotEnd",
+						taskId: "other-task",
+						clineMessagesSeq: 6,
+						snapshotId: "ignored-end",
+						snapshotTotal: 0,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotEnd",
+						taskId: "task-1",
+						clineMessagesSeq: 6,
+						snapshotId: "missing-end-start",
+						snapshotTotal: 0,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotStart",
+						taskId: "task-1",
+						clineMessagesSeq: 7,
+						snapshotId: "incomplete",
+						snapshotTotal: 1,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessagesSnapshotEnd",
+						taskId: "task-1",
+						clineMessagesSeq: 7,
+						snapshotId: "incomplete",
+						snapshotTotal: 1,
+					})
+				})
+
+				expect(postMessage).toHaveBeenCalledTimes(5)
+				expect(readTranscript()).toEqual({ currentTaskId: "task-1", clineMessages: [], clineMessagesSeq: 1 })
+			} finally {
+				postMessage.mockRestore()
+			}
+		})
+
+		it("requests recovery for legacy unsequenced updates", () => {
+			const postMessage = vi.spyOn(vscode, "postMessage").mockImplementation(() => undefined)
+			try {
+				renderTranscript({ clineMessagesSeq: 2 })
+				postMessage.mockClear()
+
+				act(() => dispatchExtensionMessage({ type: "messageUpdated", clineMessagesSeq: 9 }))
+
+				expect(postMessage).toHaveBeenCalledWith({
+					type: "requestClineMessagesResync",
+					taskId: "task-1",
+					expectedSeq: 3,
+					receivedSeq: 9,
+				})
+			} finally {
+				postMessage.mockRestore()
+			}
+		})
+
+		it("hydrates metadata, non-empty transcripts, and empty transcripts through shared helpers", () => {
+			renderTranscript({ clineMessages: [makeMessage(1, "existing")], clineMessagesSeq: 1 })
+
+			act(() => {
+				hydrateExtensionState({ version: "2.0.0" })
+			})
+			expect(readTranscript().clineMessages).toEqual([makeMessage(1, "existing")])
+
+			act(() => {
+				hydrateExtensionState({
+					currentTaskId: "task-1",
+					clineMessages: [makeMessage(2, "hydrated")],
+					clineMessagesSeq: 4,
+				})
+				appendClineMessage(makeMessage(3, "appended"), 5, "task-1")
+			})
+			expect(readTranscript()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: [makeMessage(2, "hydrated"), makeMessage(3, "appended")],
+				clineMessagesSeq: 5,
+			})
+
+			act(() => {
+				hydrateExtensionState({ clineMessages: [] }, { taskId: "task-1", clineMessagesSeq: 6 })
+			})
+			expect(readTranscript()).toEqual({ currentTaskId: "task-1", clineMessages: [], clineMessagesSeq: 6 })
 		})
 	})
 })

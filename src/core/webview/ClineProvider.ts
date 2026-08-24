@@ -1417,8 +1417,10 @@ export class ClineProvider
 			return
 		}
 
-		// Generic state is metadata-only. Transcripts use the dedicated transport below.
-		if (message.type === "state" && message.state) {
+		// Browser webviews use the dedicated transcript transport below. The CLI
+		// still consumes transcript state and legacy updates until its clients adopt
+		// the sequence-aware protocol.
+		if (process.env.ROO_CLI_RUNTIME !== "1" && message.type === "state" && message.state) {
 			const { clineMessages: _omitMessages, clineMessagesSeq: _omitMessagesSeq, ...metadataState } = message.state
 			message = { ...message, state: metadataState }
 		}
@@ -1456,6 +1458,9 @@ export class ClineProvider
 		if (this.getCurrentTask()?.taskId !== taskId) {
 			return Promise.resolve()
 		}
+		if (process.env.ROO_CLI_RUNTIME === "1") {
+			return this.postStateToWebviewWithoutTaskHistory()
+		}
 
 		const seq = this.bumpClineMessagesSeq(taskId)
 		const generation = this.clineMessagesTransportGeneration
@@ -1476,6 +1481,9 @@ export class ClineProvider
 	public postClineMessageUpdated(taskId: string, message: ClineMessage): Promise<void> {
 		if (this.getCurrentTask()?.taskId !== taskId) {
 			return Promise.resolve()
+		}
+		if (process.env.ROO_CLI_RUNTIME === "1") {
+			return this.postMessageToWebview({ type: "messageUpdated", clineMessage: structuredClone(message) })
 		}
 
 		const seq = this.bumpClineMessagesSeq(taskId)
@@ -1501,6 +1509,9 @@ export class ClineProvider
 		const currentTask = this.getCurrentTask()
 		if ((currentTask?.taskId ?? undefined) !== taskId) {
 			return Promise.resolve()
+		}
+		if (process.env.ROO_CLI_RUNTIME === "1") {
+			return this.postStateToWebviewWithoutTaskHistory()
 		}
 
 		const seq = taskId
