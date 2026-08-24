@@ -232,11 +232,18 @@ describe("webviewMessageHandler - Edit Message with Timestamp Fallback", () => {
 			{ ts: 500, role: "user", content: [{ type: "text", text: "Earlier message" }] },
 			{ ts: 1000, role: "user", content: [{ type: "text", text: "Edit me" }] },
 		] as ApiMessage[]
+		let completedOverwrites = 0
+		let submitObservedCompletedOverwrites = 0
 		mockCurrentTask.overwriteClineMessages.mockImplementation(async (messages: ClineMessage[]) => {
+			await Promise.resolve()
 			mockCurrentTask.clineMessages = structuredClone(messages).map((message) => {
 				const { checkpoint: _checkpoint, ...withoutCheckpoint } = message
 				return withoutCheckpoint
 			})
+			completedOverwrites += 1
+		})
+		mockCurrentTask.submitUserMessage.mockImplementation(() => {
+			submitObservedCompletedOverwrites = completedOverwrites
 		})
 
 		await webviewMessageHandler(mockClineProvider, {
@@ -251,9 +258,7 @@ describe("webviewMessageHandler - Edit Message with Timestamp Fallback", () => {
 			expect.objectContaining({ ts: 500, checkpoint }),
 		])
 		expect(mockCurrentTask.submitUserMessage).toHaveBeenCalledWith("Edited message", [])
-		expect(mockCurrentTask.overwriteClineMessages.mock.invocationCallOrder[1]).toBeLessThan(
-			mockCurrentTask.submitUserMessage.mock.invocationCallOrder[0],
-		)
+		expect(submitObservedCompletedOverwrites).toBe(2)
 	})
 
 	it("should not use fallback when exact apiConversationHistoryIndex is found", async () => {
