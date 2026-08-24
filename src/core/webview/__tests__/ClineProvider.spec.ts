@@ -1298,6 +1298,19 @@ describe("ClineProvider", () => {
 		expect(state.taskHistory).toEqual([historyItem])
 	})
 
+	test("eviction synchronizes an authoritative no-task identity that survives serialization", async () => {
+		const task = new Task(defaultTaskOptions)
+		await provider.addClineToStack(task)
+		const postMessageSpy = vi.spyOn(provider, "postMessageToWebview").mockResolvedValue(undefined)
+
+		await provider.evictCurrentTask()
+
+		const stateMessage = postMessageSpy.mock.calls.map(([message]) => message).find(({ type }) => type === "state")
+		const roundTrippedState = JSON.parse(JSON.stringify(stateMessage?.state)) as Partial<ExtensionState>
+		expect(stateMessage?.state?.currentTaskId).toBeNull()
+		expect(roundTrippedState).toHaveProperty("currentTaskId", null)
+	})
+
 	describe("postStateToWebviewThrottled", () => {
 		beforeEach(() => {
 			vi.useFakeTimers()
