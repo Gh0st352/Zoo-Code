@@ -59,6 +59,7 @@ describe("webviewMessageHandler - Edit Message with Timestamp Fallback", () => {
 			overwriteClineMessages: vi.fn(),
 			overwriteApiConversationHistory: vi.fn(),
 			handleWebviewAskResponse: vi.fn(),
+			submitUserMessage: vi.fn(),
 		}
 		mockCurrentTask.messageManager = new MessageManager(mockCurrentTask)
 
@@ -249,6 +250,10 @@ describe("webviewMessageHandler - Edit Message with Timestamp Fallback", () => {
 		expect(mockCurrentTask.overwriteClineMessages).toHaveBeenLastCalledWith([
 			expect.objectContaining({ ts: 500, checkpoint }),
 		])
+		expect(mockCurrentTask.submitUserMessage).toHaveBeenCalledWith("Edited message", [])
+		expect(mockCurrentTask.overwriteClineMessages.mock.invocationCallOrder[1]).toBeLessThan(
+			mockCurrentTask.submitUserMessage.mock.invocationCallOrder[0],
+		)
 	})
 
 	it("should not use fallback when exact apiConversationHistoryIndex is found", async () => {
