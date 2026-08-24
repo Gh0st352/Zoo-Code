@@ -624,6 +624,7 @@ export class ClineProvider
 		}
 
 		if (task) {
+			this.clineMessagesSeqByTaskId.delete(task.taskId)
 			task.emit(RooCodeEventName.TaskUnfocused)
 
 			try {
@@ -2543,6 +2544,9 @@ export class ClineProvider
 
 			// Delete all tasks from state in one batch
 			await this.taskHistoryStore.deleteMany(allIdsToDelete)
+			for (const taskId of allIdsToDelete) {
+				this.clineMessagesSeqByTaskId.delete(taskId)
+			}
 			this.recentTasksCache = undefined
 
 			// Delete associated shadow repositories or branches and task directories
@@ -2585,6 +2589,7 @@ export class ClineProvider
 
 	async deleteTaskFromState(id: string) {
 		await this.taskHistoryStore.delete(id)
+		this.clineMessagesSeqByTaskId.delete(id)
 		this.recentTasksCache = undefined
 
 		await this.postStateToWebview()

@@ -369,8 +369,9 @@ export const webviewMessageHandler = async (
 					globalStoragePath: provider.contextProxy.globalStorageUri.fsPath,
 				})
 
-				// Rewind already posts a snapshot. Checkpoint metadata is not rendered
-				// in transcript rows, so persisting it does not require a second snapshot.
+				// Rewind posts before checkpoint metadata is restored. Publish the
+				// persisted transcript so checkpoint filtering and controls stay current.
+				await currentCline.overwriteClineMessages(currentCline.clineMessages)
 			}
 		} catch (error) {
 			console.error("Error in delete message:", error)
@@ -539,6 +540,9 @@ export const webviewMessageHandler = async (
 				globalStoragePath: provider.contextProxy.globalStorageUri.fsPath,
 			})
 
+			// Rewind posts before checkpoint metadata is restored. Publish that
+			// restored state before the edited message starts a new delta stream.
+			await currentCline.overwriteClineMessages(currentCline.clineMessages)
 			await currentCline.submitUserMessage(editedContent, images)
 		} catch (error) {
 			console.error("Error in edit message:", error)
