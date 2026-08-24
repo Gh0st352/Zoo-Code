@@ -214,6 +214,43 @@ describe("webviewMessageHandler - Edit Message with Timestamp Fallback", () => {
 		])
 	})
 
+	it("publishes restored checkpoint metadata before submitting an edited message", async () => {
+		const checkpoint = { hash: "checkpoint-hash", type: "user_message" }
+		const preservedMessage = {
+			ts: 500,
+			type: "say",
+			say: "user_feedback",
+			text: "Earlier message",
+			checkpoint,
+		} as ClineMessage
+		mockCurrentTask.clineMessages = [
+			preservedMessage,
+			{ ts: 1000, type: "say", say: "user_feedback", text: "Edit me" } as ClineMessage,
+		]
+		mockCurrentTask.apiConversationHistory = [
+			{ ts: 500, role: "user", content: [{ type: "text", text: "Earlier message" }] },
+			{ ts: 1000, role: "user", content: [{ type: "text", text: "Edit me" }] },
+		] as ApiMessage[]
+		mockCurrentTask.overwriteClineMessages.mockImplementation(async (messages: ClineMessage[]) => {
+			mockCurrentTask.clineMessages = structuredClone(messages).map((message) => {
+				const { checkpoint: _checkpoint, ...withoutCheckpoint } = message
+				return withoutCheckpoint
+			})
+		})
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "editMessageConfirm",
+			messageTs: 1000,
+			text: "Edited message",
+			restoreCheckpoint: false,
+		})
+
+		expect(mockCurrentTask.overwriteClineMessages).toHaveBeenCalledTimes(2)
+		expect(mockCurrentTask.overwriteClineMessages).toHaveBeenLastCalledWith([
+			expect.objectContaining({ ts: 500, checkpoint }),
+		])
+	})
+
 	it("should not use fallback when exact apiConversationHistoryIndex is found", async () => {
 		const userMessageTs = 1000
 		const assistantMessageTs = 2000

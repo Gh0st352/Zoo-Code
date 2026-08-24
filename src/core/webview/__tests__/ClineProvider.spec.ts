@@ -1135,6 +1135,27 @@ describe("ClineProvider", () => {
 			)
 		})
 
+		test("prunes sequence state when a task leaves the stack", async () => {
+			const task = new Task(defaultTaskOptions)
+			Object.defineProperty(task, "taskId", { value: "task-to-remove", writable: true })
+			await provider.addClineToStack(task)
+			provider["clineMessagesSeqByTaskId"].set(task.taskId, 4)
+
+			await provider.removeClineFromStack()
+
+			expect(provider["clineMessagesSeqByTaskId"].has(task.taskId)).toBe(false)
+		})
+
+		test("prunes sequence state when a task is deleted from history", async () => {
+			provider["clineMessagesSeqByTaskId"].set("deleted-task", 4)
+			vi.spyOn(provider.taskHistoryStore, "delete").mockResolvedValue(undefined)
+			vi.spyOn(provider, "postStateToWebview").mockResolvedValue(undefined)
+
+			await provider.deleteTaskFromState("deleted-task")
+
+			expect(provider["clineMessagesSeqByTaskId"].has("deleted-task")).toBe(false)
+		})
+
 		test("abandons an older focus sync when a resync invalidates its state post", async () => {
 			const task = { taskId: "task-1", clineMessages: [] as ClineMessage[] }
 			setCurrentTask(task)
