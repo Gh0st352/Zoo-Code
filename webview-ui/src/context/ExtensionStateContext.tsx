@@ -283,7 +283,7 @@ export const ExtensionStateContextProvider: React.FC<{
 	const [state, setState] = useState<ExtensionState>(() =>
 		mergeExtensionState(createInitialExtensionState(), initialState ?? {}),
 	)
-	const activeTaskIdRef = useRef<string | undefined>(state.currentTaskId)
+	const activeTaskIdRef = useRef<string | undefined>(state.currentTaskId ?? undefined)
 	const clineMessagesSeqRef = useRef(state.clineMessagesSeq ?? 0)
 	const clineMessagesRef = useRef<ClineMessage[]>(state.clineMessages)
 	const activeSnapshotRef = useRef<ClineMessagesSnapshotBuffer | null>(null)
@@ -437,9 +437,12 @@ export const ExtensionStateContextProvider: React.FC<{
 						...newState
 					} = message.state ?? {}
 					const hasCurrentTaskId = Object.prototype.hasOwnProperty.call(newState, "currentTaskId")
-					const nextTaskId = hasCurrentTaskId ? newState.currentTaskId : activeTaskIdRef.current
+					const nextTaskId = hasCurrentTaskId
+						? (newState.currentTaskId ?? undefined)
+						: activeTaskIdRef.current
 					const taskChanged = hasCurrentTaskId && nextTaskId !== activeTaskIdRef.current
-					if (taskChanged) {
+					const taskCleared = hasCurrentTaskId && newState.currentTaskId === null
+					if (taskChanged || taskCleared) {
 						activeTaskIdRef.current = nextTaskId
 						clineMessagesSeqRef.current = 0
 						clineMessagesRef.current = []
@@ -448,8 +451,22 @@ export const ExtensionStateContextProvider: React.FC<{
 					}
 					setState((prevState) => {
 						const merged = mergeExtensionState(prevState, newState)
+						if (taskCleared) {
+							return {
+								...merged,
+								currentTaskId: null,
+								currentTaskItem: undefined,
+								currentTaskTodos: [],
+								messageQueue: [],
+								clineMessages: [],
+								clineMessagesSeq: 0,
+							}
+						}
 						return taskChanged ? { ...merged, clineMessages: [], clineMessagesSeq: 0 } : merged
 					})
+					if (taskCleared) {
+						setCurrentCheckpoint(undefined)
+					}
 					setShowWelcome(!checkExistKey(newState.apiConfiguration, newState.zooCodeIsAuthenticated))
 					setDidHydrateState(true)
 					// Update alwaysAllowFollowupQuestions if present in state message

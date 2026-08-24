@@ -48,7 +48,7 @@ export const hydrateExtensionState = (
 	options: { taskId?: string; clineMessagesSeq?: number } = {},
 ) => {
 	const { clineMessages, clineMessagesSeq: stateSeq, ...metadataState } = state
-	const taskId = options.taskId ?? metadataState.currentTaskId
+	const taskId = options.taskId ?? metadataState.currentTaskId ?? undefined
 	const clineMessagesSeq = options.clineMessagesSeq ?? stateSeq ?? 0
 
 	dispatchExtensionMessage({
