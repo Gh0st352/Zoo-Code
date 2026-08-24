@@ -345,7 +345,11 @@ export type ExtensionState = Pick<
 	lockApiConfigAcrossModes?: boolean
 	version: string
 	clineMessages: ClineMessage[]
-	currentTaskId?: string
+	/**
+	 * Focused task identity. Omitted means this partial state update does not
+	 * change task focus; null authoritatively means no task is focused.
+	 */
+	currentTaskId?: string | null
 	currentTaskItem?: HistoryItem
 	currentTaskTodos?: TodoItem[] // Initial todos for the current task
 	apiConfiguration: ProviderSettings
