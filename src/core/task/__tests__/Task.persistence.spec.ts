@@ -4,7 +4,7 @@ import * as os from "os"
 import * as path from "path"
 import * as vscode from "vscode"
 
-import type { ClineMessage, GlobalState, ProviderSettings } from "@roo-code/types"
+import { RooCodeEventName, type ClineMessage, type GlobalState, type ProviderSettings } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 import type { Anthropic } from "@anthropic-ai/sdk"
 
@@ -391,6 +391,42 @@ describe("Task persistence", () => {
 	// ── saveClineMessages ────────────────────────────────────────────────
 
 	describe("saveClineMessages", () => {
+		it("emits the revision captured before an asynchronous transport fan-in settles", async () => {
+			let releaseTransport!: () => void
+			const transportGate = new Promise<void>((resolve) => {
+				releaseTransport = resolve
+			})
+			mockProvider.postClineMessageUpdated = vi.fn().mockReturnValue(transportGate)
+			mockProvider.isClineMessagesPartialCoalescingActive = vi.fn().mockReturnValue(true)
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const message = {
+				ts: 1,
+				type: "say",
+				say: "text",
+				text: "first revision",
+				partial: true,
+			} satisfies ClineMessage
+			const emitted: ClineMessage[] = []
+			task.on(RooCodeEventName.Message, ({ action, message: emittedMessage }) => {
+				if (action === "updated") {
+					emitted.push(emittedMessage)
+				}
+			})
+
+			const update = task["updateClineMessage"](message)
+			message.text = "later revision"
+			releaseTransport()
+			await update
+
+			expect(emitted).toEqual([expect.objectContaining({ text: "first revision", partial: true })])
+			expect(emitted[0]).not.toBe(message)
+		})
+
 		it("returns true on success", async () => {
 			mockSaveTaskMessages.mockResolvedValueOnce(undefined)
 

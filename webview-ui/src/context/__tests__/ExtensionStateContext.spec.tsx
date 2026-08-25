@@ -497,6 +497,28 @@ describe("ExtensionStateContext", () => {
 			})
 		})
 
+		it("applies a coalesced non-prefix revision as a complete replacement", () => {
+			const partial = { ...makeMessage(1, "long streamed preview"), partial: true }
+			renderTranscript({ clineMessages: [partial], clineMessagesSeq: 1 })
+
+			const replacement = { ...partial, text: '{"tool":"readFile","path":"src/index.ts"}' }
+			act(() => {
+				dispatchExtensionMessage({
+					type: "clineMessageUpdated",
+					taskId: "task-1",
+					clineMessagesSeq: 2,
+					clineMessage: replacement,
+				})
+			})
+
+			expect(replacement.text?.startsWith(partial.text ?? "")).toBe(false)
+			expect(readTranscriptFields()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: [replacement],
+				clineMessagesSeq: 2,
+			})
+		})
+
 		it("ignores transcript fields in generic state and clears transport state on task switch", () => {
 			const existing = makeMessage(1, "existing")
 			render(

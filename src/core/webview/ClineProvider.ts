@@ -121,6 +121,34 @@ import { getUri } from "./getUri"
 import { REQUESTY_BASE_URL } from "../../shared/utils/requesty"
 import { validateAndFixToolResultIds } from "../task/validateToolResultIds"
 import { PendingEditOperationStore, type PendingEditOperationInput } from "./PendingEditOperationStore"
+import {
+	ClineMessagesTransportDiagnostics,
+	type ClineMessagesTransportCoalescingObservation,
+	type ClineMessagesTransportDiagnosticOperation,
+	type ClineMessagesTransportDiagnosticsOptions,
+	type ClineMessagesTransportDiagnosticsSnapshot,
+	type ClineMessagesTransportDropReason,
+	type ClineMessagesTransportOperationKind,
+	formatClineMessagesTransportHighWater,
+	isClineMessagesTransportDiagnosticsEnabled,
+} from "./ClineMessagesTransportDiagnostics"
+import { ClineMessagesTransportQueue, type ClineMessagesTransportQueueObservation } from "./ClineMessagesTransportQueue"
+
+export const CLINE_MESSAGES_PARTIAL_COALESCING_ENV = "ROO_CODE_TRANSCRIPT_PARTIAL_COALESCING"
+
+type ClineMessagesPartialUpdateIdentity = {
+	taskId: string
+	generation: number
+	messageTimestamp: number
+	messageIndex: number
+	messageType: ClineMessage["type"]
+	messageAsk: ClineMessage["ask"]
+	messageSay: ClineMessage["say"]
+}
+
+type ClineMessagesPartialUpdatePayload = {
+	message: ClineMessage
+}
 
 /**
  * https://github.com/microsoft/vscode-webview-ui-toolkit-samples/blob/main/default/weather-webview/src/providers/WeatherViewProvider.ts
@@ -161,6 +189,59 @@ function scheduleTask(scheduler: TaskScheduler, task: Task, source: string): voi
 	void scheduler
 		.schedule(task, () => task.run())
 		.catch((error) => console.error(`[${source}] taskScheduler.schedule failed:`, error))
+}
+
+function isClineMessagesTransportMessage(message: ExtensionMessage): boolean {
+	return (
+		message.type === "clineMessageAppended" ||
+		message.type === "clineMessageUpdated" ||
+		message.type === "clineMessagesSnapshotStart" ||
+		message.type === "clineMessagesSnapshotChunk" ||
+		message.type === "clineMessagesSnapshotEnd"
+	)
+}
+
+export function isClineMessagesPartialCoalescingEnabled(environment: NodeJS.ProcessEnv = process.env): boolean {
+	return environment[CLINE_MESSAGES_PARTIAL_COALESCING_ENV] === "1"
+}
+
+function sameClineMessagesPartialUpdateIdentity(
+	left: ClineMessagesPartialUpdateIdentity,
+	right: ClineMessagesPartialUpdateIdentity,
+): boolean {
+	return (
+		left.taskId === right.taskId &&
+		left.generation === right.generation &&
+		left.messageTimestamp === right.messageTimestamp &&
+		left.messageIndex === right.messageIndex &&
+		left.messageType === right.messageType &&
+		left.messageAsk === right.messageAsk &&
+		left.messageSay === right.messageSay
+	)
+}
+
+function captureClineMessagesPartialUpdate(message: ClineMessage): ClineMessage | undefined {
+	if (message.checkpoint !== undefined) {
+		return undefined
+	}
+	return {
+		ts: message.ts,
+		type: message.type,
+		ask: message.ask,
+		say: message.say,
+		text: message.text,
+		images: message.images ? [...message.images] : undefined,
+		partial: message.partial,
+		reasoning: message.reasoning,
+		conversationHistoryIndex: message.conversationHistoryIndex,
+		progressStatus: message.progressStatus ? { ...message.progressStatus } : undefined,
+		contextCondense: message.contextCondense ? { ...message.contextCondense } : undefined,
+		contextTruncation: message.contextTruncation ? { ...message.contextTruncation } : undefined,
+		isProtected: message.isProtected,
+		apiProtocol: message.apiProtocol,
+		isAnswered: message.isAnswered,
+		autoApprovalDecision: message.autoApprovalDecision,
+	}
 }
 
 type GetStateOptions = {
@@ -207,8 +288,15 @@ export class ClineProvider
 	private static readonly CLINE_MESSAGES_SNAPSHOT_CHUNK_SIZE = 200
 	private readonly clineMessagesSeqByTaskId = new Map<string, number>()
 	private clineMessagesPostQueue: Promise<void> = Promise.resolve()
+	private clineMessagesTransitionBoundaryActive = false
+	private clineMessagesPartialUpdateQueue?: ClineMessagesTransportQueue<
+		ClineMessagesPartialUpdateIdentity,
+		ClineMessagesPartialUpdatePayload
+	>
+	private clineMessagesPartialCoalescingEnabled = false
 	private clineMessagesTransportGeneration = 0
 	private nextClineMessagesSnapshotId = 0
+	private clineMessagesTransportDiagnostics?: ClineMessagesTransportDiagnostics
 	private readonly _postStateToWebviewThrottled = debounce(
 		async () => {
 			try {
@@ -319,6 +407,14 @@ export class ClineProvider
 			ClineProvider.PENDING_OPERATION_TIMEOUT_MS,
 			(message) => this.log(message),
 		)
+		if (isClineMessagesTransportDiagnosticsEnabled()) {
+			this.enableClineMessagesTransportDiagnostics({
+				onHighWater: (event) => this.log(formatClineMessagesTransportHighWater(event)),
+			})
+		}
+		if (isClineMessagesPartialCoalescingEnabled()) {
+			this.enableClineMessagesPartialCoalescing()
+		}
 
 		ClineProvider.activeInstances.add(this)
 
@@ -782,6 +878,8 @@ export class ClineProvider
 		}
 
 		this._disposed = true
+		this.disposeClineMessagesPartialUpdateQueue(new Error("ClineProvider disposed"))
+		this.disableClineMessagesTransportDiagnostics()
 		this._postStateToWebviewThrottled.cancel()
 		this.log("Disposing ClineProvider...")
 
@@ -1418,6 +1516,20 @@ export class ClineProvider
 			return
 		}
 
+		if (
+			!isClineMessagesTransportMessage(message) &&
+			(this.clineMessagesPartialCoalescingEnabled || this.clineMessagesTransitionBoundaryActive)
+		) {
+			return this.enqueueClineMessagesHardBoundary(() => this.postMessageToWebviewDirect(message))
+		}
+		return this.postMessageToWebviewDirect(message)
+	}
+
+	private async postMessageToWebviewDirect(message: ExtensionMessage): Promise<void> {
+		if (this._disposed) {
+			return
+		}
+
 		// Browser webviews use the dedicated transcript transport below. The CLI
 		// still consumes transcript state and legacy updates until its clients adopt
 		// the sequence-aware protocol.
@@ -1426,9 +1538,21 @@ export class ClineProvider
 			message = { ...message, state: metadataState }
 		}
 
+		const activeDiagnostics = this.clineMessagesTransportDiagnostics
+		const diagnostics =
+			activeDiagnostics && isClineMessagesTransportMessage(message) ? activeDiagnostics : undefined
+		const bridgePost = diagnostics?.startBridgePost()
+
 		try {
-			await this.view?.webview.postMessage(message)
+			const webview = this.view?.webview
+			if (!webview) {
+				diagnostics?.markBridgePostSettled(bridgePost, "dropped")
+				return
+			}
+			await webview.postMessage(message)
+			diagnostics?.markBridgePostSettled(bridgePost, "completed")
 		} catch {
+			diagnostics?.markBridgePostSettled(bridgePost, "failed")
 			// View disposed, drop message silently
 		}
 	}
@@ -1443,16 +1567,236 @@ export class ClineProvider
 		return next
 	}
 
-	private enqueueClineMessagesPost(operation: () => Promise<void>): Promise<void> {
-		const run = this.clineMessagesPostQueue.then(operation, operation)
-		this.clineMessagesPostQueue = run.catch((error) => {
-			this.log(`[clineMessages] transport failure: ${error instanceof Error ? error.message : String(error)}`)
-		})
+	private enqueueClineMessagesPost(
+		operation: () => Promise<void>,
+		diagnosticOperation?: ClineMessagesTransportDiagnosticOperation,
+	): Promise<void> {
+		if (!diagnosticOperation) {
+			const run = this.clineMessagesPostQueue.then(operation, operation)
+			this.setClineMessagesPostQueue(
+				run.catch((error) => {
+					this.log(
+						`[clineMessages] transport failure: ${error instanceof Error ? error.message : String(error)}`,
+					)
+				}),
+			)
+			return run
+		}
+
+		const runOperation = async () => {
+			this.clineMessagesTransportDiagnostics?.markStarted(diagnosticOperation)
+			let failed = true
+			try {
+				await operation()
+				failed = false
+			} finally {
+				this.clineMessagesTransportDiagnostics?.markSettled(diagnosticOperation, failed)
+			}
+		}
+		const run = this.clineMessagesPostQueue.then(runOperation, runOperation)
+		this.setClineMessagesPostQueue(
+			run.catch((error) => {
+				this.log(`[clineMessages] transport failure: ${error instanceof Error ? error.message : String(error)}`)
+			}),
+		)
 		return run
 	}
 
+	private setClineMessagesPostQueue(queue: Promise<void>): void {
+		this.clineMessagesPostQueue = queue
+		if (!this.clineMessagesTransitionBoundaryActive) {
+			return
+		}
+		void queue.then(() => {
+			if (this.clineMessagesPostQueue === queue && !this.clineMessagesPartialCoalescingEnabled) {
+				this.clineMessagesTransitionBoundaryActive = false
+			}
+		})
+	}
+
+	private enqueueClineMessagesHardBoundary(
+		operation: () => Promise<void>,
+		diagnosticOperation?: ClineMessagesTransportDiagnosticOperation,
+	): Promise<void> {
+		const coalescingQueue = this.clineMessagesPartialUpdateQueue
+		if (!this.clineMessagesPartialCoalescingEnabled || !coalescingQueue) {
+			return this.enqueueClineMessagesPost(operation, diagnosticOperation)
+		}
+		const result = coalescingQueue.enqueueBoundary(() =>
+			this.runClineMessagesDiagnosticOperation(operation, diagnosticOperation),
+		)
+		if (result.hardBoundaryClosed) {
+			this.clineMessagesTransportDiagnostics?.markCoalescingHardBoundaryFlush()
+		}
+		return result.promise
+	}
+
+	private async runClineMessagesDiagnosticOperation(
+		operation: () => Promise<void>,
+		diagnosticOperation?: ClineMessagesTransportDiagnosticOperation,
+	): Promise<void> {
+		if (!diagnosticOperation) {
+			return operation()
+		}
+		this.clineMessagesTransportDiagnostics?.markStarted(diagnosticOperation)
+		let failed = true
+		try {
+			await operation()
+			failed = false
+		} finally {
+			this.clineMessagesTransportDiagnostics?.markSettled(diagnosticOperation, failed)
+		}
+	}
+
+	private recordDroppedClineMessagesOperation(
+		kind: ClineMessagesTransportOperationKind,
+		sequence: number,
+		payload: unknown,
+		reason: ClineMessagesTransportDropReason,
+	): void {
+		const diagnostics = this.clineMessagesTransportDiagnostics
+		const diagnosticOperation = diagnostics?.beginOperation(kind, sequence, payload)
+		diagnostics?.markEnqueued(diagnosticOperation)
+		diagnostics?.markStarted(diagnosticOperation)
+		diagnostics?.markDropped(diagnosticOperation, reason)
+		diagnostics?.markSettled(diagnosticOperation)
+	}
+
+	private captureClineMessagesBoundaryPayload<T>(
+		payload: T,
+		kind: "append" | "update-final" | "update-partial" | "snapshot",
+	): T {
+		try {
+			return structuredClone(payload)
+		} catch (error) {
+			const diagnostics = this.clineMessagesTransportDiagnostics
+			const diagnosticOperation = diagnostics?.beginOperation(kind, 0, payload)
+			diagnostics?.markCloneFailed(diagnosticOperation)
+			throw error
+		}
+	}
+
+	private markClineMessagesPartialCoalescingHardBoundary(): void {
+		if (this.clineMessagesPartialUpdateQueue?.markHardBoundary()) {
+			this.clineMessagesTransportDiagnostics?.markCoalescingHardBoundaryFlush()
+		}
+	}
+
+	private getClineMessagesPartialUpdateIdentity(
+		taskId: string,
+		message: ClineMessage,
+	): ClineMessagesPartialUpdateIdentity | undefined {
+		const currentTask = this.getCurrentTask()
+		const hasValidDiscriminant =
+			(message.type === "ask" && message.ask !== undefined && message.say === undefined) ||
+			(message.type === "say" && message.say !== undefined && message.ask === undefined)
+		if (
+			!currentTask ||
+			currentTask.taskId !== taskId ||
+			!Number.isSafeInteger(message.ts) ||
+			!hasValidDiscriminant
+		) {
+			return undefined
+		}
+
+		const matchingIndices: number[] = []
+		for (let index = 0; index < currentTask.clineMessages.length; index++) {
+			if (currentTask.clineMessages[index]?.ts === message.ts) {
+				matchingIndices.push(index)
+				if (matchingIndices.length > 1) {
+					return undefined
+				}
+			}
+		}
+		const messageIndex = matchingIndices[0]
+		if (messageIndex === undefined || messageIndex !== currentTask.clineMessages.length - 1) {
+			return undefined
+		}
+		const authoritativeMessage = currentTask.clineMessages[messageIndex]
+		if (
+			!authoritativeMessage ||
+			authoritativeMessage !== message ||
+			authoritativeMessage.partial !== true ||
+			authoritativeMessage.type !== message.type ||
+			authoritativeMessage.ask !== message.ask ||
+			authoritativeMessage.say !== message.say
+		) {
+			return undefined
+		}
+
+		return {
+			taskId,
+			generation: this.clineMessagesTransportGeneration,
+			messageTimestamp: message.ts,
+			messageIndex,
+			messageType: message.type,
+			messageAsk: message.ask,
+			messageSay: message.say,
+		}
+	}
+
+	private getClineMessagesPartialUpdateObservation(
+		observation: ClineMessagesTransportCoalescingObservation | undefined,
+	): ClineMessagesTransportQueueObservation | undefined {
+		const diagnostics = this.clineMessagesTransportDiagnostics
+		if (!diagnostics || !observation) {
+			return undefined
+		}
+		const queueObservation: ClineMessagesTransportQueueObservation & {
+			coalescingObservation: ClineMessagesTransportCoalescingObservation
+		} = {
+			coalescingObservation: observation,
+			onQueued: () => diagnostics.markCoalescingOffered(observation),
+			onSuperseded: (replacement) => {
+				diagnostics.markCoalescingSuperseded(observation)
+				const replacementObservation = replacement as
+					| (ClineMessagesTransportQueueObservation & {
+							coalescingObservation?: ClineMessagesTransportCoalescingObservation
+					  })
+					| undefined
+				diagnostics.markCoalescingPendingReplaced(observation, replacementObservation?.coalescingObservation)
+			},
+			onStarted: () => diagnostics.markCoalescingPendingStarted(observation),
+			onEmitted: (waiterCount) => diagnostics.markCoalescingEmitted(observation, waiterCount),
+			onDiscarded: () => diagnostics.markCoalescingPendingRemoved(observation),
+			onSettled: (outcome) => diagnostics.markCoalescingWaiterSettled(observation, outcome !== "completed"),
+		}
+		return queueObservation
+	}
+
+	private disposeClineMessagesPartialUpdateQueue(error: Error): void {
+		const queue = this.clineMessagesPartialUpdateQueue
+		queue?.dispose(error)
+		this.clineMessagesPartialUpdateQueue = undefined
+		this.clineMessagesPartialCoalescingEnabled = false
+		if (queue) {
+			this.clineMessagesTransitionBoundaryActive = true
+			this.setClineMessagesPostQueue(
+				queue.waitForIdle().catch((queueError) => {
+					this.log(
+						`[clineMessages] transport failure: ${queueError instanceof Error ? queueError.message : String(queueError)}`,
+					)
+				}),
+			)
+		}
+	}
+
 	private invalidateClineMessagesTransport(): number {
+		this.markClineMessagesPartialCoalescingHardBoundary()
 		return ++this.clineMessagesTransportGeneration
+	}
+
+	private getClineMessagesTransportDropReason(
+		generation: number,
+		taskId: string | undefined,
+	): ClineMessagesTransportDropReason | undefined {
+		if (generation !== this.clineMessagesTransportGeneration) {
+			return "generation"
+		}
+		if ((this.getCurrentTask()?.taskId ?? undefined) !== taskId) {
+			return "focus"
+		}
+		return undefined
 	}
 
 	public postClineMessageAppended(taskId: string, message: ClineMessage): Promise<void> {
@@ -1463,19 +1807,78 @@ export class ClineProvider
 			return this.postStateToWebviewWithoutTaskHistory()
 		}
 
-		const seq = this.bumpClineMessagesSeq(taskId)
 		const generation = this.clineMessagesTransportGeneration
-		const clonedMessage = structuredClone(message)
-		return this.enqueueClineMessagesPost(async () => {
-			if (generation !== this.clineMessagesTransportGeneration || this.getCurrentTask()?.taskId !== taskId) {
-				return
-			}
-			await this.postMessageToWebview({
+		if (!this.clineMessagesPartialCoalescingEnabled) {
+			const seq = this.bumpClineMessagesSeq(taskId)
+			const diagnostics = this.clineMessagesTransportDiagnostics
+			const diagnosticOperation = diagnostics?.beginOperation("append", seq, {
 				type: "clineMessageAppended",
 				taskId,
-				clineMessage: clonedMessage,
+				clineMessage: message,
 				clineMessagesSeq: seq,
 			})
+			let clonedMessage: ClineMessage
+			try {
+				clonedMessage = structuredClone(message)
+			} catch (error) {
+				diagnostics?.markCloneFailed(diagnosticOperation)
+				throw error
+			}
+			diagnostics?.markEnqueued(diagnosticOperation)
+			return this.enqueueClineMessagesPost(async () => {
+				const dropReason = this.getClineMessagesTransportDropReason(generation, taskId)
+				if (dropReason) {
+					this.clineMessagesTransportDiagnostics?.markDropped(diagnosticOperation, dropReason)
+					return
+				}
+				await this.postMessageToWebview({
+					type: "clineMessageAppended",
+					taskId,
+					clineMessage: clonedMessage,
+					clineMessagesSeq: seq,
+				})
+			}, diagnosticOperation)
+		}
+		const capturedMessage = this.captureClineMessagesBoundaryPayload(message, "append")
+		return this.enqueueClineMessagesHardBoundary(async () => {
+			const dropReason = this.getClineMessagesTransportDropReason(generation, taskId)
+			if (dropReason) {
+				const prospectiveSeq = this.getClineMessagesSeq(taskId) + 1
+				this.recordDroppedClineMessagesOperation(
+					"append",
+					prospectiveSeq,
+					{
+						type: "clineMessageAppended",
+						taskId,
+						clineMessage: capturedMessage,
+						clineMessagesSeq: prospectiveSeq,
+					},
+					dropReason,
+				)
+				return
+			}
+			const seq = this.bumpClineMessagesSeq(taskId)
+			const diagnostics = this.clineMessagesTransportDiagnostics
+			const diagnosticOperation = diagnostics?.beginOperation("append", seq, {
+				type: "clineMessageAppended",
+				taskId,
+				clineMessage: capturedMessage,
+				clineMessagesSeq: seq,
+			})
+			diagnostics?.markEnqueued(diagnosticOperation)
+			diagnostics?.markStarted(diagnosticOperation)
+			let failed = true
+			try {
+				await this.postMessageToWebviewDirect({
+					type: "clineMessageAppended",
+					taskId,
+					clineMessage: capturedMessage,
+					clineMessagesSeq: seq,
+				})
+				failed = false
+			} finally {
+				diagnostics?.markSettled(diagnosticOperation, failed)
+			}
 		})
 	}
 
@@ -1486,20 +1889,167 @@ export class ClineProvider
 		if (process.env.ROO_CLI_RUNTIME === "1") {
 			return this.postMessageToWebview({ type: "messageUpdated", clineMessage: structuredClone(message) })
 		}
+		if (message.partial === true && this.clineMessagesPartialCoalescingEnabled) {
+			const identity = this.getClineMessagesPartialUpdateIdentity(taskId, message)
+			const capturedMessage = identity ? captureClineMessagesPartialUpdate(message) : undefined
+			if (identity && capturedMessage) {
+				const diagnostics = this.clineMessagesTransportDiagnostics
+				const offeredWeight = diagnostics?.estimateWeight({
+					type: "clineMessageUpdated",
+					taskId,
+					clineMessage: capturedMessage,
+				})
+				const coalescingObservation = offeredWeight
+					? diagnostics?.beginCoalescingObservation(offeredWeight)
+					: undefined
+				const payload: ClineMessagesPartialUpdatePayload = {
+					message: capturedMessage,
+				}
+				const observation = this.getClineMessagesPartialUpdateObservation(coalescingObservation)
+				const coalescingQueue = this.clineMessagesPartialUpdateQueue
+				if (coalescingQueue) {
+					const result = coalescingQueue.enqueueCoalescible(
+						identity,
+						payload,
+						async (survivingPayload, execution) => {
+							const activeDiagnostics = this.clineMessagesTransportDiagnostics
+							const prospectiveSeq = this.getClineMessagesSeq(taskId) + 1
+							const diagnosticPayload = {
+								type: "clineMessageUpdated",
+								taskId,
+								clineMessage: survivingPayload.message,
+								clineMessagesSeq: prospectiveSeq,
+							} as const
+							const dropReason = this.getClineMessagesTransportDropReason(identity.generation, taskId)
+							if (dropReason) {
+								this.recordDroppedClineMessagesOperation(
+									"update-partial",
+									prospectiveSeq,
+									diagnosticPayload,
+									dropReason,
+								)
+								return
+							}
+							const diagnosticOperation = activeDiagnostics?.beginOperation(
+								"update-partial",
+								prospectiveSeq,
+								diagnosticPayload,
+							)
+							let clonedMessage: ClineMessage
+							try {
+								clonedMessage = structuredClone(survivingPayload.message)
+							} catch (error) {
+								activeDiagnostics?.markCloneFailed(diagnosticOperation)
+								throw error
+							}
+							const seq = this.bumpClineMessagesSeq(taskId)
+							activeDiagnostics?.markEnqueued(diagnosticOperation)
+							activeDiagnostics?.markStarted(diagnosticOperation)
+							let failed = true
+							try {
+								execution.markEmitted()
+								await this.postMessageToWebviewDirect({
+									type: "clineMessageUpdated",
+									taskId,
+									clineMessage: clonedMessage,
+									clineMessagesSeq: seq,
+								})
+								failed = false
+							} finally {
+								activeDiagnostics?.markSettled(diagnosticOperation, failed)
+							}
+						},
+						observation,
+					)
+					if (!result.superseded) {
+						diagnostics?.markCoalescingPendingQueued(coalescingObservation)
+					}
+					if (result.hardBoundaryClosed) {
+						diagnostics?.markCoalescingHardBoundaryFlush()
+					}
+					return result.promise
+				}
+			}
+			this.clineMessagesTransportDiagnostics?.markCoalescingFailClosedSkip()
+		}
 
-		const seq = this.bumpClineMessagesSeq(taskId)
 		const generation = this.clineMessagesTransportGeneration
-		const clonedMessage = structuredClone(message)
-		return this.enqueueClineMessagesPost(async () => {
-			if (generation !== this.clineMessagesTransportGeneration || this.getCurrentTask()?.taskId !== taskId) {
+		if (!this.clineMessagesPartialCoalescingEnabled) {
+			const seq = this.bumpClineMessagesSeq(taskId)
+			const diagnostics = this.clineMessagesTransportDiagnostics
+			const diagnosticOperation = diagnostics?.beginOperation(
+				message.partial === true ? "update-partial" : "update-final",
+				seq,
+				{
+					type: "clineMessageUpdated",
+					taskId,
+					clineMessage: message,
+					clineMessagesSeq: seq,
+				},
+			)
+			let clonedMessage: ClineMessage
+			try {
+				clonedMessage = structuredClone(message)
+			} catch (error) {
+				diagnostics?.markCloneFailed(diagnosticOperation)
+				throw error
+			}
+			diagnostics?.markEnqueued(diagnosticOperation)
+			return this.enqueueClineMessagesPost(async () => {
+				const dropReason = this.getClineMessagesTransportDropReason(generation, taskId)
+				if (dropReason) {
+					this.clineMessagesTransportDiagnostics?.markDropped(diagnosticOperation, dropReason)
+					return
+				}
+				await this.postMessageToWebview({
+					type: "clineMessageUpdated",
+					taskId,
+					clineMessage: clonedMessage,
+					clineMessagesSeq: seq,
+				})
+			}, diagnosticOperation)
+		}
+		const updateKind = message.partial === true ? "update-partial" : "update-final"
+		const capturedMessage = this.captureClineMessagesBoundaryPayload(message, updateKind)
+		return this.enqueueClineMessagesHardBoundary(async () => {
+			const dropReason = this.getClineMessagesTransportDropReason(generation, taskId)
+			if (dropReason) {
+				const prospectiveSeq = this.getClineMessagesSeq(taskId) + 1
+				this.recordDroppedClineMessagesOperation(
+					updateKind,
+					prospectiveSeq,
+					{
+						type: "clineMessageUpdated",
+						taskId,
+						clineMessage: capturedMessage,
+						clineMessagesSeq: prospectiveSeq,
+					},
+					dropReason,
+				)
 				return
 			}
-			await this.postMessageToWebview({
+			const seq = this.bumpClineMessagesSeq(taskId)
+			const diagnostics = this.clineMessagesTransportDiagnostics
+			const diagnosticOperation = diagnostics?.beginOperation(updateKind, seq, {
 				type: "clineMessageUpdated",
 				taskId,
-				clineMessage: clonedMessage,
+				clineMessage: capturedMessage,
 				clineMessagesSeq: seq,
 			})
+			diagnostics?.markEnqueued(diagnosticOperation)
+			diagnostics?.markStarted(diagnosticOperation)
+			let failed = true
+			try {
+				await this.postMessageToWebviewDirect({
+					type: "clineMessageUpdated",
+					taskId,
+					clineMessage: capturedMessage,
+					clineMessagesSeq: seq,
+				})
+				failed = false
+			} finally {
+				diagnostics?.markSettled(diagnosticOperation, failed)
+			}
 		})
 	}
 
@@ -1515,56 +2065,232 @@ export class ClineProvider
 			return this.postStateToWebviewWithoutTaskHistory()
 		}
 
-		const seq = taskId
-			? options.bumpSeq
-				? this.bumpClineMessagesSeq(taskId)
-				: this.getClineMessagesSeq(taskId)
-			: 0
-		const messages = structuredClone(currentTask?.clineMessages ?? [])
-		const snapshotId = `${taskId ?? "none"}:${++this.nextClineMessagesSnapshotId}`
+		const sourceMessages = currentTask?.clineMessages ?? []
 		const generation = options.generation ?? this.clineMessagesTransportGeneration
-
-		return this.enqueueClineMessagesPost(async () => {
-			const isCurrent = () =>
-				generation === this.clineMessagesTransportGeneration &&
-				(this.getCurrentTask()?.taskId ?? undefined) === taskId
-			if (!isCurrent()) {
-				return
-			}
-
-			await this.postMessageToWebview({
-				type: "clineMessagesSnapshotStart",
+		if (!this.clineMessagesPartialCoalescingEnabled) {
+			const seq = taskId
+				? options.bumpSeq
+					? this.bumpClineMessagesSeq(taskId)
+					: this.getClineMessagesSeq(taskId)
+				: 0
+			const diagnostics = this.clineMessagesTransportDiagnostics
+			const diagnosticOperation = diagnostics?.beginOperation("snapshot", seq, {
+				type: "clineMessagesSnapshot",
 				taskId,
 				clineMessagesSeq: seq,
-				snapshotId,
-				snapshotTotal: messages.length,
+				clineMessages: sourceMessages,
 			})
-
-			for (let start = 0; start < messages.length; start += ClineProvider.CLINE_MESSAGES_SNAPSHOT_CHUNK_SIZE) {
+			let messages: ClineMessage[]
+			try {
+				messages = structuredClone(sourceMessages)
+			} catch (error) {
+				diagnostics?.markCloneFailed(diagnosticOperation)
+				throw error
+			}
+			diagnostics?.markEnqueued(diagnosticOperation)
+			const snapshotId = `${taskId ?? "none"}:${++this.nextClineMessagesSnapshotId}`
+			return this.enqueueClineMessagesPost(async () => {
+				const isCurrent = () => {
+					const dropReason = this.getClineMessagesTransportDropReason(generation, taskId)
+					if (dropReason) {
+						this.clineMessagesTransportDiagnostics?.markDropped(diagnosticOperation, dropReason)
+						return false
+					}
+					return true
+				}
 				if (!isCurrent()) {
 					return
 				}
 				await this.postMessageToWebview({
-					type: "clineMessagesSnapshotChunk",
+					type: "clineMessagesSnapshotStart",
 					taskId,
 					clineMessagesSeq: seq,
 					snapshotId,
-					snapshotStartIndex: start,
-					clineMessages: messages.slice(start, start + ClineProvider.CLINE_MESSAGES_SNAPSHOT_CHUNK_SIZE),
+					snapshotTotal: messages.length,
 				})
-			}
+				for (
+					let start = 0;
+					start < messages.length;
+					start += ClineProvider.CLINE_MESSAGES_SNAPSHOT_CHUNK_SIZE
+				) {
+					if (!isCurrent()) {
+						return
+					}
+					await this.postMessageToWebview({
+						type: "clineMessagesSnapshotChunk",
+						taskId,
+						clineMessagesSeq: seq,
+						snapshotId,
+						snapshotStartIndex: start,
+						clineMessages: messages.slice(start, start + ClineProvider.CLINE_MESSAGES_SNAPSHOT_CHUNK_SIZE),
+					})
+				}
+				if (!isCurrent()) {
+					return
+				}
+				await this.postMessageToWebview({
+					type: "clineMessagesSnapshotEnd",
+					taskId,
+					clineMessagesSeq: seq,
+					snapshotId,
+					snapshotTotal: messages.length,
+				})
+			}, diagnosticOperation)
+		}
 
-			if (!isCurrent()) {
+		const messages = this.captureClineMessagesBoundaryPayload(sourceMessages, "snapshot")
+		return this.enqueueClineMessagesHardBoundary(async () => {
+			const initialDropReason = this.getClineMessagesTransportDropReason(generation, taskId)
+			if (initialDropReason) {
+				const prospectiveSeq = taskId
+					? options.bumpSeq
+						? this.getClineMessagesSeq(taskId) + 1
+						: this.getClineMessagesSeq(taskId)
+					: 0
+				this.recordDroppedClineMessagesOperation(
+					"snapshot",
+					prospectiveSeq,
+					{
+						type: "clineMessagesSnapshot",
+						taskId,
+						clineMessagesSeq: prospectiveSeq,
+						clineMessages: messages,
+					},
+					initialDropReason,
+				)
 				return
 			}
-			await this.postMessageToWebview({
-				type: "clineMessagesSnapshotEnd",
+			const seq = taskId
+				? options.bumpSeq
+					? this.bumpClineMessagesSeq(taskId)
+					: this.getClineMessagesSeq(taskId)
+				: 0
+			const diagnostics = this.clineMessagesTransportDiagnostics
+			const diagnosticOperation = diagnostics?.beginOperation("snapshot", seq, {
+				type: "clineMessagesSnapshot",
 				taskId,
 				clineMessagesSeq: seq,
-				snapshotId,
-				snapshotTotal: messages.length,
+				clineMessages: messages,
 			})
+			diagnostics?.markEnqueued(diagnosticOperation)
+			diagnostics?.markStarted(diagnosticOperation)
+			const snapshotId = `${taskId ?? "none"}:${++this.nextClineMessagesSnapshotId}`
+			let failed = true
+			try {
+				const isCurrent = () => {
+					const dropReason = this.getClineMessagesTransportDropReason(generation, taskId)
+					if (dropReason) {
+						this.clineMessagesTransportDiagnostics?.markDropped(diagnosticOperation, dropReason)
+						failed = false
+						return false
+					}
+					return true
+				}
+				if (!isCurrent()) {
+					return
+				}
+
+				await this.postMessageToWebviewDirect({
+					type: "clineMessagesSnapshotStart",
+					taskId,
+					clineMessagesSeq: seq,
+					snapshotId,
+					snapshotTotal: messages.length,
+				})
+
+				for (
+					let start = 0;
+					start < messages.length;
+					start += ClineProvider.CLINE_MESSAGES_SNAPSHOT_CHUNK_SIZE
+				) {
+					if (!isCurrent()) {
+						return
+					}
+					await this.postMessageToWebviewDirect({
+						type: "clineMessagesSnapshotChunk",
+						taskId,
+						clineMessagesSeq: seq,
+						snapshotId,
+						snapshotStartIndex: start,
+						clineMessages: messages.slice(start, start + ClineProvider.CLINE_MESSAGES_SNAPSHOT_CHUNK_SIZE),
+					})
+				}
+
+				if (!isCurrent()) {
+					return
+				}
+				await this.postMessageToWebviewDirect({
+					type: "clineMessagesSnapshotEnd",
+					taskId,
+					clineMessagesSeq: seq,
+					snapshotId,
+					snapshotTotal: messages.length,
+				})
+				failed = false
+			} finally {
+				diagnostics?.markSettled(diagnosticOperation, failed)
+			}
 		})
+	}
+
+	/** @internal Diagnostic and test seam; no persisted or user-visible setting is created. */
+	public enableClineMessagesTransportDiagnostics(options: ClineMessagesTransportDiagnosticsOptions = {}): void {
+		this.clineMessagesTransportDiagnostics?.dispose()
+		this.clineMessagesTransportDiagnostics = new ClineMessagesTransportDiagnostics(options)
+	}
+
+	/** @internal Returns scalar-only data and never exposes transcript payload references. */
+	public getClineMessagesTransportDiagnostics(): ClineMessagesTransportDiagnosticsSnapshot | undefined {
+		return this.clineMessagesTransportDiagnostics?.snapshot()
+	}
+
+	/** @internal Invalidates in-flight observations and clears all bounded diagnostic state. */
+	public resetClineMessagesTransportDiagnostics(): void {
+		this.clineMessagesTransportDiagnostics?.reset()
+	}
+
+	/** @internal Clears diagnostic state and restores the near-zero-overhead transport path. */
+	public disableClineMessagesTransportDiagnostics(): void {
+		this.clineMessagesTransportDiagnostics?.dispose()
+		this.clineMessagesTransportDiagnostics = undefined
+	}
+
+	/**
+	 * @internal Hidden, non-persisted A/B control. The conservative default is
+	 * off; the environment opt-in uses ROO_CODE_TRANSCRIPT_PARTIAL_COALESCING=1.
+	 */
+	public enableClineMessagesPartialCoalescing(): void {
+		if (this._disposed || this.clineMessagesPartialCoalescingEnabled) {
+			return
+		}
+		this.clineMessagesPartialUpdateQueue = new ClineMessagesTransportQueue(
+			sameClineMessagesPartialUpdateIdentity,
+			this.clineMessagesPostQueue,
+		)
+		this.clineMessagesTransitionBoundaryActive = false
+		this.clineMessagesPartialCoalescingEnabled = true
+	}
+
+	/** @internal Allows Task events to snapshot revisions only while fan-in can delay their emission. */
+	public isClineMessagesPartialCoalescingActive(): boolean {
+		return this.clineMessagesPartialCoalescingEnabled
+	}
+
+	/**
+	 * @internal Immediate kill switch. Pending candidate work is rejected so no
+	 * caller is stranded; in-flight VS Code bridge posts cannot be cancelled.
+	 */
+	public disableClineMessagesPartialCoalescing(): void {
+		this.disposeClineMessagesPartialUpdateQueue(new Error("Cline messages partial coalescing disabled"))
+	}
+
+	/** @internal Test/diagnostic reset with the same settlement contract as the kill switch. */
+	public resetClineMessagesPartialCoalescing(): void {
+		const wasEnabled = this.clineMessagesPartialCoalescingEnabled
+		this.disposeClineMessagesPartialUpdateQueue(new Error("Cline messages partial coalescing reset"))
+		if (wasEnabled && !this._disposed) {
+			this.enableClineMessagesPartialCoalescing()
+		}
 	}
 
 	public resyncClineMessagesToWebview(taskId?: string): Promise<void> {

@@ -28,7 +28,7 @@ import { ContextProxy } from "../../config/ContextProxy"
 import { Task, TaskOptions } from "../../task/Task"
 import { safeWriteJson } from "../../../utils/safeWriteJson"
 
-import { ClineProvider } from "../ClineProvider"
+import { ClineProvider, isClineMessagesPartialCoalescingEnabled } from "../ClineProvider"
 import { webviewMessageHandler } from "../webviewMessageHandler"
 import { Terminal } from "../../../integrations/terminal/Terminal"
 import { MessageManager } from "../../message-manager"
@@ -882,6 +882,20 @@ describe("ClineProvider", () => {
 		const setCurrentTask = (task: { taskId: string; clineMessages: ClineMessage[] } | undefined) => {
 			vi.spyOn(provider, "getCurrentTask").mockImplementation(() => task as Task | undefined)
 		}
+		const flushMicrotasks = async (turns = 5): Promise<void> => {
+			for (let turn = 0; turn < turns; turn++) {
+				await Promise.resolve()
+			}
+		}
+
+		test("requires the exact hidden environment opt-in for partial coalescing", () => {
+			expect(isClineMessagesPartialCoalescingEnabled({})).toBe(false)
+			expect(isClineMessagesPartialCoalescingEnabled({ ROO_CODE_TRANSCRIPT_PARTIAL_COALESCING: "0" })).toBe(false)
+			expect(isClineMessagesPartialCoalescingEnabled({ ROO_CODE_TRANSCRIPT_PARTIAL_COALESCING: "true" })).toBe(
+				false,
+			)
+			expect(isClineMessagesPartialCoalescingEnabled({ ROO_CODE_TRANSCRIPT_PARTIAL_COALESCING: "1" })).toBe(true)
+		})
 
 		test("preserves legacy transcript messages for CLI consumers", async () => {
 			await provider.resolveWebviewView(mockWebviewView)
@@ -961,6 +975,722 @@ describe("ClineProvider", () => {
 					clineMessagesSeq: 2,
 				},
 			])
+		})
+
+		test("leaves diagnostics disabled without estimating transcript weight", async () => {
+			const task = { taskId: "task-1", clineMessages: [] as ClineMessage[] }
+			setCurrentTask(task)
+			const message = {
+				ts: 1,
+				type: "say",
+				say: "text",
+				text: "synthetic",
+				partial: true,
+			} as ClineMessage
+
+			expect(provider.getClineMessagesTransportDiagnostics()).toBeUndefined()
+			await provider.postClineMessageUpdated("task-1", message)
+
+			expect(provider.getClineMessagesTransportDiagnostics()).toBeUndefined()
+		})
+
+		test("measures deterministic superlinear full-prefix backlog and drains it", async () => {
+			const updateCount = 64
+			const charactersPerRevision = 256
+			const curveCheckpoints = new Set([8, 16, 32, 64])
+			const backlogCurve: Array<{
+				operations: number
+				estimatedCharacters: number
+				estimatedBytes: number
+			}> = []
+			const task = { taskId: "task-1", clineMessages: [] as ClineMessage[] }
+			setCurrentTask(task)
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesTransportDiagnostics({ maxRecentOperations: 8 })
+
+			let releaseBridge!: () => void
+			const bridgeGate = new Promise<void>((resolve) => {
+				releaseBridge = resolve
+			})
+			mockPostMessage.mockImplementationOnce(() => bridgeGate).mockResolvedValue(undefined)
+
+			const pendingPosts: Promise<void>[] = []
+			let growingText = ""
+			for (let revision = 1; revision <= updateCount; revision++) {
+				growingText += "x".repeat(charactersPerRevision)
+				pendingPosts.push(
+					provider.postClineMessageUpdated("task-1", {
+						ts: 1,
+						type: "say",
+						say: "text",
+						text: growingText,
+						partial: true,
+					}),
+				)
+				if (curveCheckpoints.has(revision)) {
+					const checkpoint = provider.getClineMessagesTransportDiagnostics()
+					backlogCurve.push({
+						operations: checkpoint?.pending.operations ?? 0,
+						estimatedCharacters: checkpoint?.pending.estimatedCharacters ?? 0,
+						estimatedBytes: checkpoint?.pending.estimatedBytes ?? 0,
+					})
+				}
+			}
+
+			await flushMicrotasks()
+			const peak = provider.getClineMessagesTransportDiagnostics()
+			const linearFinalPayloadWeight = updateCount * charactersPerRevision
+			const expectedPrefixTextCharacters = charactersPerRevision * ((updateCount * (updateCount + 1)) / 2)
+
+			expect(mockPostMessage).toHaveBeenCalledOnce()
+			expect(peak).toMatchObject({
+				pending: { operations: updateCount, bridgePosts: 1 },
+				highWater: { operations: updateCount, bridgePosts: 1 },
+				totals: { enqueued: updateCount, started: 1, completed: 0, failed: 0 },
+				byKind: { "update-partial": { enqueued: updateCount } },
+			})
+			expect(peak?.pending.estimatedCharacters).toBeGreaterThanOrEqual(expectedPrefixTextCharacters)
+			expect(peak?.pending.estimatedCharacters).toBeGreaterThan(linearFinalPayloadWeight * 16)
+			expect(backlogCurve).toEqual([
+				{ operations: 8, estimatedCharacters: 10_368, estimatedBytes: 10_368 },
+				{ operations: 16, estimatedCharacters: 37_127, estimatedBytes: 37_127 },
+				{ operations: 32, estimatedCharacters: 139_799, estimatedBytes: 139_799 },
+				{ operations: 64, estimatedCharacters: 541_751, estimatedBytes: 541_751 },
+			])
+			for (let index = 1; index < backlogCurve.length; index++) {
+				const previous = backlogCurve[index - 1]
+				const current = backlogCurve[index]
+				expect(current.estimatedCharacters / current.operations).toBeGreaterThan(
+					previous.estimatedCharacters / previous.operations,
+				)
+				expect(current.estimatedCharacters / previous.estimatedCharacters).toBeGreaterThan(3.4)
+			}
+
+			releaseBridge()
+			await Promise.all(pendingPosts)
+
+			const drained = provider.getClineMessagesTransportDiagnostics()
+			expect(drained).toMatchObject({
+				pending: { operations: 0, estimatedCharacters: 0, estimatedBytes: 0, bridgePosts: 0 },
+				totals: {
+					enqueued: updateCount,
+					started: updateCount,
+					completed: updateCount,
+					failed: 0,
+					bridgePostsStarted: updateCount,
+					bridgePostsCompleted: updateCount,
+				},
+			})
+			expect(mockPostMessage).toHaveBeenCalledTimes(updateCount)
+			expect(drained?.recentOperations).toHaveLength(8)
+		})
+
+		test("bounds the candidate pending backlog at the deterministic curve checkpoints", async () => {
+			const updateCount = 64
+			const charactersPerRevision = 256
+			const curveCheckpoints = new Set([8, 16, 32, 64])
+			const backlogCurve: Array<{
+				operations: number
+				estimatedCharacters: number
+				estimatedBytes: number
+			}> = []
+			const partial = { ts: 1, type: "say", say: "text", text: "", partial: true } as ClineMessage
+			setCurrentTask({ taskId: "task-1", clineMessages: [partial] })
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesTransportDiagnostics({ maxRecentOperations: 8 })
+			provider.enableClineMessagesPartialCoalescing()
+
+			let releaseBridge!: () => void
+			const bridgeGate = new Promise<void>((resolve) => {
+				releaseBridge = resolve
+			})
+			mockPostMessage.mockImplementationOnce(() => bridgeGate).mockResolvedValue(undefined)
+
+			const pendingPosts: Promise<void>[] = []
+			for (let revision = 1; revision <= updateCount; revision++) {
+				partial.text += "x".repeat(charactersPerRevision)
+				pendingPosts.push(provider.postClineMessageUpdated("task-1", partial))
+				if (revision === 1) {
+					await flushMicrotasks()
+				}
+				if (curveCheckpoints.has(revision)) {
+					const checkpoint = provider.getClineMessagesTransportDiagnostics()
+					backlogCurve.push({
+						operations: checkpoint?.coalescing.pendingOperations ?? 0,
+						estimatedCharacters: checkpoint?.coalescing.pendingEstimatedCharacters ?? 0,
+						estimatedBytes: checkpoint?.coalescing.pendingEstimatedBytes ?? 0,
+					})
+				}
+			}
+
+			expect(backlogCurve).toEqual([
+				{ operations: 1, estimatedCharacters: 2_171, estimatedBytes: 2_171 },
+				{ operations: 1, estimatedCharacters: 4_219, estimatedBytes: 4_219 },
+				{ operations: 1, estimatedCharacters: 8_315, estimatedBytes: 8_315 },
+				{ operations: 1, estimatedCharacters: 16_507, estimatedBytes: 16_507 },
+			])
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				pending: { operations: 1, bridgePosts: 1 },
+				coalescing: { pendingOperations: 1, highWaterOperations: 1, pendingWaiters: updateCount },
+				totals: { coalescingOffered: updateCount, coalescingSuperseded: updateCount - 2 },
+			})
+
+			releaseBridge()
+			await Promise.all(pendingPosts)
+			expect(mockPostMessage).toHaveBeenCalledTimes(2)
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				pending: { operations: 0, bridgePosts: 0 },
+				coalescing: { pendingOperations: 0, pendingWaiters: 0 },
+			})
+		})
+
+		test("soaks thousands of candidate offers with bounded state, exact final state, and contiguous sequences", async () => {
+			const updateCount = 4_000
+			const diagnosticSampleLimit = 32
+			const partial = { ts: 1, type: "say", say: "text", text: "initial", partial: true } as ClineMessage
+			setCurrentTask({ taskId: "task-1", clineMessages: [partial] })
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesTransportDiagnostics({ maxRecentOperations: diagnosticSampleLimit })
+			provider.enableClineMessagesPartialCoalescing()
+
+			let releaseBridge!: () => void
+			const bridgeGate = new Promise<void>((resolve) => {
+				releaseBridge = resolve
+			})
+			mockPostMessage.mockImplementationOnce(() => bridgeGate).mockResolvedValue(undefined)
+
+			const pendingPosts: Promise<void>[] = []
+			for (let revision = 1; revision <= updateCount; revision++) {
+				partial.text = revision % 2 === 0 ? `short-${revision}` : `non-prefix replacement ${revision}`
+				pendingPosts.push(provider.postClineMessageUpdated("task-1", partial))
+				if (revision === 1) {
+					await flushMicrotasks()
+				}
+			}
+
+			const peak = provider.getClineMessagesTransportDiagnostics()
+			expect(peak).toMatchObject({
+				pending: { operations: 1, bridgePosts: 1 },
+				coalescing: { pendingOperations: 1, highWaterOperations: 1, pendingWaiters: updateCount },
+				totals: { coalescingOffered: updateCount, coalescingSuperseded: updateCount - 2 },
+			})
+
+			releaseBridge()
+			const settlements = await Promise.allSettled(pendingPosts)
+			expect(settlements).toHaveLength(updateCount)
+			expect(settlements.every(({ status }) => status === "fulfilled")).toBe(true)
+
+			const posts: ExtensionMessage[] = mockPostMessage.mock.calls.map(([message]: [ExtensionMessage]) => message)
+			const deltas = posts.filter(
+				(message): message is ExtensionMessage & { type: "clineMessageUpdated" } =>
+					message.type === "clineMessageUpdated",
+			)
+			expect(deltas.map((message: ExtensionMessage) => message.clineMessagesSeq)).toEqual([1, 2])
+			expect(deltas.at(-1)?.clineMessage).toMatchObject({ text: `short-${updateCount}`, partial: true })
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				pending: { operations: 0, bridgePosts: 0 },
+				coalescing: { pendingOperations: 0, pendingWaiters: 0, highWaterOperations: 1 },
+				totals: { coalescingWaitersSettled: updateCount, failed: 0 },
+			})
+			expect(provider.getClineMessagesTransportDiagnostics()?.recentOperations.length).toBeLessThanOrEqual(
+				diagnosticSampleLimit,
+			)
+
+			const failure = new Error("synthetic clone failure")
+			const structuredCloneSpy = vi.spyOn(globalThis, "structuredClone").mockImplementationOnce(() => {
+				throw failure
+			})
+			partial.text = "fails"
+			await expect(provider.postClineMessageUpdated("task-1", partial)).rejects.toBe(failure)
+			structuredCloneSpy.mockRestore()
+			partial.text = "after failure"
+			await expect(provider.postClineMessageUpdated("task-1", partial)).resolves.toBeUndefined()
+			expect(provider["clineMessagesSeqByTaskId"].get("task-1")).toBe(3)
+		})
+
+		test("coalesces only the latest pending same-message partial before clone and sequence allocation", async () => {
+			const task = {
+				taskId: "task-1",
+				clineMessages: [
+					{ ts: 1, type: "say", say: "text", text: "one", images: ["one.png"], partial: true },
+				] as ClineMessage[],
+			}
+			setCurrentTask(task)
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesTransportDiagnostics()
+			provider.enableClineMessagesPartialCoalescing()
+
+			let releaseBridge!: () => void
+			const bridgeGate = new Promise<void>((resolve) => {
+				releaseBridge = resolve
+			})
+			mockPostMessage.mockImplementationOnce(() => bridgeGate).mockResolvedValue(undefined)
+
+			const first = provider.postClineMessageUpdated("task-1", task.clineMessages[0])
+			await flushMicrotasks()
+			task.clineMessages[0].text = "two"
+			task.clineMessages[0].images = ["two.png"]
+			const second = provider.postClineMessageUpdated("task-1", task.clineMessages[0])
+			task.clineMessages[0].text = "three"
+			task.clineMessages[0].images?.push("three.png")
+			const third = provider.postClineMessageUpdated("task-1", task.clineMessages[0])
+			task.clineMessages[0].text = "mutated after offer"
+			task.clineMessages[0].images?.push("mutated.png")
+
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				pending: { operations: 1 },
+				coalescing: { pendingOperations: 1, pendingWaiters: 3, highWaterOperations: 1 },
+				totals: { coalescingOffered: 3, coalescingSuperseded: 1 },
+			})
+
+			releaseBridge()
+			await Promise.all([first, second, third])
+
+			const posts: ExtensionMessage[] = mockPostMessage.mock.calls.map(([message]: [ExtensionMessage]) => message)
+			expect(posts).toHaveLength(2)
+			expect(posts.map((message) => message.clineMessagesSeq)).toEqual([1, 2])
+			expect(posts[0].clineMessage).toMatchObject({ text: "one", images: ["one.png"] })
+			expect(posts[1].clineMessage).toMatchObject({ text: "three", images: ["two.png", "three.png"] })
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				pending: { operations: 0 },
+				coalescing: { pendingOperations: 0, pendingWaiters: 0 },
+				totals: {
+					coalescingOffered: 3,
+					coalescingSuperseded: 1,
+					coalescingEmitted: 2,
+					coalescingWaitersSettled: 3,
+				},
+			})
+		})
+
+		test("keeps final updates and unrelated webview posts as FIFO sequence boundaries", async () => {
+			const partial = { ts: 1, type: "say", say: "text", text: "one", partial: true } as ClineMessage
+			const task = { taskId: "task-1", clineMessages: [partial] }
+			setCurrentTask(task)
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesPartialCoalescing()
+
+			let releaseBridge!: () => void
+			const bridgeGate = new Promise<void>((resolve) => {
+				releaseBridge = resolve
+			})
+			mockPostMessage.mockImplementationOnce(() => bridgeGate).mockResolvedValue(undefined)
+
+			const first = provider.postClineMessageUpdated("task-1", partial)
+			await flushMicrotasks()
+			partial.text = "two"
+			const second = provider.postClineMessageUpdated("task-1", partial)
+			const unrelated = provider.postMessageToWebview({ type: "action", action: "focusInput" })
+			partial.text = "final"
+			partial.partial = false
+			const final = provider.postClineMessageUpdated("task-1", partial)
+
+			releaseBridge()
+			await Promise.all([first, second, unrelated, final])
+
+			const posts: ExtensionMessage[] = mockPostMessage.mock.calls.map(([message]: [ExtensionMessage]) => message)
+			expect(posts.map((message) => message.type)).toEqual([
+				"clineMessageUpdated",
+				"clineMessageUpdated",
+				"action",
+				"clineMessageUpdated",
+			])
+			expect(
+				posts
+					.filter((message) => message.type === "clineMessageUpdated")
+					.map((message) => message.clineMessagesSeq),
+			).toEqual([1, 2, 3])
+		})
+
+		test("captures enabled append, final, and snapshot boundaries when they are offered", async () => {
+			const partial = { ts: 1, type: "say", say: "text", text: "partial", partial: true } as ClineMessage
+			const appended = { ts: 2, type: "say", say: "text", text: "append offered" } as ClineMessage
+			const final = { ts: 3, type: "say", say: "text", text: "final offered", partial: false } as ClineMessage
+			const snapshotMessage = {
+				ts: 4,
+				type: "say",
+				say: "text",
+				text: "snapshot offered",
+				images: ["offered.png"],
+			} as ClineMessage
+			const task = { taskId: "task-1", clineMessages: [partial, snapshotMessage] }
+			setCurrentTask(task)
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesPartialCoalescing()
+
+			let releaseBridge!: () => void
+			const bridgeGate = new Promise<void>((resolve) => {
+				releaseBridge = resolve
+			})
+			mockPostMessage.mockImplementationOnce(() => bridgeGate).mockResolvedValue(undefined)
+
+			const blocked = provider.postClineMessageUpdated("task-1", partial)
+			await flushMicrotasks()
+			const appendBoundary = provider.postClineMessageAppended("task-1", appended)
+			const finalBoundary = provider.postClineMessageUpdated("task-1", final)
+			const snapshotBoundary = provider.postClineMessagesSnapshot("task-1", { bumpSeq: true })
+
+			appended.text = "append mutated"
+			final.text = "final mutated"
+			snapshotMessage.text = "snapshot mutated"
+			snapshotMessage.images?.push("mutated.png")
+			task.clineMessages.push({ ts: 5, type: "say", say: "text", text: "added later" } as ClineMessage)
+
+			releaseBridge()
+			await Promise.all([blocked, appendBoundary, finalBoundary, snapshotBoundary])
+
+			const posts: ExtensionMessage[] = mockPostMessage.mock.calls.map(([message]: [ExtensionMessage]) => message)
+			expect(posts.find((message) => message.type === "clineMessageAppended")?.clineMessage).toMatchObject({
+				text: "append offered",
+			})
+			expect(
+				posts.find(
+					(message) => message.type === "clineMessageUpdated" && message.clineMessage?.partial === false,
+				)?.clineMessage,
+			).toMatchObject({ text: "final offered" })
+			const snapshotChunk = posts.find((message) => message.type === "clineMessagesSnapshotChunk")
+			expect(snapshotChunk?.clineMessages).toEqual([
+				expect.objectContaining({ text: "partial" }),
+				expect.objectContaining({ text: "snapshot offered", images: ["offered.png"] }),
+			])
+		})
+
+		test("fails closed for ambiguous identity without coalescing", async () => {
+			const firstMessage = { ts: 1, type: "say", say: "text", text: "one", partial: true } as ClineMessage
+			const secondMessage = { ...firstMessage, text: "two" }
+			setCurrentTask({ taskId: "task-1", clineMessages: [firstMessage, secondMessage] })
+			provider.enableClineMessagesTransportDiagnostics()
+			provider.enableClineMessagesPartialCoalescing()
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+
+			await provider.postClineMessageUpdated("task-1", secondMessage)
+
+			expect(mockPostMessage).toHaveBeenCalledOnce()
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				totals: { coalescingOffered: 0, coalescingSuperseded: 0, coalescingFailClosedSkips: 1 },
+			})
+		})
+
+		test.each([
+			{ description: "ask message carrying say", message: { type: "ask", ask: "tool", say: "text" } },
+			{ description: "say message carrying ask", message: { type: "say", say: "text", ask: "tool" } },
+			{ description: "ask message missing ask", message: { type: "ask" } },
+			{ description: "say message missing say", message: { type: "say" } },
+		] as const)("fails closed for a malformed $description discriminant", async ({ message: discriminant }) => {
+			const message = { ts: 1, text: "partial", partial: true, ...discriminant } as ClineMessage
+			setCurrentTask({ taskId: "task-1", clineMessages: [message] })
+			provider.enableClineMessagesTransportDiagnostics()
+			provider.enableClineMessagesPartialCoalescing()
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+
+			await provider.postClineMessageUpdated("task-1", message)
+
+			expect(mockPostMessage).toHaveBeenCalledOnce()
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				totals: { coalescingOffered: 0, coalescingFailClosedSkips: 1 },
+			})
+		})
+
+		test("keeps generic posts behind an in-flight candidate after the kill switch", async () => {
+			const partial = { ts: 1, type: "say", say: "text", text: "one", partial: true } as ClineMessage
+			setCurrentTask({ taskId: "task-1", clineMessages: [partial] })
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesPartialCoalescing()
+
+			let releaseBridge!: () => void
+			const bridgeGate = new Promise<void>((resolve) => {
+				releaseBridge = resolve
+			})
+			mockPostMessage.mockImplementationOnce(() => bridgeGate).mockResolvedValue(undefined)
+
+			const candidate = provider.postClineMessageUpdated("task-1", partial)
+			await flushMicrotasks()
+			provider.disableClineMessagesPartialCoalescing()
+			const generic = provider.postMessageToWebview({ type: "action", action: "focusInput" })
+
+			expect(mockPostMessage).toHaveBeenCalledOnce()
+			await expect(candidate).rejects.toThrow("coalescing disabled")
+			releaseBridge()
+			await generic
+
+			expect(mockPostMessage.mock.calls.map(([message]: [ExtensionMessage]) => message.type)).toEqual([
+				"clineMessageUpdated",
+				"action",
+			])
+		})
+
+		test("rejects superseded callers without consuming a sequence and recovers contiguously", async () => {
+			const partial = { ts: 1, type: "say", say: "text", text: "one", partial: true } as ClineMessage
+			const task = { taskId: "task-1", clineMessages: [partial] }
+			setCurrentTask(task)
+			provider.enableClineMessagesPartialCoalescing()
+			let releaseCandidateGate!: () => void
+			const legacyGate = new Promise<void>((resolve) => {
+				releaseCandidateGate = resolve
+			})
+			Object.assign(provider, { clineMessagesPostQueue: legacyGate })
+			provider.resetClineMessagesPartialCoalescing()
+			const failure = new Error("surviving candidate failed")
+			const structuredCloneSpy = vi.spyOn(globalThis, "structuredClone").mockImplementationOnce(() => {
+				throw failure
+			})
+
+			const first = provider.postClineMessageUpdated("task-1", partial)
+			partial.text = "two"
+			const replacement = provider.postClineMessageUpdated("task-1", partial)
+			releaseCandidateGate()
+
+			await expect(first).rejects.toBe(failure)
+			await expect(replacement).rejects.toBe(failure)
+			structuredCloneSpy.mockRestore()
+			partial.partial = false
+			await expect(provider.postClineMessageUpdated("task-1", partial)).resolves.toBeUndefined()
+			expect(provider["clineMessagesSeqByTaskId"].get("task-1")).toBe(1)
+		})
+
+		test.each([
+			[
+				"kill switch",
+				(candidateProvider: ClineProvider) => candidateProvider.disableClineMessagesPartialCoalescing(),
+			],
+			["reset", (candidateProvider: ClineProvider) => candidateProvider.resetClineMessagesPartialCoalescing()],
+		])("settles pending candidate callers on %s", async (_description, transition) => {
+			const partial = { ts: 1, type: "say", say: "text", text: "one", partial: true } as ClineMessage
+			setCurrentTask({ taskId: "task-1", clineMessages: [partial] })
+			let releaseGate!: () => void
+			Object.assign(provider, {
+				clineMessagesPostQueue: new Promise<void>((resolve) => {
+					releaseGate = resolve
+				}),
+			})
+			provider.enableClineMessagesPartialCoalescing()
+
+			const pending = provider.postClineMessageUpdated("task-1", partial)
+			transition(provider)
+
+			await expect(pending).rejects.toThrow(/coalescing (disabled|reset)/)
+			releaseGate()
+		})
+
+		test("settles pending candidate callers when the provider is disposed", async () => {
+			const partial = { ts: 1, type: "say", say: "text", text: "one", partial: true } as ClineMessage
+			setCurrentTask({ taskId: "task-1", clineMessages: [partial] })
+			let releaseGate!: () => void
+			Object.assign(provider, {
+				clineMessagesPostQueue: new Promise<void>((resolve) => {
+					releaseGate = resolve
+				}),
+			})
+			provider.enableClineMessagesPartialCoalescing()
+
+			const pending = provider.postClineMessageUpdated("task-1", partial)
+			const disposal = provider.dispose()
+
+			await expect(pending).rejects.toThrow("ClineProvider disposed")
+			releaseGate()
+			await disposal
+		})
+
+		test("drops stale enabled boundaries without consuming transcript sequences", async () => {
+			const appended = { ts: 1, type: "say", say: "text", text: "append" } as ClineMessage
+			const final = { ts: 2, type: "say", say: "text", text: "final", partial: false } as ClineMessage
+			setCurrentTask({ taskId: "task-1", clineMessages: [appended, final] })
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesTransportDiagnostics()
+			let releaseGate!: () => void
+			Object.assign(provider, {
+				clineMessagesPostQueue: new Promise<void>((resolve) => {
+					releaseGate = resolve
+				}),
+			})
+			provider.enableClineMessagesPartialCoalescing()
+
+			const staleAppend = provider.postClineMessageAppended("task-1", appended)
+			const staleFinal = provider.postClineMessageUpdated("task-1", final)
+			const staleSnapshot = provider.postClineMessagesSnapshot("task-1", { bumpSeq: true })
+			const resync = provider.resyncClineMessagesToWebview("task-1")
+			releaseGate()
+			await Promise.all([staleAppend, staleFinal, staleSnapshot, resync])
+
+			const posts: ExtensionMessage[] = mockPostMessage.mock.calls.map(([message]: [ExtensionMessage]) => message)
+			expect(posts.map(({ type }) => type)).toEqual([
+				"clineMessagesSnapshotStart",
+				"clineMessagesSnapshotChunk",
+				"clineMessagesSnapshotEnd",
+			])
+			expect(posts.map(({ clineMessagesSeq }) => clineMessagesSeq)).toEqual([0, 0, 0])
+			expect(provider["clineMessagesSeqByTaskId"].has("task-1")).toBe(false)
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				totals: { dropped: 3, failed: 0, generationDrops: 3 },
+				byKind: {
+					append: { dropped: 1 },
+					"update-final": { dropped: 1 },
+					snapshot: { dropped: 1, completed: 1 },
+				},
+			})
+		})
+
+		test("accounts for snapshot hard boundaries independently from growing partials", async () => {
+			const task = {
+				taskId: "task-1",
+				clineMessages: [
+					{ ts: 1, type: "say", say: "text", text: "x".repeat(512), partial: true },
+				] as ClineMessage[],
+			}
+			setCurrentTask(task)
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesTransportDiagnostics()
+
+			let releaseBridge!: () => void
+			mockPostMessage.mockImplementationOnce(
+				() =>
+					new Promise<void>((resolve) => {
+						releaseBridge = resolve
+					}),
+			)
+
+			const partial = provider.postClineMessageUpdated("task-1", task.clineMessages[0])
+			const snapshot = provider.postClineMessagesSnapshot("task-1", { bumpSeq: true })
+			const final = provider.postClineMessageUpdated("task-1", {
+				...task.clineMessages[0],
+				partial: false,
+			})
+
+			await flushMicrotasks()
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				pending: { operations: 3 },
+				byKind: {
+					"update-partial": { enqueued: 1 },
+					snapshot: { enqueued: 1 },
+					"update-final": { enqueued: 1 },
+				},
+			})
+
+			releaseBridge()
+			await Promise.all([partial, snapshot, final])
+			const postedTypes = mockPostMessage.mock.calls.map(([message]: [ExtensionMessage]) => message.type)
+			expect(postedTypes).toEqual([
+				"clineMessageUpdated",
+				"clineMessagesSnapshotStart",
+				"clineMessagesSnapshotChunk",
+				"clineMessagesSnapshotEnd",
+				"clineMessageUpdated",
+			])
+			expect(provider.getClineMessagesTransportDiagnostics()?.pending.operations).toBe(0)
+		})
+
+		test("cleans diagnostics after queue rejection and continues draining", async () => {
+			const task = { taskId: "task-1", clineMessages: [] as ClineMessage[] }
+			setCurrentTask(task)
+			provider.enableClineMessagesTransportDiagnostics()
+			const failure = new Error("bridge rejected")
+			const postSpy = vi
+				.spyOn(provider, "postMessageToWebview")
+				.mockRejectedValueOnce(failure)
+				.mockResolvedValue(undefined)
+
+			const failed = provider.postClineMessageUpdated("task-1", {
+				ts: 1,
+				type: "say",
+				say: "text",
+				text: "first",
+				partial: true,
+			})
+			const recovered = provider.postClineMessageUpdated("task-1", {
+				ts: 1,
+				type: "say",
+				say: "text",
+				text: "second",
+				partial: false,
+			})
+
+			await expect(failed).rejects.toThrow("bridge rejected")
+			await recovered
+
+			expect(postSpy).toHaveBeenCalledTimes(2)
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				pending: { operations: 0, estimatedCharacters: 0, estimatedBytes: 0 },
+				totals: { enqueued: 2, started: 2, completed: 1, failed: 1 },
+				byKind: {
+					"update-partial": { failed: 1 },
+					"update-final": { completed: 1 },
+				},
+			})
+		})
+
+		test("records a rejected webview bridge post without poisoning the queue", async () => {
+			const task = { taskId: "task-1", clineMessages: [] as ClineMessage[] }
+			setCurrentTask(task)
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesTransportDiagnostics()
+			mockPostMessage.mockRejectedValueOnce(new Error("webview disposed"))
+
+			await provider.postClineMessageUpdated("task-1", {
+				ts: 1,
+				type: "say",
+				say: "text",
+				text: "synthetic",
+				partial: true,
+			})
+
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				pending: { operations: 0, bridgePosts: 0 },
+				totals: {
+					completed: 1,
+					failed: 0,
+					bridgePostsStarted: 1,
+					bridgePostsCompleted: 0,
+					bridgePostsFailed: 1,
+				},
+			})
+		})
+
+		test("reset invalidates in-flight diagnostic handles without changing queue delivery", async () => {
+			const task = { taskId: "task-1", clineMessages: [] as ClineMessage[] }
+			setCurrentTask(task)
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesTransportDiagnostics()
+
+			let releaseQueue!: () => void
+			Object.assign(provider, {
+				clineMessagesPostQueue: new Promise<void>((resolve) => {
+					releaseQueue = resolve
+				}),
+			})
+			const pending = provider.postClineMessageUpdated("task-1", {
+				ts: 1,
+				type: "say",
+				say: "text",
+				text: "queued",
+				partial: true,
+			})
+			expect(provider.getClineMessagesTransportDiagnostics()?.pending.operations).toBe(1)
+
+			provider.resetClineMessagesTransportDiagnostics()
+			releaseQueue()
+			await pending
+
+			expect(mockPostMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ type: "clineMessageUpdated", taskId: "task-1" }),
+			)
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				pending: { operations: 0 },
+				totals: { enqueued: 0, started: 0, completed: 0, failed: 0 },
+				recentOperations: [],
+			})
 		})
 
 		test("ignores transcript work for a task that is not focused", async () => {
@@ -1087,6 +1817,39 @@ describe("ClineProvider", () => {
 			expect(postSpy).not.toHaveBeenCalled()
 		})
 
+		test("drops an enabled snapshot as dropped diagnostics when its generation is invalidated", async () => {
+			const task = {
+				taskId: "task-1",
+				clineMessages: [{ ts: 1, type: "say", say: "text", text: "message" }] as ClineMessage[],
+			}
+			setCurrentTask(task)
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesTransportDiagnostics()
+			let releaseGate!: () => void
+			Object.assign(provider, {
+				clineMessagesPostQueue: new Promise<void>((resolve) => {
+					releaseGate = resolve
+				}),
+			})
+			provider.enableClineMessagesPartialCoalescing()
+
+			const snapshot = provider.postClineMessagesSnapshot("task-1", { bumpSeq: true })
+			const resync = provider.resyncClineMessagesToWebview("task-1")
+			releaseGate()
+			await Promise.all([snapshot, resync])
+
+			expect(mockPostMessage.mock.calls.map(([message]: [ExtensionMessage]) => message.type)).toEqual([
+				"clineMessagesSnapshotStart",
+				"clineMessagesSnapshotChunk",
+				"clineMessagesSnapshotEnd",
+			])
+			expect(provider.getClineMessagesTransportDiagnostics()).toMatchObject({
+				totals: { dropped: 1, failed: 0, generationDrops: 1 },
+				byKind: { snapshot: { dropped: 1, failed: 0, completed: 1 } },
+			})
+		})
+
 		test.each([
 			["after the start marker", "clineMessagesSnapshotStart", ["clineMessagesSnapshotStart"]],
 			[
@@ -1131,6 +1894,45 @@ describe("ClineProvider", () => {
 				1,
 				expect.objectContaining({ type: "clineMessagesSnapshotStart", taskId: "task-1", clineMessagesSeq: 1 }),
 			)
+		})
+
+		test("drops a stale pending partial before resync without cloning or consuming a sequence", async () => {
+			const partial = { ts: 1, type: "say", say: "text", text: "one", partial: true } as ClineMessage
+			const task = { taskId: "task-1", clineMessages: [partial] }
+			setCurrentTask(task)
+			await provider.resolveWebviewView(mockWebviewView)
+			mockPostMessage.mockClear()
+			provider.enableClineMessagesPartialCoalescing()
+
+			let releaseBridge!: () => void
+			const bridgeGate = new Promise<void>((resolve) => {
+				releaseBridge = resolve
+			})
+			mockPostMessage.mockImplementationOnce(() => bridgeGate).mockResolvedValue(undefined)
+
+			const first = provider.postClineMessageUpdated("task-1", partial)
+			await flushMicrotasks()
+			partial.text = "two"
+			const pending = provider.postClineMessageUpdated("task-1", partial)
+			const resync = provider.resyncClineMessagesToWebview("task-1")
+			const structuredCloneSpy = vi.spyOn(globalThis, "structuredClone")
+			const cloneCallsBeforeRelease = structuredCloneSpy.mock.calls.length
+
+			releaseBridge()
+			await Promise.all([first, pending, resync])
+
+			const posts: ExtensionMessage[] = mockPostMessage.mock.calls.map(([message]: [ExtensionMessage]) => message)
+			expect(posts.map(({ type }) => type)).toEqual([
+				"clineMessageUpdated",
+				"clineMessagesSnapshotStart",
+				"clineMessagesSnapshotChunk",
+				"clineMessagesSnapshotEnd",
+			])
+			expect(posts[1]).toEqual(expect.objectContaining({ clineMessagesSeq: 1, snapshotTotal: 1 }))
+			expect(posts[2].clineMessages).toEqual([expect.objectContaining({ text: "two" })])
+			expect(provider["clineMessagesSeqByTaskId"].get("task-1")).toBe(1)
+			expect(structuredCloneSpy.mock.calls).toHaveLength(cloneCallsBeforeRelease)
+			structuredCloneSpy.mockRestore()
 		})
 
 		test("prunes sequence state when a task leaves the stack", async () => {

@@ -1072,8 +1072,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	private async updateClineMessage(message: ClineMessage) {
 		const provider = this.providerRef.deref()
+		const capturedMessage = provider?.isClineMessagesPartialCoalescingActive() ? structuredClone(message) : message
 		await provider?.postClineMessageUpdated(this.taskId, message)
-		this.emit(RooCodeEventName.Message, { action: "updated", message })
+		this.emit(RooCodeEventName.Message, { action: "updated", message: capturedMessage })
 
 		// Check if we should sync to cloud and haven't already synced this message
 		const shouldCaptureMessage = message.partial !== true && CloudService.isEnabled()
