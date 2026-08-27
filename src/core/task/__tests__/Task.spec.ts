@@ -1931,6 +1931,10 @@ describe("Cline", () => {
 	})
 
 	describe("webview transcript transport", () => {
+		afterEach(() => {
+			vi.useRealTimers()
+		})
+
 		it("posts a bumped snapshot after overwriting the transcript", async () => {
 			const task = new Task({
 				provider: mockProvider,
@@ -2068,7 +2072,8 @@ describe("Cline", () => {
 			expect(mockProvider.postClineMessageAppended).toHaveBeenCalledWith(task.taskId, message)
 		})
 
-		it("serializes a new partial message before its following update", async () => {
+		it("serializes a new partial message before its debounced following update", async () => {
+			vi.useFakeTimers()
 			const task = new Task({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
@@ -2102,6 +2107,7 @@ describe("Cline", () => {
 			expect(updatePostSpy).not.toHaveBeenCalled()
 
 			releaseAppend()
+			await vi.advanceTimersByTimeAsync(500)
 			await addThenUpdate
 
 			expect(appendSpy.mock.invocationCallOrder[0]).toBeLessThan(updatePostSpy.mock.invocationCallOrder[0])
@@ -2109,6 +2115,108 @@ describe("Cline", () => {
 				...partialMessage,
 				text: "updated partial",
 			})
+		})
+
+		it("debounces partial updates and posts the latest revision on the trailing edge", async () => {
+			vi.useFakeTimers()
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const taskAccess = getTaskTestAccess(task)
+			const updatePostSpy = vi.mocked(mockProvider.postClineMessageUpdated)
+
+			void taskAccess.updateClineMessage({
+				ts: 1,
+				type: "say",
+				say: "text",
+				text: "first partial",
+				partial: true,
+			})
+			await vi.advanceTimersByTimeAsync(250)
+			void taskAccess.updateClineMessage({
+				ts: 1,
+				type: "say",
+				say: "text",
+				text: "latest partial",
+				partial: true,
+			})
+
+			await vi.advanceTimersByTimeAsync(499)
+			expect(updatePostSpy).not.toHaveBeenCalled()
+
+			await vi.advanceTimersByTimeAsync(1)
+			expect(updatePostSpy).toHaveBeenCalledOnce()
+			expect(updatePostSpy).toHaveBeenCalledWith(
+				task.taskId,
+				expect.objectContaining({ text: "latest partial", partial: true }),
+			)
+		})
+
+		it.each([
+			["false", { ts: 1, type: "say" as const, say: "text" as const, text: "complete", partial: false }],
+			["absent", { ts: 1, type: "say" as const, say: "text" as const, text: "complete" }],
+		])(
+			"cancels a pending partial update and posts completion immediately when partial is %s",
+			async (_case, complete) => {
+				vi.useFakeTimers()
+				const task = new Task({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					task: "test task",
+					startTask: false,
+				})
+				const taskAccess = getTaskTestAccess(task)
+				const updatePostSpy = vi.mocked(mockProvider.postClineMessageUpdated)
+
+				void taskAccess.updateClineMessage({
+					ts: 1,
+					type: "say",
+					say: "text",
+					text: "partial",
+					partial: true,
+				})
+				await taskAccess.updateClineMessage(complete)
+
+				expect(updatePostSpy).toHaveBeenCalledOnce()
+				expect(updatePostSpy).toHaveBeenCalledWith(task.taskId, complete)
+
+				await vi.advanceTimersByTimeAsync(500)
+				expect(updatePostSpy).toHaveBeenCalledOnce()
+			},
+		)
+
+		it("handles a rejected debounced partial update", async () => {
+			vi.useFakeTimers()
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const postError = new Error("incremental update failed")
+			vi.mocked(mockProvider.postClineMessageUpdated).mockRejectedValueOnce(postError)
+			const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+			try {
+				void getTaskTestAccess(task).updateClineMessage({
+					ts: 1,
+					type: "say",
+					say: "text",
+					text: "partial",
+					partial: true,
+				})
+				await vi.advanceTimersByTimeAsync(500)
+
+				expect(consoleErrorSpy).toHaveBeenCalledWith(
+					"[Task#updateClineMessage] incremental post failed:",
+					postError,
+				)
+			} finally {
+				consoleErrorSpy.mockRestore()
+			}
 		})
 	})
 

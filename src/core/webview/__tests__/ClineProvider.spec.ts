@@ -1068,8 +1068,11 @@ describe("ClineProvider", () => {
 			},
 		)
 
-		test("drops a snapshot invalidated before its first post", async () => {
-			const task = { taskId: "task-1", clineMessages: [] as ClineMessage[] }
+		test("drops a snapshot invalidated before its first post without cloning it", async () => {
+			const task = {
+				taskId: "task-1",
+				clineMessages: [{ ts: 1, type: "say", say: "text", text: "message" }] as ClineMessage[],
+			}
 			setCurrentTask(task)
 			const postSpy = vi.spyOn(provider, "postMessageToWebview")
 			let releaseQueue!: () => void
@@ -1079,12 +1082,18 @@ describe("ClineProvider", () => {
 				}),
 			})
 
-			const snapshot = provider.postClineMessagesSnapshot("task-1")
-			task.taskId = "task-2"
-			releaseQueue()
-			await snapshot
+			const structuredCloneSpy = vi.spyOn(globalThis, "structuredClone")
+			try {
+				const snapshot = provider.postClineMessagesSnapshot("task-1")
+				task.taskId = "task-2"
+				releaseQueue()
+				await snapshot
 
-			expect(postSpy).not.toHaveBeenCalled()
+				expect(postSpy).not.toHaveBeenCalled()
+				expect(structuredCloneSpy).not.toHaveBeenCalled()
+			} finally {
+				structuredCloneSpy.mockRestore()
+			}
 		})
 
 		test.each([

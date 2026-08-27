@@ -141,6 +141,7 @@ const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
 const FORCED_CONTEXT_REDUCTION_PERCENT = 75 // Keep 75% of context (remove 25%) on context window errors
 const MAX_CONTEXT_WINDOW_RETRIES = 3 // Maximum retries for context window errors
+const PARTIAL_MESSAGE_UPDATE_DEBOUNCE_MS = 500
 
 export interface TaskOptions extends CreateTaskOptions {
 	provider: ClineProvider
@@ -448,6 +449,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	// Token Usage Throttling - Debounced emit function
 	private readonly TOKEN_USAGE_EMIT_INTERVAL_MS = 2000 // 2 seconds
 	private debouncedEmitTokenUsage: ReturnType<typeof debounce>
+	private debouncedPostPartialMessageUpdate: ReturnType<typeof debounce>
 
 	// Historical cloud sync tracking retained only to avoid task resume churn.
 	private cloudSyncedMessageTimestamps: Set<number> = new Set()
@@ -608,6 +610,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			},
 			this.TOKEN_USAGE_EMIT_INTERVAL_MS,
 			{ leading: true, trailing: true, maxWait: this.TOKEN_USAGE_EMIT_INTERVAL_MS },
+		)
+		this.debouncedPostPartialMessageUpdate = debounce(
+			(message: ClineMessage) => {
+				const provider = this.providerRef.deref()
+				if (!provider) {
+					return
+				}
+
+				void provider.postClineMessageUpdated(this.taskId, message).catch((error) => {
+					console.error("[Task#updateClineMessage] incremental post failed:", error)
+				})
+			},
+			PARTIAL_MESSAGE_UPDATE_DEBOUNCE_MS,
+			{ leading: false, trailing: true },
 		)
 
 		onCreated?.(this)
@@ -1071,8 +1087,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	private async updateClineMessage(message: ClineMessage) {
-		const provider = this.providerRef.deref()
-		await provider?.postClineMessageUpdated(this.taskId, message)
+		if (message.partial === true) {
+			this.debouncedPostPartialMessageUpdate(message)
+		} else {
+			this.debouncedPostPartialMessageUpdate.cancel()
+			await this.providerRef.deref()?.postClineMessageUpdated(this.taskId, message)
+		}
 		this.emit(RooCodeEventName.Message, { action: "updated", message })
 
 		// Check if we should sync to cloud and haven't already synced this message
@@ -2299,6 +2319,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	public dispose(): void {
 		console.log(`[Task#dispose] disposing task ${this.taskId}.${this.instanceId}`)
+		this.debouncedPostPartialMessageUpdate.cancel()
 
 		// Stop the idle telemetry check and report any unflushed activity as a
 		// shutdown installment, so a task torn down mid-work (panel closed, task
