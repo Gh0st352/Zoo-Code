@@ -1013,6 +1013,36 @@ describe("ExtensionStateContext", () => {
 			}
 		})
 
+		it("keeps the prior transcript when a snapshot end is dropped", () => {
+			const existing = makeMessage(1, "existing")
+			const replacement = makeMessage(2, "replacement")
+			renderTranscript({ clineMessages: [existing], clineMessagesSeq: 1 })
+
+			act(() => {
+				dispatchExtensionMessage({
+					type: "clineMessagesSnapshotStart",
+					taskId: "task-1",
+					clineMessagesSeq: 2,
+					snapshotId: "dropped-end",
+					snapshotTotal: 1,
+				})
+				dispatchExtensionMessage({
+					type: "clineMessagesSnapshotChunk",
+					taskId: "task-1",
+					clineMessagesSeq: 2,
+					snapshotId: "dropped-end",
+					snapshotStartIndex: 0,
+					clineMessages: [replacement],
+				})
+			})
+
+			expect(readTranscriptFields()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: [existing],
+				clineMessagesSeq: 1,
+			})
+		})
+
 		it("requests recovery for legacy unsequenced updates", () => {
 			const postMessage = vi.spyOn(vscode, "postMessage").mockImplementation(() => undefined)
 			try {
