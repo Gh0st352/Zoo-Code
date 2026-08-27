@@ -1586,7 +1586,6 @@ export class ClineProvider
 				? this.bumpClineMessagesSeq(taskId)
 				: this.getClineMessagesSeq(taskId)
 			: 0
-		const messages = structuredClone(currentTask?.clineMessages ?? [])
 		const snapshotId = `${taskId ?? "none"}:${++this.nextClineMessagesSnapshotId}`
 		const generation = options.generation ?? this.clineMessagesTransportGeneration
 
@@ -1597,6 +1596,7 @@ export class ClineProvider
 			if (!isCurrent()) {
 				return
 			}
+			const messages = structuredClone(currentTask?.clineMessages ?? [])
 
 			await this.postMessageToWebview({
 				type: "clineMessagesSnapshotStart",
