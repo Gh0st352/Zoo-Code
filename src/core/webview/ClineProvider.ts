@@ -2080,13 +2080,6 @@ export class ClineProvider
 				clineMessagesSeq: seq,
 				clineMessages: sourceMessages,
 			})
-			let messages: ClineMessage[]
-			try {
-				messages = structuredClone(sourceMessages)
-			} catch (error) {
-				diagnostics?.markCloneFailed(diagnosticOperation)
-				throw error
-			}
 			diagnostics?.markEnqueued(diagnosticOperation)
 			const snapshotId = `${taskId ?? "none"}:${++this.nextClineMessagesSnapshotId}`
 			return this.enqueueClineMessagesPost(async () => {
@@ -2100,6 +2093,13 @@ export class ClineProvider
 				}
 				if (!isCurrent()) {
 					return
+				}
+				let messages: ClineMessage[]
+				try {
+					messages = structuredClone(currentTask?.clineMessages ?? [])
+				} catch (error) {
+					diagnostics?.markCloneFailed(diagnosticOperation)
+					throw error
 				}
 				await this.postMessageToWebview({
 					type: "clineMessagesSnapshotStart",

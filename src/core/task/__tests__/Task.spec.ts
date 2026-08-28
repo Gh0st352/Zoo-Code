@@ -10,6 +10,7 @@ import type { Mock } from "vitest"
 import {
 	providerIdentifiers,
 	RooCodeEventName,
+	type ClineMessage,
 	type GlobalState,
 	type ProviderSettings,
 	type ModelInfo,
@@ -174,6 +175,9 @@ vi.mock("vscode", () => {
 			onDidSaveTextDocument: vi.fn(() => mockDisposable),
 			getConfiguration: vi.fn(() => ({ get: (_key: string, defaultValue: unknown) => defaultValue })),
 		},
+		RelativePattern: vi.fn().mockImplementation(function (base: string, pattern: string) {
+			return { base, pattern }
+		}),
 		env: {
 			uriScheme: "vscode",
 			language: "en",
@@ -1931,6 +1935,10 @@ describe("Cline", () => {
 	})
 
 	describe("webview transcript transport", () => {
+		afterEach(() => {
+			vi.useRealTimers()
+		})
+
 		it("posts a bumped snapshot after overwriting the transcript", async () => {
 			const task = new Task({
 				provider: mockProvider,
@@ -2068,7 +2076,8 @@ describe("Cline", () => {
 			expect(mockProvider.postClineMessageAppended).toHaveBeenCalledWith(task.taskId, message)
 		})
 
-		it("serializes a new partial message before its following update", async () => {
+		it("serializes a new partial message before its debounced following update", async () => {
+			vi.useFakeTimers()
 			const task = new Task({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
@@ -2102,6 +2111,7 @@ describe("Cline", () => {
 			expect(updatePostSpy).not.toHaveBeenCalled()
 
 			releaseAppend()
+			await vi.advanceTimersByTimeAsync(500)
 			await addThenUpdate
 
 			expect(appendSpy.mock.invocationCallOrder[0]).toBeLessThan(updatePostSpy.mock.invocationCallOrder[0])
@@ -2109,6 +2119,139 @@ describe("Cline", () => {
 				...partialMessage,
 				text: "updated partial",
 			})
+		})
+
+		it("debounces partial updates and posts the latest revision on the trailing edge", async () => {
+			vi.useFakeTimers()
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const taskAccess = getTaskTestAccess(task)
+			const updatePostSpy = vi.mocked(mockProvider.postClineMessageUpdated)
+
+			void taskAccess.updateClineMessage({
+				ts: 1,
+				type: "say",
+				say: "text",
+				text: "first partial",
+				partial: true,
+			})
+			await vi.advanceTimersByTimeAsync(250)
+			void taskAccess.updateClineMessage({
+				ts: 1,
+				type: "say",
+				say: "text",
+				text: "latest partial",
+				partial: true,
+			})
+
+			await vi.advanceTimersByTimeAsync(499)
+			expect(updatePostSpy).not.toHaveBeenCalled()
+
+			await vi.advanceTimersByTimeAsync(1)
+			expect(updatePostSpy).toHaveBeenCalledOnce()
+			expect(updatePostSpy).toHaveBeenCalledWith(
+				task.taskId,
+				expect.objectContaining({ text: "latest partial", partial: true }),
+			)
+		})
+
+		it("emits the partial revision captured before a debounced post runs while provider fan-in is active", async () => {
+			vi.useFakeTimers()
+			vi.spyOn(mockProvider, "isClineMessagesPartialCoalescingActive").mockReturnValue(true)
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const message = {
+				ts: 1,
+				type: "say",
+				say: "text",
+				text: "first revision",
+				partial: true,
+			} satisfies ClineMessage
+			const emitted: ClineMessage[] = []
+			task.on(RooCodeEventName.Message, ({ action, message: emittedMessage }) => {
+				if (action === "updated") {
+					emitted.push(emittedMessage)
+				}
+			})
+
+			await getTaskTestAccess(task).updateClineMessage(message)
+			message.text = "later revision"
+
+			expect(emitted).toEqual([expect.objectContaining({ text: "first revision", partial: true })])
+			expect(emitted[0]).not.toBe(message)
+			await vi.advanceTimersByTimeAsync(500)
+		})
+
+		it.each([
+			["false", { ts: 1, type: "say" as const, say: "text" as const, text: "complete", partial: false }],
+			["absent", { ts: 1, type: "say" as const, say: "text" as const, text: "complete" }],
+		])(
+			"cancels a pending partial update and posts completion immediately when partial is %s",
+			async (_case, complete) => {
+				vi.useFakeTimers()
+				const task = new Task({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					task: "test task",
+					startTask: false,
+				})
+				const taskAccess = getTaskTestAccess(task)
+				const updatePostSpy = vi.mocked(mockProvider.postClineMessageUpdated)
+
+				void taskAccess.updateClineMessage({
+					ts: 1,
+					type: "say",
+					say: "text",
+					text: "partial",
+					partial: true,
+				})
+				await taskAccess.updateClineMessage(complete)
+
+				expect(updatePostSpy).toHaveBeenCalledOnce()
+				expect(updatePostSpy).toHaveBeenCalledWith(task.taskId, complete)
+
+				await vi.advanceTimersByTimeAsync(500)
+				expect(updatePostSpy).toHaveBeenCalledOnce()
+			},
+		)
+
+		it("handles a rejected debounced partial update", async () => {
+			vi.useFakeTimers()
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const postError = new Error("incremental update failed")
+			vi.mocked(mockProvider.postClineMessageUpdated).mockRejectedValueOnce(postError)
+			const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+			try {
+				void getTaskTestAccess(task).updateClineMessage({
+					ts: 1,
+					type: "say",
+					say: "text",
+					text: "partial",
+					partial: true,
+				})
+				await vi.advanceTimersByTimeAsync(500)
+
+				expect(consoleErrorSpy).toHaveBeenCalledWith(
+					"[Task#updateClineMessage] incremental post failed:",
+					postError,
+				)
+			} finally {
+				consoleErrorSpy.mockRestore()
+			}
 		})
 	})
 
