@@ -1223,7 +1223,9 @@ describe("ClineProvider", () => {
 			"postStateToWebviewWithoutTaskHistory",
 			(currentProvider: ClineProvider) => currentProvider.postStateToWebviewWithoutTaskHistory(),
 		],
-	])("%s assigns message sequence numbers before asynchronous state construction", async (_methodName, postState) => {
+	])("%s keeps out-of-order generic state publications transcript-free", async (_methodName, postState) => {
+		await provider.resolveWebviewView(mockWebviewView)
+		mockPostMessage.mockClear()
 		let releaseOlderSnapshot!: (state: ExtensionState) => void
 		const olderSnapshot = new Promise<ExtensionState>((resolve) => {
 			releaseOlderSnapshot = resolve
@@ -1239,7 +1241,6 @@ describe("ClineProvider", () => {
 		vi.spyOn(provider, "getStateToPostToWebview")
 			.mockReturnValueOnce(olderSnapshot)
 			.mockResolvedValueOnce(readyState)
-		const postMessageSpy = vi.spyOn(provider, "postMessageToWebview").mockResolvedValue(undefined)
 
 		const olderPost = postState(provider)
 		await Promise.resolve()
@@ -1248,11 +1249,12 @@ describe("ClineProvider", () => {
 		releaseOlderSnapshot(emptyState)
 		await olderPost
 
-		expect(postMessageSpy.mock.calls.map(([message]) => message.state?.clineMessages)).toEqual([
-			readyState.clineMessages,
-			emptyState.clineMessages,
-		])
-		expect(postMessageSpy.mock.calls.map(([message]) => message.state?.clineMessagesSeq)).toEqual([2, 1])
+		const statePosts = (mockPostMessage.mock.calls as Array<[ExtensionMessage]>)
+			.map(([message]) => message)
+			.filter((message) => message.type === "state")
+		expect(statePosts).toHaveLength(2)
+		expect(statePosts.map((message) => message.state?.clineMessages)).toEqual([undefined, undefined])
+		expect(statePosts.map((message) => message.state?.clineMessagesSeq)).toEqual([undefined, undefined])
 	})
 
 	test.each([
