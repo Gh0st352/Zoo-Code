@@ -171,11 +171,25 @@ async function readDevToolsActivePort(
 	throw Object.assign(new Error("VS Code did not advertise a CDP port"), { code: "CDP_PORT_DISCOVERY_FAILED" })
 }
 
-async function installVsix(codePath, extensionsDir, vsixPath) {
-	await fs.mkdir(extensionsDir, { recursive: true })
-	const result = spawnSync(
+export async function installVsix(codePath, userDataDir, extensionsDir, vsixPath, spawnSyncImpl = spawnSync) {
+	if (!userDataDir || !extensionsDir) {
+		throw Object.assign(new Error("VSIX installation requires explicit profile directories"), {
+			code: "VSIX_PROFILE_DIRECTORIES_REQUIRED",
+		})
+	}
+	await Promise.all([
+		fs.mkdir(userDataDir, { recursive: true, mode: 0o700 }),
+		fs.mkdir(extensionsDir, { recursive: true, mode: 0o700 }),
+	])
+	const result = spawnSyncImpl(
 		codePath,
-		[`--extensions-dir=${extensionsDir}`, "--install-extension", vsixPath, "--force"],
+		[
+			`--user-data-dir=${userDataDir}`,
+			`--extensions-dir=${extensionsDir}`,
+			"--install-extension",
+			vsixPath,
+			"--force",
+		],
 		{ stdio: "ignore", windowsHide: true, shell: false, timeout: 120_000 },
 	)
 	if (result.status !== 0) throw Object.assign(new Error("VSIX installation failed"), { code: "VSIX_INSTALL_FAILED" })
@@ -188,11 +202,20 @@ export async function launchVsCode(options, runId, dependencies = {}) {
 	if (options.dryRun) return { dryRun: true, plan: plan.sanitized }
 	await fs.mkdir(operationalDir, { recursive: true, mode: 0o700 })
 	if (options.profileMode !== "isolated") (dependencies.ensureNoCodeProcesses ?? ensureNoCodeProcesses)()
-	if (options.extensionVsix)
-		await (dependencies.installVsix ?? installVsix)(codePath, plan.extensionsDir, options.extensionVsix)
 	if (options.profileMode === "isolated") {
-		await fs.mkdir(plan.userDataDir, { recursive: true })
-		await fs.mkdir(plan.extensionsDir, { recursive: true })
+		await Promise.all([
+			fs.mkdir(plan.userDataDir, { recursive: true, mode: 0o700 }),
+			fs.mkdir(plan.extensionsDir, { recursive: true, mode: 0o700 }),
+		])
+	}
+	if (options.extensionVsix) {
+		await (dependencies.installVsix ?? installVsix)(
+			codePath,
+			plan.userDataDir,
+			plan.extensionsDir,
+			options.extensionVsix,
+			dependencies.spawnSync,
+		)
 	}
 	const child = (dependencies.spawn ?? spawn)(plan.codePath, plan.argumentsList, {
 		stdio: "ignore",

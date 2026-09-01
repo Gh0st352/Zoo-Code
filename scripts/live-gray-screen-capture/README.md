@@ -2,6 +2,24 @@
 
 This dependency-minimal Node 22 harness captures privacy-reduced scalar evidence from a live VS Code/ZooCode run. It can distinguish evidence patterns for renderer V8 heap pressure, suspected main-thread blocking, process/native pressure, process exits, CDP loss, navigation/reload, target crashes, and failed or malformed heap snapshots. It records evidence; it does not diagnose a root cause by itself and does not fix or reload ZooCode.
 
+## Portable operator kit
+
+For capture from an arbitrary repository without a Zoo-Code source checkout, use the generated portable kit documented in [`../portable-gray-screen-kit/README.md`](../portable-gray-screen-kit/README.md). The explicit artifact-to-evidence procedure is in [`../portable-gray-screen-kit/OPERATOR-GUIDE.md`](../portable-gray-screen-kit/OPERATOR-GUIDE.md). A maintainer builds it with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\portable-gray-screen-kit\Build-PortableGrayScreenKit.ps1
+```
+
+The generated kit contains a checksum-bound PowerShell launcher, this collector's runtime `.mjs` tree, a validated production ZooCode VSIX, an exact payload manifest, the license, and offline instructions. It requires Node 22 or newer and stable VS Code, but it does not require the repository, `pnpm`, `node_modules`, or an extension build on the operator machine.
+
+The portable workflow must not be mistaken for retroactive attachment:
+
+> The VS Code window in which the portable script is started remains **unmonitored**. CDP generally cannot be enabled in an already-running VS Code process. The launcher opens a **second, dedicated, isolated VS Code window**, and the operator must start the ZooCode task only in that new window.
+
+Portable evidence defaults outside the target repository under `%LOCALAPPDATA%\ZooCode\GrayScreenCapture\evidence`. The foreground launcher remains attached for the full capture. The same script provides `Status`, privacy-acknowledged `Snapshot`, and `Stop` actions, while Ctrl+C remains the normal foreground stop path. Automatic snapshots are enabled by the portable wrapper at ratio `0.82` for three samples unless explicitly disabled; the snapshot privacy warning and all collector resource/integrity gates still apply.
+
+For a conventional worktree, the portable launcher adds only precise worktree-local `.git/info/exclude` entries. It never edits `.gitignore`, stages files, or commits. Linked and unusual worktrees receive a warning without Git metadata mutation. See the portable documentation for exact operator commands, profile limitations, evidence safeguards, and packager validation behavior.
+
 ## Prerequisites
 
 - Windows 11 and Node 22 (the repository pins Node 22 in its root manifest).
