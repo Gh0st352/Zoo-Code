@@ -645,6 +645,116 @@ describe("ExtensionStateContext", () => {
 			expect(vi.getTimerCount()).toBe(0)
 		})
 
+		it("abandons an incomplete snapshot and requests recovery after the snapshot timeout", () => {
+			vi.useFakeTimers()
+			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
+
+			act(() => {
+				startSnapshot()
+				appendSnapshotChunk()
+				vi.advanceTimersByTime(30_000)
+			})
+
+			expect(postMessage).toHaveBeenCalledTimes(1)
+			expect(postMessage).toHaveBeenCalledWith({
+				type: "requestClineMessagesResync",
+				taskId: "task-1",
+				expectedSeq: 2,
+				receivedSeq: 2,
+			})
+			expect(vi.getTimerCount()).toBe(1)
+		})
+
+		it("clears the snapshot timeout when a snapshot completes", () => {
+			vi.useFakeTimers()
+			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
+
+			act(() => {
+				startSnapshot()
+				appendSnapshotChunk()
+				endSnapshot()
+				vi.advanceTimersByTime(30_000)
+			})
+
+			expect(postMessage).not.toHaveBeenCalled()
+			expect(vi.getTimerCount()).toBe(0)
+			expect(readTranscriptFields()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: [makeMessage(2, "snapshot")],
+				clineMessagesSeq: 2,
+			})
+		})
+
+		it("restarts the snapshot timeout when a replacement snapshot starts", () => {
+			vi.useFakeTimers()
+			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
+			const replacement = makeMessage(3, "replacement")
+
+			act(() => {
+				startSnapshot()
+				vi.advanceTimersByTime(20_000)
+				startSnapshot({ clineMessagesSeq: 3, snapshotId: "replacement" })
+				vi.advanceTimersByTime(20_000)
+				appendSnapshotChunk({
+					clineMessagesSeq: 3,
+					snapshotId: "replacement",
+					clineMessages: [replacement],
+				})
+				endSnapshot({ clineMessagesSeq: 3, snapshotId: "replacement" })
+			})
+
+			expect(postMessage).not.toHaveBeenCalled()
+			expect(vi.getTimerCount()).toBe(0)
+			expect(readTranscriptFields()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: [replacement],
+				clineMessagesSeq: 3,
+			})
+		})
+
+		it("clears the snapshot timeout when a newer delta invalidates the snapshot", () => {
+			vi.useFakeTimers()
+			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
+
+			act(() => {
+				startSnapshot()
+				appendClineMessage(makeMessage(3, "newer delta"), 3, "task-1")
+			})
+
+			expect(postMessage).toHaveBeenCalledTimes(1)
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ type: "requestClineMessagesResync", receivedSeq: 3 }),
+			)
+			expect(vi.getTimerCount()).toBe(1)
+		})
+
+		it("clears the snapshot timeout when the task changes", () => {
+			vi.useFakeTimers()
+			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
+
+			act(() => {
+				startSnapshot()
+				dispatchExtensionMessage({ type: "state", state: { currentTaskId: "task-2" } })
+				vi.advanceTimersByTime(30_000)
+			})
+
+			expect(postMessage).not.toHaveBeenCalled()
+			expect(vi.getTimerCount()).toBe(0)
+		})
+
+		it("clears the snapshot timeout when the provider unmounts", () => {
+			vi.useFakeTimers()
+			const postMessage = vi.spyOn(vscode, "postMessage").mockImplementation(() => undefined)
+			const { unmount } = renderTranscript({ clineMessagesSeq: 1 })
+			postMessage.mockClear()
+
+			act(() => startSnapshot())
+			expect(vi.getTimerCount()).toBe(1)
+			unmount()
+
+			expect(vi.getTimerCount()).toBe(0)
+		})
+
 		it.each([
 			{ name: "a nonnumeric sequence", overrides: { clineMessagesSeq: "2" }, receivedSeq: undefined },
 			{ name: "a boolean sequence", overrides: { clineMessagesSeq: true }, receivedSeq: undefined },
