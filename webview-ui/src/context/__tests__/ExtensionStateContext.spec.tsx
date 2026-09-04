@@ -645,6 +645,17 @@ describe("ExtensionStateContext", () => {
 			expect(vi.getTimerCount()).toBe(0)
 		})
 
+		it("does not clear a nonexistent snapshot timeout when the first snapshot starts", () => {
+			vi.useFakeTimers()
+			renderTranscript({ clineMessagesSeq: 1 })
+			const clearTimeout = vi.spyOn(window, "clearTimeout")
+
+			act(() => startSnapshot())
+
+			expect(clearTimeout).not.toHaveBeenCalled()
+			expect(vi.getTimerCount()).toBe(1)
+		})
+
 		it("abandons an incomplete snapshot and requests recovery after the snapshot timeout", () => {
 			vi.useFakeTimers()
 			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
@@ -756,14 +767,66 @@ describe("ExtensionStateContext", () => {
 		})
 
 		it.each([
+			{ name: "a replacement ID", clineMessagesSeq: 2, snapshotId: "replacement" },
+			{ name: "a replacement sequence", clineMessagesSeq: 3, snapshotId: "snapshot-1" },
+		])("ignores a stale timeout callback after $name takes ownership", ({ clineMessagesSeq, snapshotId }) => {
+			vi.useFakeTimers()
+			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
+			const setTimeout = vi.spyOn(window, "setTimeout")
+
+			act(() => startSnapshot())
+			const staleTimeout = setTimeout.mock.calls[0]?.[0]
+			if (typeof staleTimeout !== "function") {
+				throw new Error("Expected the snapshot timeout callback to be scheduled")
+			}
+			const replacement = makeMessage(clineMessagesSeq, "replacement")
+
+			act(() => {
+				startSnapshot({ clineMessagesSeq, snapshotId })
+				staleTimeout()
+				appendSnapshotChunk({ clineMessagesSeq, snapshotId, clineMessages: [replacement] })
+				endSnapshot({ clineMessagesSeq, snapshotId })
+			})
+
+			expect(postMessage).not.toHaveBeenCalled()
+			expect(vi.getTimerCount()).toBe(0)
+			expect(readTranscriptFields()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: [replacement],
+				clineMessagesSeq,
+			})
+		})
+
+		it("ignores a stale timeout callback after its snapshot is cleared", () => {
+			vi.useFakeTimers()
+			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
+			const setTimeout = vi.spyOn(window, "setTimeout")
+
+			act(() => startSnapshot())
+			const staleTimeout = setTimeout.mock.calls[0]?.[0]
+			if (typeof staleTimeout !== "function") {
+				throw new Error("Expected the snapshot timeout callback to be scheduled")
+			}
+
+			act(() => dispatchExtensionMessage({ type: "state", state: { currentTaskId: "task-2" } }))
+			expect(vi.getTimerCount()).toBe(0)
+			expect(() => act(() => staleTimeout())).not.toThrow()
+			expect(postMessage).not.toHaveBeenCalled()
+		})
+
+		it.each([
 			{ name: "a nonnumeric sequence", overrides: { clineMessagesSeq: "2" }, receivedSeq: undefined },
 			{ name: "a boolean sequence", overrides: { clineMessagesSeq: true }, receivedSeq: undefined },
 			{ name: "a fractional sequence", overrides: { clineMessagesSeq: 1.5 }, receivedSeq: 1.5 },
 			{ name: "a negative sequence", overrides: { clineMessagesSeq: -1 }, receivedSeq: -1 },
 		])("rejects a snapshot start with $name", ({ overrides, receivedSeq }) => {
+			vi.useFakeTimers()
 			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
 
-			act(() => startSnapshot(overrides))
+			act(() => {
+				startSnapshot()
+				startSnapshot(overrides)
+			})
 
 			expect(postMessage).toHaveBeenCalledTimes(1)
 			expect(postMessage).toHaveBeenCalledWith({
@@ -772,6 +835,7 @@ describe("ExtensionStateContext", () => {
 				expectedSeq: 2,
 				receivedSeq,
 			})
+			expect(vi.getTimerCount()).toBe(1)
 		})
 
 		it.each([
@@ -781,14 +845,19 @@ describe("ExtensionStateContext", () => {
 			{ name: "a fractional total", overrides: { snapshotTotal: 1.5 } },
 			{ name: "a negative total", overrides: { snapshotTotal: -1 } },
 		])("rejects a snapshot start with $name", ({ overrides }) => {
+			vi.useFakeTimers()
 			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
 
-			act(() => startSnapshot(overrides))
+			act(() => {
+				startSnapshot()
+				startSnapshot(overrides)
+			})
 
 			expect(postMessage).toHaveBeenCalledTimes(1)
 			expect(postMessage).toHaveBeenCalledWith(
 				expect.objectContaining({ type: "requestClineMessagesResync", receivedSeq: 2 }),
 			)
+			expect(vi.getTimerCount()).toBe(1)
 		})
 
 		it("rejects a snapshot start for a different task before it can accept current-task chunks", () => {
@@ -987,6 +1056,7 @@ describe("ExtensionStateContext", () => {
 				expectedResyncSeq: 3,
 			},
 		])("restarts after a chunk with $name", ({ overrides, expectedResyncSeq }) => {
+			vi.useFakeTimers()
 			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
 
 			act(() => {
@@ -998,6 +1068,7 @@ describe("ExtensionStateContext", () => {
 			expect(postMessage).toHaveBeenCalledWith(
 				expect.objectContaining({ type: "requestClineMessagesResync", receivedSeq: expectedResyncSeq }),
 			)
+			expect(vi.getTimerCount()).toBe(1)
 		})
 
 		it.each([
@@ -1033,6 +1104,7 @@ describe("ExtensionStateContext", () => {
 				overrides: { clineMessages: [makeMessage(2, "first"), makeMessage(3, "overflow")] },
 			},
 		])("rejects a snapshot chunk with $name", ({ overrides }) => {
+			vi.useFakeTimers()
 			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
 
 			act(() => {
@@ -1044,6 +1116,7 @@ describe("ExtensionStateContext", () => {
 			expect(postMessage).toHaveBeenCalledWith(
 				expect.objectContaining({ type: "requestClineMessagesResync", receivedSeq: 2 }),
 			)
+			expect(vi.getTimerCount()).toBe(1)
 		})
 
 		it.each([
@@ -1104,6 +1177,7 @@ describe("ExtensionStateContext", () => {
 			{ name: "a newer sequence", overrides: { clineMessagesSeq: 3 } },
 			{ name: "a newer ID and sequence", overrides: { snapshotId: "newer", clineMessagesSeq: 3 } },
 		])("restarts after an end with $name", ({ overrides }) => {
+			vi.useFakeTimers()
 			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
 
 			act(() => {
@@ -1115,6 +1189,7 @@ describe("ExtensionStateContext", () => {
 			expect(postMessage).toHaveBeenCalledWith(
 				expect.objectContaining({ type: "requestClineMessagesResync", receivedSeq: 3 }),
 			)
+			expect(vi.getTimerCount()).toBe(1)
 		})
 
 		it.each([
@@ -1142,6 +1217,7 @@ describe("ExtensionStateContext", () => {
 			{ name: "a mismatched declared total", overrides: { snapshotTotal: 2 } },
 			{ name: "an incomplete message list", overrides: {} },
 		])("rejects a snapshot end with $name", ({ name, overrides }) => {
+			vi.useFakeTimers()
 			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
 
 			act(() => {
@@ -1156,6 +1232,7 @@ describe("ExtensionStateContext", () => {
 			expect(postMessage).toHaveBeenCalledWith(
 				expect.objectContaining({ type: "requestClineMessagesResync", receivedSeq: 2 }),
 			)
+			expect(vi.getTimerCount()).toBe(1)
 		})
 
 		it("reconstructs a snapshot and applies contiguous append and update deltas", () => {
