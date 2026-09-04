@@ -352,13 +352,17 @@ export const ExtensionStateContextProvider: React.FC<{
 		[],
 	)
 
-	const clearClineMessagesSnapshot = useCallback(() => {
-		activeSnapshotRef.current = null
-		if (snapshotTimeoutRef.current !== undefined) {
-			window.clearTimeout(snapshotTimeoutRef.current)
-			snapshotTimeoutRef.current = undefined
-		}
-	}, [])
+	const clearClineMessagesSnapshot = useCallback(
+		() => {
+			activeSnapshotRef.current = null
+			if (snapshotTimeoutRef.current !== undefined) {
+				window.clearTimeout(snapshotTimeoutRef.current)
+				snapshotTimeoutRef.current = undefined
+			}
+		},
+		// Stryker disable next-line ArrayDeclaration: an inserted constant cannot change this ref-only callback's stable identity or captured values.
+		[],
+	)
 
 	const requestClineMessagesResync = useCallback(
 		(receivedSeq?: number) => {
@@ -398,7 +402,6 @@ export const ExtensionStateContextProvider: React.FC<{
 			snapshotTimeoutRef.current = window.setTimeout(() => {
 				const snapshot = activeSnapshotRef.current
 				if (snapshot?.snapshotId !== snapshotId || snapshot.seq !== seq) {
-					snapshotTimeoutRef.current = undefined
 					return
 				}
 				activeSnapshotRef.current = null
@@ -406,6 +409,7 @@ export const ExtensionStateContextProvider: React.FC<{
 				retryClineMessagesResync(seq)
 			}, CLINE_MESSAGES_SNAPSHOT_TIMEOUT_MS)
 		},
+		// Stryker disable next-line ArrayDeclaration: retryClineMessagesResync is stable, so omitting it cannot alter callback identity or captured values.
 		[retryClineMessagesResync],
 	)
 
