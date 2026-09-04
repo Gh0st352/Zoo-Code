@@ -645,20 +645,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			this.TOKEN_USAGE_EMIT_INTERVAL_MS,
 			{ leading: true, trailing: true, maxWait: this.TOKEN_USAGE_EMIT_INTERVAL_MS },
 		)
-		this.debouncedPostPartialMessageUpdate = debounce(
-			(message: ClineMessage) => {
-				const provider = this.providerRef.deref()
-				if (!provider) {
-					return
-				}
+		this.debouncedPostPartialMessageUpdate = debounce((message: ClineMessage) => {
+			const provider = this.providerRef.deref()
+			if (!provider) {
+				return
+			}
 
-				void provider.postClineMessageUpdated(this.taskId, message).catch((error) => {
-					console.error("[Task#updateClineMessage] incremental post failed:", error)
-				})
-			},
-			PARTIAL_MESSAGE_UPDATE_DEBOUNCE_MS,
-			{ leading: false, trailing: true },
-		)
+			void provider.postClineMessageUpdated(this.taskId, message).catch((error) => {
+				console.error("[Task#updateClineMessage] incremental post failed:", error)
+			})
+		}, PARTIAL_MESSAGE_UPDATE_DEBOUNCE_MS)
 
 		onCreated?.(this)
 
