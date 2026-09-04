@@ -36,8 +36,18 @@ import { Terminal } from "../../../integrations/terminal/Terminal"
 import { MessageManager } from "../../message-manager"
 import { forceFullModelDetailsLoad, hasLoadedFullDetails } from "../../../api/providers/fetchers/lmstudio"
 
-// Mock setup must come before imports.
-vi.mock("../../prompts/sections/custom-instructions")
+const { mockAddCustomInstructions, mockTaskConstructor } = vi.hoisted(() => ({
+	mockAddCustomInstructions: vi.fn().mockResolvedValue("Combined instructions"),
+	mockTaskConstructor: vi.fn(),
+}))
+
+vi.mock("../../prompts/sections/custom-instructions", () => ({
+	addCustomInstructions: mockAddCustomInstructions,
+}))
+
+vi.mock("../../task/Task", () => ({
+	Task: mockTaskConstructor,
+}))
 
 vi.mock("p-wait-for", () => ({
 	__esModule: true,
@@ -110,13 +120,6 @@ vi.mock("@modelcontextprotocol/sdk/types.js", () => ({
 	},
 }))
 
-// Remove duplicate mock - it's already defined below.
-
-const mockAddCustomInstructions = vi.fn().mockResolvedValue("Combined instructions")
-
-;(vi.mocked(await import("../../prompts/sections/custom-instructions")) as any).addCustomInstructions =
-	mockAddCustomInstructions
-
 vi.mock("delay", () => {
 	const delayFn = (_ms: number) => Promise.resolve()
 	delayFn.createDelay = () => delayFn
@@ -175,6 +178,7 @@ vi.mock("vscode", () => ({
 		showErrorMessage: vi.fn(),
 		showSaveDialog: vi.fn(),
 		showOpenDialog: vi.fn(),
+		createTextEditorDecorationType: vi.fn(() => ({ dispose: vi.fn() })),
 		activeTextEditor: undefined,
 		onDidChangeActiveTextEditor: vi.fn(() => ({ dispose: vi.fn() })),
 	},
@@ -262,27 +266,6 @@ vi.mock("../../../integrations/workspace/WorkspaceTracker", () => {
 		}),
 	}
 })
-
-vi.mock("../../task/Task", () => ({
-	Task: vi.fn().mockImplementation(function (options: any) {
-		return {
-			api: undefined,
-			abortTask: vi.fn(),
-			dispose: vi.fn().mockResolvedValue(undefined),
-			handleWebviewAskResponse: vi.fn(),
-			clineMessages: [],
-			apiConversationHistory: [],
-			overwriteClineMessages: vi.fn(),
-			overwriteApiConversationHistory: vi.fn(),
-			getTaskNumber: vi.fn().mockReturnValue(0),
-			setTaskNumber: vi.fn(),
-			setParentTask: vi.fn(),
-			setRootTask: vi.fn(),
-			taskId: options?.historyItem?.id || "test-task-id",
-			emit: vi.fn(),
-		}
-	}),
-}))
 
 vi.mock("../../../integrations/misc/extract-text", () => ({
 	extractTextFromFile: vi.fn().mockImplementation(async (_filePath: string) => {
@@ -412,7 +395,7 @@ afterAll(() => {
 
 describe("ClineProvider", () => {
 	beforeAll(() => {
-		vi.mocked(Task).mockImplementation(function (options: any) {
+		mockTaskConstructor.mockImplementation(function (options: any) {
 			const task: any = {
 				api: undefined,
 				abortTask: vi.fn(),
@@ -882,6 +865,17 @@ describe("ClineProvider", () => {
 		expect(mockPostMessage).toHaveBeenCalledWith({ type: "state", state: { version: "1.0.0" } })
 	})
 
+	test("postMessageToWebview forwards non-state messages unchanged", async () => {
+		await provider.resolveWebviewView(mockWebviewView)
+		mockPostMessage.mockClear()
+		const message: ExtensionMessage = { type: "action", action: "chatButtonClicked" }
+
+		await provider.postMessageToWebview(message)
+
+		expect(mockPostMessage).toHaveBeenCalledOnce()
+		expect(mockPostMessage).toHaveBeenCalledWith(message)
+	})
+
 	describe("transcript transport", () => {
 		const setCurrentTask = (task: { taskId: string; clineMessages: ClineMessage[] } | undefined) => {
 			vi.spyOn(provider, "getCurrentTask").mockImplementation(() => task as Task | undefined)
@@ -1071,6 +1065,40 @@ describe("ClineProvider", () => {
 				)
 			},
 		)
+
+		test("invalidates a queued delta when only the transport generation changes", async () => {
+			await provider.resolveWebviewView(mockWebviewView)
+			const task = { taskId: "task-1", clineMessages: [] as ClineMessage[] }
+			setCurrentTask(task)
+			mockPostMessage.mockClear()
+
+			let releaseQueue!: () => void
+			Object.assign(provider, {
+				clineMessagesPostQueue: new Promise<void>((resolve) => {
+					releaseQueue = resolve
+				}),
+			})
+			const pendingDelta = provider.postClineMessageAppended("task-1", {
+				ts: 1,
+				type: "say",
+				say: "text",
+				text: "stale generation",
+			})
+			const previousGeneration = provider["clineMessagesTransportGeneration"]
+			const resync = provider.resyncClineMessagesToWebview("task-1")
+
+			expect(provider["clineMessagesTransportGeneration"]).toBe(previousGeneration + 1)
+
+			releaseQueue()
+			await Promise.all([pendingDelta, resync])
+
+			expect(mockPostMessage).not.toHaveBeenCalledWith(
+				expect.objectContaining({ type: "clineMessageAppended", taskId: "task-1" }),
+			)
+			expect(mockPostMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ type: "clineMessagesSnapshotStart", taskId: "task-1" }),
+			)
+		})
 
 		test("drops a snapshot invalidated before its first post without cloning it", async () => {
 			const task = {
