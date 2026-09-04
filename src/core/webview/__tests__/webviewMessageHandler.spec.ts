@@ -119,6 +119,7 @@ const mockClineProvider = {
 	postStateToWebview: vi.fn(),
 	syncFocusedTaskToWebview: vi.fn().mockResolvedValue(undefined),
 	resyncClineMessagesToWebview: vi.fn().mockResolvedValue(undefined),
+	clearTask: vi.fn().mockResolvedValue(undefined),
 	resolveWebviewThemeFixtureProbe: vi.fn(),
 	getCurrentTask: vi.fn(),
 	getTaskWithId: vi.fn(),
@@ -142,6 +143,20 @@ describe("webviewMessageHandler - transcript resync", () => {
 
 		expect(mockClineProvider.resyncClineMessagesToWebview).toHaveBeenCalledOnce()
 		expect(mockClineProvider.resyncClineMessagesToWebview).toHaveBeenCalledWith("task-1")
+	})
+})
+
+describe("webviewMessageHandler - clear task", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+	})
+
+	it("clears the task and synchronizes focused state with task history", async () => {
+		await webviewMessageHandler(mockClineProvider, { type: "clearTask" })
+
+		expect(mockClineProvider.clearTask).toHaveBeenCalledOnce()
+		expect(mockClineProvider.syncFocusedTaskToWebview).toHaveBeenCalledOnce()
+		expect(mockClineProvider.syncFocusedTaskToWebview).toHaveBeenCalledWith({ includeTaskHistory: true })
 	})
 })
 
