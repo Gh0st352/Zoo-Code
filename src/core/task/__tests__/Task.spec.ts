@@ -2005,6 +2005,34 @@ describe("Cline", () => {
 			expect(mockProvider.postStateToWebviewWithoutTaskHistory).not.toHaveBeenCalled()
 		})
 
+		it("creates a message without a transport error when the provider reference is unavailable", async () => {
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const taskAccess = getTaskTestAccess(task)
+			const saveSpy = vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
+			const messageListener = vi.fn()
+			const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+			Object.defineProperty(task, "providerRef", {
+				value: { deref: () => undefined },
+				configurable: true,
+			})
+			task.on(RooCodeEventName.Message, messageListener)
+			const message = { ts: 1, type: "say" as const, say: "text" as const, text: "message" }
+
+			await expect(taskAccess.addToClineMessages(message)).resolves.toBeUndefined()
+
+			expect(consoleErrorSpy).not.toHaveBeenCalled()
+			expect(task.clineMessages).toEqual([message])
+			expect(messageListener).toHaveBeenCalledWith({ action: "created", message })
+			expect(saveSpy).toHaveBeenCalledOnce()
+
+			consoleErrorSpy.mockRestore()
+		})
+
 		it("waits for an incremental append before emitting the message", async () => {
 			const task = new Task({
 				provider: mockProvider,
