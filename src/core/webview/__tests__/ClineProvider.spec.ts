@@ -1129,9 +1129,7 @@ describe("ClineProvider", () => {
 				releaseQueue()
 				await pendingDelta
 
-				expect(postSpy).not.toHaveBeenCalledWith(
-					expect.objectContaining({ type: messageType, taskId: "task-1" }),
-				)
+				expect(postSpy).not.toHaveBeenCalledWith(expect.objectContaining({ type: messageType }))
 			},
 		)
 
