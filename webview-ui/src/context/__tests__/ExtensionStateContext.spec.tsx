@@ -613,13 +613,13 @@ describe("ExtensionStateContext", () => {
 
 			act(() => appendClineMessage(makeMessage(3, "old gap"), 3, "task-1"))
 			expect(postMessage).toHaveBeenCalledTimes(1)
-			const timeoutHandle = vi.getTimerCount()
+			const pendingTimerCount = vi.getTimerCount()
 			act(() => {
 				dispatchExtensionMessage({ type: "state", state: { currentTaskId: "task-2" } })
 				appendClineMessage(makeMessage(2, "new gap"), 2, "task-2")
 			})
 
-			expect(timeoutHandle).toBe(1)
+			expect(pendingTimerCount).toBe(1)
 			expect(clearTimeout).toHaveBeenCalledTimes(1)
 			expect(postMessage).toHaveBeenCalledTimes(2)
 			expect(postMessage).toHaveBeenLastCalledWith({
