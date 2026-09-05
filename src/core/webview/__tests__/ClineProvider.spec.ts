@@ -1563,6 +1563,14 @@ describe("ClineProvider", () => {
 		expect(postMessageSpy.mock.calls[0]?.[0].state).not.toHaveProperty("taskHistory")
 	})
 
+	test("postStateToWebviewWithoutClineMessages delegates to the canonical lightweight state post", async () => {
+		const postStateSpy = vi.spyOn(provider, "postStateToWebviewWithoutTaskHistory").mockResolvedValue(undefined)
+
+		await provider.postStateToWebviewWithoutClineMessages()
+
+		expect(postStateSpy).toHaveBeenCalledOnce()
+	})
+
 	test("getStateToPostToWebview computes task history once after its base state resolves", async () => {
 		const historyItem = {
 			id: "history-task",

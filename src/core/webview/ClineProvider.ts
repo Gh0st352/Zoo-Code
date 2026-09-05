@@ -2641,9 +2641,10 @@ export class ClineProvider
 	}
 
 	/**
-	 * Like postStateToWebview but intentionally omits taskHistory. The final
-	 * postMessageToWebview boundary removes transcript fields from every generic
-	 * state message.
+	 * Compatibility name for callers that need a lightweight generic state post.
+	 * Transcript fields are removed from every generic state message at the
+	 * postMessageToWebview boundary, while the canonical method below also omits
+	 * taskHistory.
 	 *
 	 * Rationale:
 	 * - Cloud event handlers (auth, settings, user-info) and mode changes trigger state pushes
@@ -2654,9 +2655,7 @@ export class ClineProvider
 	 *   (cloud auth, org settings, profiles, etc.) without interfering with task message streaming.
 	 */
 	async postStateToWebviewWithoutClineMessages(): Promise<void> {
-		const state = await this.getStateToPostToWebview({ includeTaskHistory: false })
-		const { taskHistory: _omitHistory, ...rest } = state
-		await this.postMessageToWebview({ type: "state", state: rest })
+		await this.postStateToWebviewWithoutTaskHistory()
 	}
 
 	/**
