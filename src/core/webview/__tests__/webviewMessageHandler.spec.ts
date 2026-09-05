@@ -128,6 +128,24 @@ const mockClineProvider = {
 	cwd: "/mock/workspace",
 } as unknown as ClineProvider
 
+describe("webviewMessageHandler - launch", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+		vi.mocked(mockClineProvider.customModesManager.getCustomModes).mockResolvedValue([])
+		Object.assign(mockClineProvider, {
+			getMcpHub: vi.fn().mockReturnValue(undefined),
+			providerSettingsManager: { listConfig: vi.fn().mockResolvedValue(undefined) },
+		})
+	})
+
+	it("synchronizes focused state with task history", async () => {
+		await webviewMessageHandler(mockClineProvider, { type: "webviewDidLaunch" })
+
+		expect(mockClineProvider.syncFocusedTaskToWebview).toHaveBeenCalledOnce()
+		expect(mockClineProvider.syncFocusedTaskToWebview).toHaveBeenCalledWith({ includeTaskHistory: true })
+	})
+})
+
 describe("webviewMessageHandler - transcript resync", () => {
 	beforeEach(() => {
 		vi.clearAllMocks()
