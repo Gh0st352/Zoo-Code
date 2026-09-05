@@ -1,3 +1,4 @@
+import { providerIdentifiers } from "@roo-code/types"
 import React, { createContext, useCallback, useEffect, useRef, useState } from "react"
 
 import {
@@ -165,6 +166,7 @@ type ClineMessagesSnapshotBuffer = {
 }
 
 const CLINE_MESSAGES_RESYNC_TIMEOUT_MS = 5_000
+const CLINE_MESSAGES_SNAPSHOT_TIMEOUT_MS = 30_000
 
 export const mergeExtensionState = (prevState: ExtensionState, newState: Partial<ExtensionState>) => {
 	const { customModePrompts: prevCustomModePrompts, experiments: prevExperiments, ...prevRest } = prevState
@@ -255,7 +257,7 @@ const createInitialExtensionState = (): ExtensionState => ({
 	codebaseIndexConfig: {
 		codebaseIndexEnabled: true,
 		codebaseIndexQdrantUrl: "http://localhost:6333",
-		codebaseIndexEmbedderProvider: "openai",
+		codebaseIndexEmbedderProvider: providerIdentifiers.openai,
 		codebaseIndexEmbedderBaseUrl: "",
 		codebaseIndexEmbedderModelId: "",
 		codebaseIndexSearchMaxResults: undefined,
@@ -286,6 +288,7 @@ export const ExtensionStateContextProvider: React.FC<{
 	const clineMessagesSeqRef = useRef(state.clineMessagesSeq ?? 0)
 	const clineMessagesRef = useRef<ClineMessage[]>(state.clineMessages)
 	const activeSnapshotRef = useRef<ClineMessagesSnapshotBuffer | null>(null)
+	const snapshotTimeoutRef = useRef<number | undefined>(undefined)
 	const resyncPendingRef = useRef(false)
 	const resyncTimeoutRef = useRef<number | undefined>(undefined)
 
@@ -337,47 +340,87 @@ export const ExtensionStateContextProvider: React.FC<{
 		}))
 	}, [])
 
-	const clearClineMessagesResync = useCallback(() => {
-		resyncPendingRef.current = false
-		if (resyncTimeoutRef.current !== undefined) {
-			window.clearTimeout(resyncTimeoutRef.current)
-			resyncTimeoutRef.current = undefined
-		}
-	}, [])
-
-	const requestClineMessagesResync = useCallback((receivedSeq?: number) => {
-		if (resyncPendingRef.current) {
-			return
-		}
-		resyncPendingRef.current = true
-		resyncTimeoutRef.current = window.setTimeout(() => {
+	const clearClineMessagesResync = useCallback(
+		() => {
 			resyncPendingRef.current = false
-			resyncTimeoutRef.current = undefined
-		}, CLINE_MESSAGES_RESYNC_TIMEOUT_MS)
-		vscode.postMessage({
-			type: "requestClineMessagesResync",
-			taskId: activeTaskIdRef.current,
-			expectedSeq: clineMessagesSeqRef.current + 1,
-			receivedSeq,
-		})
-	}, [])
+			if (resyncTimeoutRef.current !== undefined) {
+				window.clearTimeout(resyncTimeoutRef.current)
+				resyncTimeoutRef.current = undefined
+			}
+		},
+		// Stryker disable next-line ArrayDeclaration: an inserted constant never changes, so this ref-only callback retains the same identity and captures.
+		[],
+	)
+
+	const clearClineMessagesSnapshot = useCallback(
+		() => {
+			activeSnapshotRef.current = null
+			if (snapshotTimeoutRef.current !== undefined) {
+				window.clearTimeout(snapshotTimeoutRef.current)
+				snapshotTimeoutRef.current = undefined
+			}
+		},
+		// Stryker disable next-line ArrayDeclaration: an inserted constant cannot change this ref-only callback's stable identity or captured values.
+		[],
+	)
+
+	const requestClineMessagesResync = useCallback(
+		(receivedSeq?: number) => {
+			if (resyncPendingRef.current) {
+				return
+			}
+			resyncPendingRef.current = true
+			resyncTimeoutRef.current = window.setTimeout(() => {
+				resyncPendingRef.current = false
+				resyncTimeoutRef.current = undefined
+			}, CLINE_MESSAGES_RESYNC_TIMEOUT_MS)
+			vscode.postMessage({
+				type: "requestClineMessagesResync",
+				taskId: activeTaskIdRef.current,
+				expectedSeq: clineMessagesSeqRef.current + 1,
+				receivedSeq,
+			})
+		},
+		// Stryker disable next-line ArrayDeclaration: an inserted constant never changes, so this ref-only callback retains the same identity and captures.
+		[],
+	)
 
 	const retryClineMessagesResync = useCallback(
 		(receivedSeq?: number) => {
 			clearClineMessagesResync()
 			requestClineMessagesResync(receivedSeq)
 		},
+		// Stryker disable next-line ArrayDeclaration: both dependencies are stable callbacks; omitting them cannot alter callback identity or captured values.
 		[clearClineMessagesResync, requestClineMessagesResync],
+	)
+
+	const startClineMessagesSnapshotTimeout = useCallback(
+		(snapshotId: string, seq: number) => {
+			if (snapshotTimeoutRef.current !== undefined) {
+				window.clearTimeout(snapshotTimeoutRef.current)
+			}
+			snapshotTimeoutRef.current = window.setTimeout(() => {
+				const snapshot = activeSnapshotRef.current
+				if (snapshot?.snapshotId !== snapshotId || snapshot.seq !== seq) {
+					return
+				}
+				activeSnapshotRef.current = null
+				snapshotTimeoutRef.current = undefined
+				retryClineMessagesResync(seq)
+			}, CLINE_MESSAGES_SNAPSHOT_TIMEOUT_MS)
+		},
+		// Stryker disable next-line ArrayDeclaration: retryClineMessagesResync is stable, so omitting it cannot alter callback identity or captured values.
+		[retryClineMessagesResync],
 	)
 
 	const applyClineMessagesDelta = useCallback(
 		(message: ExtensionMessage, operation: "append" | "update") => {
-			const seq = message.clineMessagesSeq
+			const seq = message.clineMessagesSeq as number
 			const clineMessage = message.clineMessage
 			if (message.taskId !== activeTaskIdRef.current) {
 				return
 			}
-			if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0 || !clineMessage) {
+			if (!Number.isSafeInteger(seq) || seq < 0 || !clineMessage) {
 				requestClineMessagesResync(typeof seq === "number" ? seq : undefined)
 				return
 			}
@@ -389,7 +432,7 @@ export const ExtensionStateContextProvider: React.FC<{
 				if (seq <= snapshot.seq) {
 					return
 				}
-				activeSnapshotRef.current = null
+				clearClineMessagesSnapshot()
 				retryClineMessagesResync(seq)
 				return
 			}
@@ -422,7 +465,8 @@ export const ExtensionStateContextProvider: React.FC<{
 				clineMessagesSeq: seq,
 			}))
 		},
-		[requestClineMessagesResync, retryClineMessagesResync],
+		// Stryker disable next-line ArrayDeclaration: both dependencies are stable callbacks; an empty dependency list produces the same closure for the provider lifetime.
+		[clearClineMessagesSnapshot, requestClineMessagesResync, retryClineMessagesResync],
 	)
 
 	const handleMessage = useCallback(
@@ -445,7 +489,7 @@ export const ExtensionStateContextProvider: React.FC<{
 						activeTaskIdRef.current = nextTaskId
 						clineMessagesSeqRef.current = 0
 						clineMessagesRef.current = []
-						activeSnapshotRef.current = null
+						clearClineMessagesSnapshot()
 						clearClineMessagesResync()
 					}
 					setState((prevState) => {
@@ -532,9 +576,9 @@ export const ExtensionStateContextProvider: React.FC<{
 						break
 					}
 
-					const seq = message.clineMessagesSeq
-					if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) {
-						activeSnapshotRef.current = null
+					const seq = message.clineMessagesSeq as number
+					if (!Number.isSafeInteger(seq) || seq < 0) {
+						clearClineMessagesSnapshot()
 						retryClineMessagesResync(typeof seq === "number" ? seq : undefined)
 						break
 					}
@@ -542,9 +586,9 @@ export const ExtensionStateContextProvider: React.FC<{
 						break
 					}
 
-					const total = message.snapshotTotal
-					if (!message.snapshotId || typeof total !== "number" || !Number.isSafeInteger(total) || total < 0) {
-						activeSnapshotRef.current = null
+					const total = message.snapshotTotal as number
+					if (!message.snapshotId || !Number.isSafeInteger(total) || total < 0) {
+						clearClineMessagesSnapshot()
 						retryClineMessagesResync(seq)
 						break
 					}
@@ -564,6 +608,7 @@ export const ExtensionStateContextProvider: React.FC<{
 						total,
 						messages: [],
 					}
+					startClineMessagesSnapshotTimeout(message.snapshotId, seq)
 					break
 				}
 				case "clineMessagesSnapshotChunk": {
@@ -571,10 +616,10 @@ export const ExtensionStateContextProvider: React.FC<{
 						break
 					}
 
-					const seq = message.clineMessagesSeq
+					const seq = message.clineMessagesSeq as number
 					const snapshot = activeSnapshotRef.current
-					if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) {
-						activeSnapshotRef.current = null
+					if (!Number.isSafeInteger(seq) || seq < 0) {
+						clearClineMessagesSnapshot()
 						retryClineMessagesResync(typeof seq === "number" ? seq : undefined)
 						break
 					}
@@ -586,23 +631,22 @@ export const ExtensionStateContextProvider: React.FC<{
 					}
 					if (message.snapshotId !== snapshot.snapshotId || seq !== snapshot.seq) {
 						if (seq > snapshot.seq) {
-							activeSnapshotRef.current = null
+							clearClineMessagesSnapshot()
 							retryClineMessagesResync(seq)
 						}
 						break
 					}
 
 					const chunk = message.clineMessages
-					const startIndex = message.snapshotStartIndex
+					const startIndex = message.snapshotStartIndex as number
 					if (
 						!Array.isArray(chunk) ||
 						chunk.length === 0 ||
-						typeof startIndex !== "number" ||
 						!Number.isSafeInteger(startIndex) ||
 						startIndex !== snapshot.messages.length ||
 						snapshot.messages.length + chunk.length > snapshot.total
 					) {
-						activeSnapshotRef.current = null
+						clearClineMessagesSnapshot()
 						retryClineMessagesResync(seq)
 						break
 					}
@@ -615,10 +659,10 @@ export const ExtensionStateContextProvider: React.FC<{
 						break
 					}
 
-					const seq = message.clineMessagesSeq
+					const seq = message.clineMessagesSeq as number
 					const snapshot = activeSnapshotRef.current
-					if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) {
-						activeSnapshotRef.current = null
+					if (!Number.isSafeInteger(seq) || seq < 0) {
+						clearClineMessagesSnapshot()
 						retryClineMessagesResync(typeof seq === "number" ? seq : undefined)
 						break
 					}
@@ -630,18 +674,18 @@ export const ExtensionStateContextProvider: React.FC<{
 					}
 					if (message.snapshotId !== snapshot.snapshotId || seq !== snapshot.seq) {
 						if (seq > snapshot.seq) {
-							activeSnapshotRef.current = null
+							clearClineMessagesSnapshot()
 							retryClineMessagesResync(seq)
 						}
 						break
 					}
 					if (message.snapshotTotal !== snapshot.total || snapshot.messages.length !== snapshot.total) {
-						activeSnapshotRef.current = null
+						clearClineMessagesSnapshot()
 						retryClineMessagesResync(seq)
 						break
 					}
 
-					activeSnapshotRef.current = null
+					clearClineMessagesSnapshot()
 					clearClineMessagesResync()
 					clineMessagesRef.current = snapshot.messages
 					clineMessagesSeqRef.current = snapshot.seq
@@ -657,6 +701,7 @@ export const ExtensionStateContextProvider: React.FC<{
 					break
 				}
 				case "clineMessageUpdated": {
+					// Stryker disable next-line StringLiteral: applyClineMessagesDelta treats every non-"append" operation as an update, so replacing this literal with another non-append string is equivalent.
 					applyClineMessagesDelta(message, "update")
 					break
 				}
@@ -743,22 +788,30 @@ export const ExtensionStateContextProvider: React.FC<{
 				}
 			}
 		},
+		// Stryker disable next-line ArrayDeclaration: every listed dependency is a stable callback; removing the list does not change this listener closure.
 		[
 			applyClineMessagesDelta,
+			clearClineMessagesSnapshot,
 			clearClineMessagesResync,
 			requestClineMessagesResync,
 			retryClineMessagesResync,
 			setListApiConfigMeta,
+			startClineMessagesSnapshotTimeout,
 		],
 	)
 
-	useEffect(() => {
-		window.addEventListener("message", handleMessage)
-		return () => {
-			window.removeEventListener("message", handleMessage)
-			clearClineMessagesResync()
-		}
-	}, [clearClineMessagesResync, handleMessage])
+	useEffect(
+		() => {
+			window.addEventListener("message", handleMessage)
+			return () => {
+				window.removeEventListener("message", handleMessage)
+				clearClineMessagesSnapshot()
+				clearClineMessagesResync()
+			}
+		},
+		// Stryker disable next-line ArrayDeclaration: both effect dependencies are stable callbacks, making an empty list behaviorally identical for the provider lifetime.
+		[clearClineMessagesResync, clearClineMessagesSnapshot, handleMessage],
+	)
 
 	useEffect(() => {
 		vscode.postMessage({ type: "webviewDidLaunch" })

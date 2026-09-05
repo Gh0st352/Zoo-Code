@@ -119,6 +119,7 @@ const mockClineProvider = {
 	postStateToWebview: vi.fn(),
 	syncFocusedTaskToWebview: vi.fn().mockResolvedValue(undefined),
 	resyncClineMessagesToWebview: vi.fn().mockResolvedValue(undefined),
+	clearTask: vi.fn().mockResolvedValue(undefined),
 	resolveWebviewThemeFixtureProbe: vi.fn(),
 	getCurrentTask: vi.fn(),
 	getTaskWithId: vi.fn(),
@@ -126,6 +127,24 @@ const mockClineProvider = {
 	getSkillsManager: vi.fn(),
 	cwd: "/mock/workspace",
 } as unknown as ClineProvider
+
+describe("webviewMessageHandler - launch", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+		vi.mocked(mockClineProvider.customModesManager.getCustomModes).mockResolvedValue([])
+		Object.assign(mockClineProvider, {
+			getMcpHub: vi.fn().mockReturnValue(undefined),
+			providerSettingsManager: { listConfig: vi.fn().mockResolvedValue(undefined) },
+		})
+	})
+
+	it("synchronizes focused state with task history", async () => {
+		await webviewMessageHandler(mockClineProvider, { type: "webviewDidLaunch" })
+
+		expect(mockClineProvider.syncFocusedTaskToWebview).toHaveBeenCalledOnce()
+		expect(mockClineProvider.syncFocusedTaskToWebview).toHaveBeenCalledWith({ includeTaskHistory: true })
+	})
+})
 
 describe("webviewMessageHandler - transcript resync", () => {
 	beforeEach(() => {
@@ -142,6 +161,20 @@ describe("webviewMessageHandler - transcript resync", () => {
 
 		expect(mockClineProvider.resyncClineMessagesToWebview).toHaveBeenCalledOnce()
 		expect(mockClineProvider.resyncClineMessagesToWebview).toHaveBeenCalledWith("task-1")
+	})
+})
+
+describe("webviewMessageHandler - clear task", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+	})
+
+	it("clears the task and synchronizes focused state with task history", async () => {
+		await webviewMessageHandler(mockClineProvider, { type: "clearTask" })
+
+		expect(mockClineProvider.clearTask).toHaveBeenCalledOnce()
+		expect(mockClineProvider.syncFocusedTaskToWebview).toHaveBeenCalledOnce()
+		expect(mockClineProvider.syncFocusedTaskToWebview).toHaveBeenCalledWith({ includeTaskHistory: true })
 	})
 })
 
