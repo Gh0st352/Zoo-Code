@@ -3022,9 +3022,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				this.presentAssistantMessageHasPendingUpdates = false
 				// No legacy text-stream tool parser.
 				this.streamingToolCallIndices.clear()
-				// Clear any leftover streaming tool call state from previous interrupted streams
-				NativeToolCallParser.clearAllStreamingToolCalls()
-				NativeToolCallParser.clearRawChunkState()
+				const nativeToolCallParserScope = NativeToolCallParser.createScope()
 
 				await this.diffViewProvider.reset()
 
@@ -3119,12 +3117,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							case "tool_call_partial": {
 								// Process raw tool call chunk through NativeToolCallParser
 								// which handles tracking, buffering, and emits events
-								const events = NativeToolCallParser.processRawChunk({
-									index: chunk.index,
-									id: chunk.id,
-									name: chunk.name,
-									arguments: chunk.arguments,
-								})
+								const events = NativeToolCallParser.processRawChunk(
+									{
+										index: chunk.index,
+										id: chunk.id,
+										name: chunk.name,
+										arguments: chunk.arguments,
+									},
+									nativeToolCallParserScope,
+								)
 
 								for (const event of events) {
 									if (event.type === "tool_call_start") {
@@ -3141,7 +3142,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 										}
 
 										// Initialize streaming in NativeToolCallParser
-										NativeToolCallParser.startStreamingToolCall(event.id, event.name as ToolName)
+										NativeToolCallParser.startStreamingToolCall(
+											event.id,
+											event.name as ToolName,
+											nativeToolCallParserScope,
+										)
 
 										// Before adding a new tool, finalize any preceding text block
 										// This prevents the text block from blocking tool presentation
@@ -3176,6 +3181,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 										const partialToolUse = NativeToolCallParser.processStreamingChunk(
 											event.id,
 											event.delta,
+											nativeToolCallParserScope,
 										)
 
 										if (partialToolUse) {
@@ -3192,52 +3198,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 												/* v8 ignore next -- streaming presenter; .catch lives in presentAssistantMessageSafe (covered) */
 												this.presentAssistantMessageSafe()
 											}
-										}
-									} else if (event.type === "tool_call_end") {
-										// Finalize the streaming tool call
-										const finalToolUse = NativeToolCallParser.finalizeStreamingToolCall(event.id)
-
-										// Get the index for this tool call
-										const toolUseIndex = this.streamingToolCallIndices.get(event.id)
-
-										if (finalToolUse) {
-											// Store the tool call ID
-											;(finalToolUse as any).id = event.id
-
-											// Get the index and replace partial with final
-											if (toolUseIndex !== undefined) {
-												this.assistantMessageContent[toolUseIndex] = finalToolUse
-											}
-
-											// Clean up tracking
-											this.streamingToolCallIndices.delete(event.id)
-
-											// Mark that we have new content to process
-											this.userMessageContentReady = false
-
-											// Present the finalized tool call
-											/* v8 ignore next -- streaming presenter; .catch lives in presentAssistantMessageSafe (covered) */
-											this.presentAssistantMessageSafe()
-										} else if (toolUseIndex !== undefined) {
-											// finalizeStreamingToolCall returned null (malformed JSON or missing args)
-											// Mark the tool as non-partial so it's presented as complete, but execution
-											// will be short-circuited in presentAssistantMessage with a structured tool_result.
-											const existingToolUse = this.assistantMessageContent[toolUseIndex]
-											if (existingToolUse && existingToolUse.type === "tool_use") {
-												existingToolUse.partial = false
-												// Ensure it has the ID for native protocol
-												;(existingToolUse as any).id = event.id
-											}
-
-											// Clean up tracking
-											this.streamingToolCallIndices.delete(event.id)
-
-											// Mark that we have new content to process
-											this.userMessageContentReady = false
-
-											// Present the tool call - validation will handle missing params
-											/* v8 ignore next -- streaming presenter; .catch lives in presentAssistantMessageSafe (covered) */
-											this.presentAssistantMessageSafe()
 										}
 									}
 								}
@@ -3593,11 +3553,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				// Finalize any remaining streaming tool calls that weren't explicitly ended
 				// This is critical for MCP tools which need tool_call_end events to be properly
 				// converted from ToolUse to McpToolUse via finalizeStreamingToolCall()
-				const finalizeEvents = NativeToolCallParser.finalizeRawChunks()
+				const finalizeEvents = NativeToolCallParser.finalizeRawChunks(nativeToolCallParserScope)
 				for (const event of finalizeEvents) {
 					if (event.type === "tool_call_end") {
 						// Finalize the streaming tool call
-						const finalToolUse = NativeToolCallParser.finalizeStreamingToolCall(event.id)
+						const finalToolUse = NativeToolCallParser.finalizeStreamingToolCall(
+							event.id,
+							nativeToolCallParserScope,
+						)
 
 						// Get the index for this tool call
 						const toolUseIndex = this.streamingToolCallIndices.get(event.id)
