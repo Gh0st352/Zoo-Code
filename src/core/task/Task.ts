@@ -2929,7 +2929,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			} satisfies ClineApiReqInfo)
 
 			await this.saveClineMessages()
-			await this.updateClineMessage(this.clineMessages[lastApiReqIndex])
+			const apiRequestMessage = this.clineMessages[lastApiReqIndex]
+			if (apiRequestMessage) {
+				await this.updateClineMessage(apiRequestMessage)
+			}
 
 			try {
 				let cacheWriteTokens = 0

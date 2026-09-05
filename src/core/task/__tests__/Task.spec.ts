@@ -3435,6 +3435,68 @@ describe("Cline", () => {
 		})
 	})
 
+	describe("recursivelyMakeClineRequests", () => {
+		it.each([
+			["publishes an API request row that remains after persistence", false, 1],
+			["does not publish a stale API request row removed during persistence", true, 0],
+		])("%s", async (_description, removeRequestDuringSave, expectedUpdateCount) => {
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const taskAccess = getTaskTestAccess(task)
+
+			vi.mocked(processUserContentMentions).mockResolvedValueOnce({
+				content: [{ type: "text", text: "hello" }],
+				mode: undefined,
+			})
+			vi.spyOn(task.diffViewProvider, "reset").mockResolvedValue(undefined as never)
+			vi.spyOn(taskAccess, "addToApiConversationHistory").mockResolvedValue(undefined)
+			vi.spyOn(taskAccess, "safeEnsureModelFetched").mockResolvedValue(undefined)
+			vi.spyOn(task.api, "getModel").mockReturnValue({
+				id: mockApiConfig.apiModelId!,
+				info: {
+					supportsImages: false,
+					supportsPromptCache: true,
+					contextWindow: 200_000,
+					maxTokens: 4096,
+				} as ModelInfo,
+			})
+			vi.spyOn(task, "attemptApiRequest").mockImplementation(() => {
+				throw new Error("stop after request-row update")
+			})
+			vi.spyOn(task, "say").mockImplementation(async (type) => {
+				if (type === "api_req_started") {
+					task.clineMessages.push({
+						ts: Date.now(),
+						type: "say",
+						say: "api_req_started",
+						text: "{}",
+					})
+				}
+				return undefined as never
+			})
+			vi.spyOn(taskAccess, "saveClineMessages").mockImplementation(async () => {
+				if (removeRequestDuringSave) {
+					// Simulate a concurrent delete/edit truncating the transcript while persistence is awaited.
+					task.clineMessages = []
+				}
+				return true
+			})
+			const updateSpy = vi.mocked(mockProvider.postClineMessageUpdated)
+			updateSpy.mockClear()
+
+			await expect(task.recursivelyMakeClineRequests([{ type: "text", text: "hello" }])).resolves.toBe(true)
+
+			expect(updateSpy).toHaveBeenCalledTimes(expectedUpdateCount)
+			if (!removeRequestDuringSave) {
+				expect(updateSpy).toHaveBeenCalledWith(task.taskId, expect.objectContaining({ say: "api_req_started" }))
+			}
+		})
+	})
+
 	describe("safeEnsureModelFetched", () => {
 		it("loads model metadata before getModel is used", async () => {
 			const task = new Task({
