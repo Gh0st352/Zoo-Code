@@ -823,7 +823,9 @@ describe("Task persistence", () => {
 			})
 			const replay = vi
 				.spyOn(getTaskPersistenceAccess(task), "resumePendingTaskAction")
-				.mockResolvedValue(undefined)
+				.mockImplementation(async () => {
+					expect(task.isInitialized).toBe(true)
+				})
 			const ask = vi.spyOn(task, "ask")
 			const snapshotDeferred = createDeferred<void>()
 			const snapshot = vi
