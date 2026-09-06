@@ -2185,6 +2185,53 @@ describe("Cline", () => {
 			expect(overwriteFinished).toBe(true)
 		})
 
+		it.each([true, false])("cancels stale partial updates before an overwrite with persist %s", async (persist) => {
+			vi.useFakeTimers()
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const taskAccess = getTaskTestAccess(task)
+			let releaseSave!: (saved: boolean) => void
+			const pendingSave = new Promise<boolean>((resolve) => {
+				releaseSave = resolve
+			})
+			vi.spyOn(taskAccess, "saveClineMessages").mockReturnValueOnce(pendingSave)
+			const staleMessage = {
+				ts: 1,
+				type: "say" as const,
+				say: "text" as const,
+				text: "removed partial",
+				partial: true,
+			}
+			const replacement = { ...staleMessage, ts: 2, text: "replacement partial" }
+			task.clineMessages = [staleMessage]
+			await taskAccess.updateClineMessage(staleMessage)
+
+			const overwritePromise = task.overwriteClineMessages([replacement], persist)
+			await vi.advanceTimersByTimeAsync(500)
+
+			expect(task.clineMessages).toEqual([replacement])
+			expect(mockProvider.postClineMessageUpdated).not.toHaveBeenCalled()
+			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledTimes(persist ? 0 : 1)
+
+			releaseSave(true)
+			await overwritePromise
+			await vi.advanceTimersByTimeAsync(500)
+
+			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledOnce()
+			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledWith(task.taskId, { bumpSeq: true })
+			expect(mockProvider.postClineMessageUpdated).not.toHaveBeenCalled()
+
+			await taskAccess.updateClineMessage(replacement)
+			await vi.advanceTimersByTimeAsync(500)
+
+			expect(mockProvider.postClineMessageUpdated).toHaveBeenCalledOnce()
+			expect(mockProvider.postClineMessageUpdated).toHaveBeenCalledWith(task.taskId, replacement)
+		})
+
 		it("propagates an overwrite snapshot failure after persistence", async () => {
 			const task = new Task({
 				provider: mockProvider,

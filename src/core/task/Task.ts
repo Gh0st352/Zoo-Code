@@ -1190,6 +1190,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	public async overwriteClineMessages(newMessages: ClineMessage[], persist = true) {
+		this.debouncedPostPartialMessageUpdate.cancel()
 		this.hydrateClineMessages(newMessages)
 		if (persist) {
 			await this.saveClineMessages(false)
@@ -2226,13 +2227,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				await this.clearPendingActionAfterDurableResult(this.pendingAction.actionId)
 			}
 
-			if (this.pendingAction) {
-				this.isInitialized = true
-				await this.resumePendingTaskAction(this.pendingAction)
+			if (this.abort || this.abandoned) {
 				return
 			}
 
+			// Publish the transcript after both histories hydrate, before any resume prompt or pending-action replay.
+			await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, { bumpSeq: true })
+
 			if (this.abort || this.abandoned) {
+				return
+			}
+
+			if (this.pendingAction) {
+				this.isInitialized = true
+				await this.resumePendingTaskAction(this.pendingAction)
 				return
 			}
 
