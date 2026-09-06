@@ -112,6 +112,7 @@ import { ClineProvider } from "../webview/ClineProvider"
 import { MultiSearchReplaceDiffStrategy } from "../diff/strategies/multi-search-replace"
 import {
 	type ApiMessage,
+	ensureMessageIdentifiers,
 	readApiMessages,
 	saveApiMessages,
 	readTaskMessages,
@@ -991,7 +992,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	// API Messages
 
 	private async getSavedApiConversationHistory(): Promise<ApiMessage[]> {
-		return readApiMessages({ taskId: this.taskId, globalStoragePath: this.globalStoragePath })
+		const messages = await readApiMessages({ taskId: this.taskId, globalStoragePath: this.globalStoragePath })
+		return ensureMessageIdentifiers(messages)
 	}
 
 	private async addToApiConversationHistory(message: Anthropic.MessageParam, reasoning?: string) {
@@ -1032,9 +1034,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	// For API requests, consecutive same-role messages are merged via mergeConsecutiveApiMessages()
 	// so rewind/edit behavior can still reference original message boundaries.
 
-	async overwriteApiConversationHistory(newHistory: ApiMessage[]) {
-		this.apiConversationHistory = newHistory
-		await this.saveApiConversationHistory()
+	async overwriteApiConversationHistory(newHistory: ApiMessage[], persist = true) {
+		this.hydrateApiConversationHistory(newHistory)
+		if (persist) {
+			await this.saveApiConversationHistory(false)
+		}
 	}
 
 	/**
@@ -1099,7 +1103,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const lastEffective = effectiveHistoryForValidation[effectiveHistoryForValidation.length - 1]
 		const historyForValidation = lastEffective?.role === "assistant" ? effectiveHistoryForValidation : []
 		const validatedMessage = validateAndFixToolResultIds(userMessage, historyForValidation)
-		const userMessageWithTs = { ...validatedMessage, ts: Date.now() }
+		const userMessageWithTs = { ...validatedMessage, messageId: crypto.randomUUID(), ts: Date.now() }
 		this.apiConversationHistory.push(userMessageWithTs as ApiMessage)
 
 		const saved = await this.saveApiConversationHistory()
@@ -1116,12 +1120,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return saved
 	}
 
-	private async saveApiConversationHistory(): Promise<boolean> {
+	private async saveApiConversationHistory(merge = true): Promise<boolean> {
 		try {
 			await saveApiMessages({
 				messages: structuredClone(this.apiConversationHistory),
 				taskId: this.taskId,
 				globalStoragePath: this.globalStoragePath,
+				merge,
 			})
 			return true
 		} catch (error) {
@@ -1161,6 +1166,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	private async addToClineMessages(message: ClineMessage) {
+		message.messageId ??= crypto.randomUUID()
 		this.clineMessages.push(message)
 		const provider = this.providerRef.deref()
 		try {
@@ -1183,20 +1189,30 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 	}
 
-	public async overwriteClineMessages(newMessages: ClineMessage[]) {
-		this.clineMessages = newMessages
-		restoreTodoListForTask(this)
-		await this.saveClineMessages()
+	public async overwriteClineMessages(newMessages: ClineMessage[], persist = true) {
+		this.hydrateClineMessages(newMessages)
+		if (persist) {
+			await this.saveClineMessages(false)
+		}
+	}
 
-		// When overwriting messages (e.g., during task resume), repopulate the cloud sync tracking Set
+	private hydrateClineMessages(messages: ClineMessage[]) {
+		this.clineMessages = ensureMessageIdentifiers(messages)
+		restoreTodoListForTask(this)
+
+		// When hydrating or overwriting messages, repopulate the cloud sync tracking Set
 		// with timestamps from all non-partial messages to prevent re-syncing previously synced messages
 		this.cloudSyncedMessageTimestamps.clear()
-		for (const msg of newMessages) {
+		for (const msg of messages) {
 			if (msg.partial !== true) {
 				this.cloudSyncedMessageTimestamps.add(msg.ts)
 			}
 		}
 		await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, { bumpSeq: true })
+	}
+
+	private hydrateApiConversationHistory(messages: ApiMessage[]) {
+		this.apiConversationHistory = ensureMessageIdentifiers(messages)
 	}
 
 	private async updateClineMessage(message: ClineMessage) {
@@ -1222,12 +1238,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 	}
 
-	private async saveClineMessages(): Promise<boolean> {
+	private async saveClineMessages(merge = true): Promise<boolean> {
 		try {
 			await saveTaskMessages({
 				messages: structuredClone(this.clineMessages),
 				taskId: this.taskId,
 				globalStoragePath: this.globalStoragePath,
+				merge,
 			})
 
 			if (this._taskApiConfigName === undefined) {
@@ -2116,7 +2133,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	private async resumeTaskFromHistory() {
 		try {
-			const modifiedClineMessages = await this.getSavedClineMessages()
+			const modifiedClineMessages = [...(await this.getSavedClineMessages())]
+
+			if (this.abort || this.abandoned) {
+				return
+			}
 
 			// Remove any resume messages that may have been added before.
 			const lastRelevantMessageIndex = findLastIndex(
@@ -2126,16 +2147,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			if (lastRelevantMessageIndex !== -1) {
 				modifiedClineMessages.splice(lastRelevantMessageIndex + 1)
-			}
-
-			// Remove any trailing reasoning-only UI messages that were not part of the persisted API conversation
-			while (modifiedClineMessages.length > 0) {
-				const last = modifiedClineMessages[modifiedClineMessages.length - 1]
-				if (last.type === "say" && last.say === "reasoning") {
-					modifiedClineMessages.pop()
-				} else {
-					break
-				}
 			}
 
 			if (this.pendingAction) {
@@ -2149,6 +2160,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				)
 				if (pendingAskIndex !== -1) {
 					modifiedClineMessages.splice(pendingAskIndex, 1)
+				}
+			}
+
+			// Incomplete reasoning has no matching API-history entry and would become
+			// an orphaned bubble when the resumed request starts fresh reasoning.
+			while (modifiedClineMessages.length > 0) {
+				const lastMessage = modifiedClineMessages[modifiedClineMessages.length - 1]
+				if (lastMessage.type === "say" && lastMessage.say === "reasoning" && lastMessage.partial === true) {
+					modifiedClineMessages.pop()
+				} else {
+					break
 				}
 			}
 
@@ -2170,8 +2192,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				}
 			}
 
-			await this.overwriteClineMessages(modifiedClineMessages)
-			this.clineMessages = await this.getSavedClineMessages()
+			// Read API history before hydrating either side. If the task is aborted
+			// or abandoned after the UI read completes but before this point, the
+			// abort guard below will fire and neither history will be written.
+			const savedApiConversationHistory = await this.getSavedApiConversationHistory()
+			if (this.abort || this.abandoned) {
+				return
+			}
+
+			// Avoid a standalone write during hydration. The resume ask will persist only
+			// after all history reads succeed and the task is still active.
+			this.hydrateClineMessages(modifiedClineMessages)
 
 			// Now present the cline messages to the user and ask if they want to
 			// resume (NOTE: we ran into a bug before where the
@@ -2179,7 +2210,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// task, and it was because we were waiting for resume).
 			// This is important in case the user deletes messages without resuming
 			// the task first.
-			this.apiConversationHistory = await this.getSavedApiConversationHistory()
+			this.hydrateApiConversationHistory(savedApiConversationHistory)
 			if (
 				this.pendingAction &&
 				this.apiConversationHistory.some(
@@ -2198,6 +2229,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			if (this.pendingAction) {
 				this.isInitialized = true
 				await this.resumePendingTaskAction(this.pendingAction)
+				return
+			}
+
+			if (this.abort || this.abandoned) {
 				return
 			}
 
@@ -2682,7 +2717,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		// Load conversation history if not already loaded
 		if (this.apiConversationHistory.length === 0) {
-			this.apiConversationHistory = await this.getSavedApiConversationHistory()
+			this.hydrateApiConversationHistory(await this.getSavedApiConversationHistory())
 		}
 
 		// Add environment details to the existing last user message (which contains the tool_result)
@@ -3038,9 +3073,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				this.presentAssistantMessageHasPendingUpdates = false
 				// No legacy text-stream tool parser.
 				this.streamingToolCallIndices.clear()
-				// Clear any leftover streaming tool call state from previous interrupted streams
-				NativeToolCallParser.clearAllStreamingToolCalls()
-				NativeToolCallParser.clearRawChunkState()
+				const nativeToolCallParserScope = NativeToolCallParser.createScope()
 
 				await this.diffViewProvider.reset()
 
@@ -3135,12 +3168,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							case "tool_call_partial": {
 								// Process raw tool call chunk through NativeToolCallParser
 								// which handles tracking, buffering, and emits events
-								const events = NativeToolCallParser.processRawChunk({
-									index: chunk.index,
-									id: chunk.id,
-									name: chunk.name,
-									arguments: chunk.arguments,
-								})
+								const events = NativeToolCallParser.processRawChunk(
+									{
+										index: chunk.index,
+										id: chunk.id,
+										name: chunk.name,
+										arguments: chunk.arguments,
+									},
+									nativeToolCallParserScope,
+								)
 
 								for (const event of events) {
 									if (event.type === "tool_call_start") {
@@ -3157,7 +3193,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 										}
 
 										// Initialize streaming in NativeToolCallParser
-										NativeToolCallParser.startStreamingToolCall(event.id, event.name as ToolName)
+										NativeToolCallParser.startStreamingToolCall(
+											event.id,
+											event.name as ToolName,
+											nativeToolCallParserScope,
+										)
 
 										// Before adding a new tool, finalize any preceding text block
 										// This prevents the text block from blocking tool presentation
@@ -3192,6 +3232,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 										const partialToolUse = NativeToolCallParser.processStreamingChunk(
 											event.id,
 											event.delta,
+											nativeToolCallParserScope,
 										)
 
 										if (partialToolUse) {
@@ -3208,52 +3249,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 												/* v8 ignore next -- streaming presenter; .catch lives in presentAssistantMessageSafe (covered) */
 												this.presentAssistantMessageSafe()
 											}
-										}
-									} else if (event.type === "tool_call_end") {
-										// Finalize the streaming tool call
-										const finalToolUse = NativeToolCallParser.finalizeStreamingToolCall(event.id)
-
-										// Get the index for this tool call
-										const toolUseIndex = this.streamingToolCallIndices.get(event.id)
-
-										if (finalToolUse) {
-											// Store the tool call ID
-											;(finalToolUse as any).id = event.id
-
-											// Get the index and replace partial with final
-											if (toolUseIndex !== undefined) {
-												this.assistantMessageContent[toolUseIndex] = finalToolUse
-											}
-
-											// Clean up tracking
-											this.streamingToolCallIndices.delete(event.id)
-
-											// Mark that we have new content to process
-											this.userMessageContentReady = false
-
-											// Present the finalized tool call
-											/* v8 ignore next -- streaming presenter; .catch lives in presentAssistantMessageSafe (covered) */
-											this.presentAssistantMessageSafe()
-										} else if (toolUseIndex !== undefined) {
-											// finalizeStreamingToolCall returned null (malformed JSON or missing args)
-											// Mark the tool as non-partial so it's presented as complete, but execution
-											// will be short-circuited in presentAssistantMessage with a structured tool_result.
-											const existingToolUse = this.assistantMessageContent[toolUseIndex]
-											if (existingToolUse && existingToolUse.type === "tool_use") {
-												existingToolUse.partial = false
-												// Ensure it has the ID for native protocol
-												;(existingToolUse as any).id = event.id
-											}
-
-											// Clean up tracking
-											this.streamingToolCallIndices.delete(event.id)
-
-											// Mark that we have new content to process
-											this.userMessageContentReady = false
-
-											// Present the tool call - validation will handle missing params
-											/* v8 ignore next -- streaming presenter; .catch lives in presentAssistantMessageSafe (covered) */
-											this.presentAssistantMessageSafe()
 										}
 									}
 								}
@@ -3609,11 +3604,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				// Finalize any remaining streaming tool calls that weren't explicitly ended
 				// This is critical for MCP tools which need tool_call_end events to be properly
 				// converted from ToolUse to McpToolUse via finalizeStreamingToolCall()
-				const finalizeEvents = NativeToolCallParser.finalizeRawChunks()
+				const finalizeEvents = NativeToolCallParser.finalizeRawChunks(nativeToolCallParserScope)
 				for (const event of finalizeEvents) {
 					if (event.type === "tool_call_end") {
 						// Finalize the streaming tool call
-						const finalToolUse = NativeToolCallParser.finalizeStreamingToolCall(event.id)
+						const finalToolUse = NativeToolCallParser.finalizeStreamingToolCall(
+							event.id,
+							nativeToolCallParserScope,
+						)
 
 						// Get the index for this tool call
 						const toolUseIndex = this.streamingToolCallIndices.get(event.id)
