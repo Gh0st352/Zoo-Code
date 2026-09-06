@@ -1194,6 +1194,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		if (persist) {
 			await this.saveClineMessages(false)
 		}
+		await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, { bumpSeq: true })
 	}
 
 	private hydrateClineMessages(messages: ClineMessage[]) {
@@ -1208,7 +1209,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				this.cloudSyncedMessageTimestamps.add(msg.ts)
 			}
 		}
-		await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, { bumpSeq: true })
 	}
 
 	private hydrateApiConversationHistory(messages: ApiMessage[]) {

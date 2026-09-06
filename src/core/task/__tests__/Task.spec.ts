@@ -2118,14 +2118,18 @@ describe("Cline", () => {
 			vi.useRealTimers()
 		})
 
-		it("posts a bumped snapshot after overwriting the transcript", async () => {
+		it("waits for persistence before posting a bumped snapshot after overwriting the transcript", async () => {
 			const task = new Task({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
 				startTask: false,
 			})
-			const saveSpy = vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockResolvedValue(true)
+			let releaseSave!: (saved: boolean) => void
+			const pendingSave = new Promise<boolean>((resolve) => {
+				releaseSave = resolve
+			})
+			const saveSpy = vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockReturnValueOnce(pendingSave)
 			const messages = [
 				{
 					ts: 1,
@@ -2135,10 +2139,68 @@ describe("Cline", () => {
 				},
 			]
 
-			await task.overwriteClineMessages(messages)
+			const overwritePromise = task.overwriteClineMessages(messages)
+
+			await Promise.resolve()
+			expect(task.clineMessages).toEqual(messages)
+			expect(saveSpy).toHaveBeenCalledWith(false)
+			expect(mockProvider.postClineMessagesSnapshot).not.toHaveBeenCalled()
+
+			releaseSave(true)
+			await overwritePromise
 
 			expect(saveSpy).toHaveBeenCalledOnce()
 			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledOnce()
+			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledWith(task.taskId, { bumpSeq: true })
+		})
+
+		it.each([true, false])("awaits the overwrite snapshot when persist is %s", async (persist) => {
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const saveSpy = vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockResolvedValue(true)
+			let releaseSnapshot!: () => void
+			const pendingSnapshot = new Promise<void>((resolve) => {
+				releaseSnapshot = resolve
+			})
+			const snapshotSpy = vi.mocked(mockProvider.postClineMessagesSnapshot).mockReturnValueOnce(pendingSnapshot)
+			const messages = [{ ts: 1, type: "say" as const, say: "text" as const, text: "replacement" }]
+			let overwriteFinished = false
+			const overwritePromise = task.overwriteClineMessages(messages, persist).then(() => {
+				overwriteFinished = true
+			})
+
+			await vi.waitFor(() => expect(snapshotSpy).toHaveBeenCalledWith(task.taskId, { bumpSeq: true }))
+			expect(task.clineMessages).toEqual(messages)
+			expect(saveSpy).toHaveBeenCalledTimes(persist ? 1 : 0)
+			expect(overwriteFinished).toBe(false)
+
+			releaseSnapshot()
+			await overwritePromise
+
+			expect(snapshotSpy).toHaveBeenCalledOnce()
+			expect(overwriteFinished).toBe(true)
+		})
+
+		it("propagates an overwrite snapshot failure after persistence", async () => {
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const saveSpy = vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockResolvedValue(true)
+			const snapshotError = new Error("snapshot failed")
+			vi.mocked(mockProvider.postClineMessagesSnapshot).mockRejectedValueOnce(snapshotError)
+			const messages = [{ ts: 1, type: "say" as const, say: "text" as const, text: "replacement" }]
+
+			await expect(task.overwriteClineMessages(messages)).rejects.toThrow(snapshotError)
+
+			expect(task.clineMessages).toEqual(messages)
+			expect(saveSpy).toHaveBeenCalledWith(false)
 			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledWith(task.taskId, { bumpSeq: true })
 		})
 
