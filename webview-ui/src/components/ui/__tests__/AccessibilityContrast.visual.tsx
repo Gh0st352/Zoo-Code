@@ -29,11 +29,18 @@ test("settles theme transitions without waiting for looping animations", async (
 	}
 
 	expect(
-		await page.evaluate(() =>
-			document
-				.getAnimations()
-				.some((animation) => animation instanceof CSSAnimation && animation.playState === "running"),
-		),
+		await component
+			.getByTestId("unsupported-gradient")
+			.evaluate((element) =>
+				element
+					.getAnimations()
+					.some(
+						(animation) =>
+							animation instanceof CSSAnimation &&
+							animation.animationName === "theme-test-spin" &&
+							animation.playState === "running",
+					),
+			),
 	).toBe(true)
 })
 
