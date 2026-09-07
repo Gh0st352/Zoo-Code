@@ -2,6 +2,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest"
 import { presentAssistantMessage } from "../presentAssistantMessage"
+import { withTaskExecution } from "../../../__tests__/helpers/execution-fixtures"
 import { validateToolUse } from "../../tools/validateToolUse"
 
 // Mock dependencies
@@ -44,7 +45,8 @@ describe("presentAssistantMessage - Custom Tool Recording", () => {
 		vi.clearAllMocks()
 
 		// Create a mock Task with minimal properties needed for testing
-		mockTask = {
+		mockTask = withTaskExecution({
+			assistantMessageSavedToHistory: true,
 			taskId: "test-task-id",
 			instanceId: "test-instance",
 			abort: false,
@@ -79,7 +81,7 @@ describe("presentAssistantMessage - Custom Tool Recording", () => {
 			},
 			say: vi.fn().mockResolvedValue(undefined),
 			ask: vi.fn().mockResolvedValue({ response: "yesButtonClicked" }),
-		}
+		})
 
 		// Add pushToolResultToUserContent method after mockTask is created so it can reference mockTask
 		mockTask.pushToolResultToUserContent = vi.fn().mockImplementation((toolResult: any) => {

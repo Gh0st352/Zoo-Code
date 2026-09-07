@@ -1,12 +1,16 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import * as vscode from "vscode"
+import * as fs from "fs/promises"
+import * as os from "os"
+import * as path from "path"
 
 import { ClineProvider } from "../ClineProvider"
 import { Task } from "../../task/Task"
 import { TaskRegistry } from "../../task/TaskRegistry"
 import { ContextProxy } from "../../config/ContextProxy"
-import type { ProviderSettings, HistoryItem } from "@roo-code/types"
+import type { ProviderSettings, HistoryItem, DelegationAction, ExecutionCommandResult } from "@roo-code/types"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
+import { commitDelegation, executionClaim, reserveDelegation } from "../../task-persistence/taskLifecycle"
 
 type MockTask = Partial<Task> &
 	Pick<Task, "taskId" | "instanceId"> & {
@@ -18,13 +22,16 @@ type MockTask = Partial<Task> &
 		didFinishAbortingStream?: boolean
 		isWaitingForFirstChunk?: boolean
 	}
-type CreatedHistoryTask = Awaited<ReturnType<ClineProvider["createTaskWithHistoryItem"]>>
-
 function seedRegistry(provider: ClineProvider, ...tasks: unknown[]) {
 	const registry = new TaskRegistry()
 	for (const value of tasks) {
 		const task = value as MockTask
 		task.dispose ??= vi.fn().mockResolvedValue(undefined)
+		task.abortTask ??= vi.fn<Task["abortTask"]>().mockResolvedValue(undefined)
+		task.awaitExecutionCleanup ??= vi.fn<Task["awaitExecutionCleanup"]>().mockResolvedValue(true)
+		task.apiConversationHistory ??= []
+		task.clineMessages ??= []
+		task.getPendingTaskAction ??= vi.fn<Task["getPendingTaskAction"]>()
 		// These lifecycle test doubles intentionally implement only the Task surface used here.
 		registry.push(task as unknown as Task)
 	}
@@ -37,7 +44,7 @@ vi.mock("vscode", () => {
 	return {
 		workspace: {
 			getConfiguration: vi.fn(() => ({
-				get: vi.fn().mockReturnValue([]),
+				get: vi.fn((_key: string, fallback: unknown) => fallback),
 				update: vi.fn().mockResolvedValue(undefined),
 			})),
 			workspaceFolders: [],
@@ -144,17 +151,6 @@ vi.mock("p-wait-for", () => ({
 	default: vi.fn().mockResolvedValue(undefined),
 }))
 
-vi.mock("fs/promises", () => ({
-	mkdir: vi.fn().mockResolvedValue(undefined),
-	writeFile: vi.fn().mockResolvedValue(undefined),
-	readFile: vi.fn().mockResolvedValue(""),
-	readdir: vi.fn().mockResolvedValue([]),
-	unlink: vi.fn().mockResolvedValue(undefined),
-	rmdir: vi.fn().mockResolvedValue(undefined),
-	access: vi.fn().mockResolvedValue(undefined),
-	rm: vi.fn().mockResolvedValue(undefined),
-}))
-
 vi.mock("axios", () => ({
 	default: { get: vi.fn().mockResolvedValue({ data: { data: [] } }), post: vi.fn() },
 	get: vi.fn().mockResolvedValue({ data: { data: [] } }),
@@ -168,17 +164,6 @@ vi.mock("delay", () => {
 	delayFn.range = () => Promise.resolve()
 	return { default: delayFn }
 })
-
-vi.mock("../../../utils/storage", () => ({
-	getSettingsDirectoryPath: vi.fn().mockResolvedValue("/test/settings/path"),
-	getTaskDirectoryPath: vi.fn().mockResolvedValue("/test/task/path"),
-	getGlobalStoragePath: vi.fn().mockResolvedValue("/test/storage/path"),
-	getStorageBasePath: vi.fn().mockImplementation((defaultPath: string) => defaultPath),
-}))
-
-vi.mock("../../../utils/safeWriteJson", () => ({
-	safeWriteJson: vi.fn().mockResolvedValue(undefined),
-}))
 
 vi.mock("../../../utils/tts", () => ({
 	setTtsEnabled: vi.fn(),
@@ -257,31 +242,9 @@ vi.mock("../../../services/skills/SkillsManager", () => ({
 	}),
 }))
 
-vi.mock("../../task-persistence", async (importOriginal) => {
-	const mod = await importOriginal<typeof import("../../task-persistence")>()
-	return {
-		...mod,
-		TaskHistoryStore: vi.fn().mockImplementation(function () {
-			return {
-				initialize: vi.fn().mockResolvedValue(undefined),
-				dispose: vi.fn(),
-				initialized: Promise.resolve(),
-				get: vi.fn().mockReturnValue(undefined),
-				getAll: vi.fn().mockReturnValue([]),
-				upsert: vi.fn().mockResolvedValue([]),
-				delete: vi.fn().mockResolvedValue(undefined),
-				deleteMany: vi.fn().mockResolvedValue(undefined),
-				migrateFromGlobalState: vi.fn().mockResolvedValue(undefined),
-			}
-		}),
-		readApiMessages: vi.fn().mockResolvedValue([]),
-		saveApiMessages: vi.fn().mockResolvedValue(undefined),
-		saveTaskMessages: vi.fn().mockResolvedValue(undefined),
-	}
-})
-
 describe("ClineProvider flicker-free cancel", () => {
 	let provider: ClineProvider
+	let directory: string
 	let mockContext: vscode.ExtensionContext
 	let mockOutputChannel: vscode.OutputChannel
 	let mockTask1: MockTask
@@ -304,8 +267,9 @@ describe("ClineProvider flicker-free cancel", () => {
 		consoleErrorSpy.mockRestore()
 	})
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.clearAllMocks()
+		directory = await fs.mkdtemp(path.join(os.tmpdir(), "zoo-cancel-"))
 
 		// Setup mock extension context
 		mockContext = {
@@ -314,7 +278,7 @@ describe("ClineProvider flicker-free cancel", () => {
 				update: vi.fn().mockResolvedValue(undefined),
 				keys: vi.fn().mockReturnValue([]),
 			},
-			globalStorageUri: { fsPath: "/test/storage" },
+			globalStorageUri: { fsPath: directory },
 			secrets: {
 				get: vi.fn().mockResolvedValue(undefined),
 				store: vi.fn().mockResolvedValue(undefined),
@@ -398,16 +362,41 @@ describe("ClineProvider flicker-free cancel", () => {
 			dispose: vi.fn().mockResolvedValue(undefined),
 			on: vi.fn(),
 			off: vi.fn(),
+			abortTask: vi.fn<Task["abortTask"]>().mockResolvedValue(undefined),
+			awaitExecutionCleanup: vi.fn<Task["awaitExecutionCleanup"]>().mockResolvedValue(true),
+			hydrateForRecovery: vi.fn<Task["hydrateForRecovery"]>().mockResolvedValue(undefined),
+			apiConversationHistory: [],
+			clineMessages: [],
+			run: vi.fn<Task["run"]>().mockResolvedValue(undefined),
 		}
 
 		// Mock Task constructor
-		vi.mocked(Task).mockImplementation(function () {
+		vi.mocked(Task).mockImplementation(function (options) {
+			Object.assign(mockTask2, {
+				taskId: options.historyItem?.id,
+				executionToken: options.executionToken,
+				executionBlocked: !options.executionToken,
+			})
 			return mockTask2 as unknown as Task
 		})
+		await provider.taskHistoryStore.initialize()
+		for (const id of ["task-1", "task-2"]) {
+			await provider.taskHistoryStore.upsert({
+				id,
+				number: 1,
+				ts: 1,
+				task: id,
+				tokensIn: 0,
+				tokensOut: 0,
+				totalCost: 0,
+			})
+		}
 	})
 
 	afterEach(async () => {
 		await provider.dispose()
+		vi.restoreAllMocks()
+		await fs.rm(directory, { recursive: true, force: true })
 	})
 
 	it("should not remove current task from stack when rehydrating same taskId", async () => {
@@ -436,6 +425,11 @@ describe("ClineProvider flicker-free cancel", () => {
 
 		// Act: Create task with history item (should rehydrate in-place)
 		await provider.createTaskWithHistoryItem(historyItem)
+		// No claim was supplied: viewing history may only install an observer.
+		expect(mockTask2.executionToken).toBeUndefined()
+		expect(mockTask2.executionBlocked).toBe(true)
+		expect(mockTask2.hydrateForRecovery).toHaveBeenCalledOnce()
+		expect(mockTask2.run).not.toHaveBeenCalled()
 
 		// Assert: removeClineFromStack should NOT be called
 		expect(removeClineFromStackSpy).not.toHaveBeenCalled()
@@ -476,6 +470,10 @@ describe("ClineProvider flicker-free cancel", () => {
 
 		// Act: Create task with different history item
 		await provider.createTaskWithHistoryItem(historyItem)
+		expect(mockTask2.taskId).toBe(historyItem.id)
+		expect(mockTask2.executionToken).toBeUndefined()
+		expect(mockTask2.hydrateForRecovery).toHaveBeenCalledOnce()
+		expect(mockTask2.run).not.toHaveBeenCalled()
 
 		// Assert: removeClineFromStack should be called
 		expect(removeClineFromStackSpy).toHaveBeenCalled()
@@ -502,11 +500,14 @@ describe("ClineProvider flicker-free cancel", () => {
 			workspace: "/test/workspace",
 		}
 
-		// Act: Should not error and should call removeClineFromStack
+		// Empty history navigation installs an observer; there is no runtime to remove.
 		await provider.createTaskWithHistoryItem(historyItem)
 
-		// Assert: removeClineFromStack should be called (no current task to rehydrate)
-		expect(removeClineFromStackSpy).toHaveBeenCalled()
+		expect(removeClineFromStackSpy).not.toHaveBeenCalled()
+		expect(provider.getCurrentTask()).toBe(mockTask2)
+		expect(mockTask2.executionToken).toBeUndefined()
+		expect(mockTask2.hydrateForRecovery).toHaveBeenCalledOnce()
+		expect(mockTask2.run).not.toHaveBeenCalled()
 	})
 
 	it("should maintain task stack integrity during flicker-free replacement", async () => {
@@ -537,6 +538,11 @@ describe("ClineProvider flicker-free cancel", () => {
 
 		await provider.createTaskWithHistoryItem(historyItem)
 
+		// Ownerless navigation must remain observation, including beside another task.
+		expect(mockTask2.executionToken).toBeUndefined()
+		expect(mockTask2.executionBlocked).toBe(true)
+		expect(mockTask2.hydrateForRecovery).toHaveBeenCalledOnce()
+		expect(mockTask2.run).not.toHaveBeenCalled()
 		// Assert: Registry should maintain parent task and replace current task
 		const registry = provider["taskRegistry"]
 		expect(registry.length).toBe(2)
@@ -574,6 +580,11 @@ describe("ClineProvider flicker-free cancel", () => {
 
 		await provider.createTaskWithHistoryItem(historyItem)
 
+		// Observation must neither grant authority nor disturb unrelated stack entries.
+		expect(mockTask2.executionToken).toBeUndefined()
+		expect(mockTask2.executionBlocked).toBe(true)
+		expect(mockTask2.hydrateForRecovery).toHaveBeenCalledOnce()
+		expect(mockTask2.run).not.toHaveBeenCalled()
 		const registry = provider["taskRegistry"]
 		// Stack order must be unchanged: replacement stays at index 0, top-task stays at index 1
 		expect(registry.length).toBe(2)
@@ -583,280 +594,177 @@ describe("ClineProvider flicker-free cancel", () => {
 		expect(registry.current).toBe(mockTask2)
 	})
 
-	it("marks a cancelled delegated child as interrupted and keeps parent delegated (preserving resume path)", async () => {
-		const mockRootTask = { taskId: "root-1" }
-		const mockParentTask = { taskId: "parent-1" }
-		const childHistory: HistoryItem = {
-			id: "child-1",
-			number: 2,
-			task: "child task",
-			ts: Date.now(),
-			tokensIn: 10,
-			tokensOut: 20,
-			totalCost: 0.001,
-			workspace: "/test/workspace",
-			parentTaskId: "parent-1",
-			rootTaskId: "root-1",
-			status: "active",
-		}
-		const parentHistory: HistoryItem = {
-			id: "parent-1",
-			number: 1,
-			task: "parent task",
-			ts: Date.now(),
-			tokensIn: 10,
-			tokensOut: 20,
-			totalCost: 0.001,
-			workspace: "/test/workspace",
-			status: "delegated",
-			awaitingChildId: "child-1",
-			delegatedToId: "child-1",
-		}
+	const applied = (result: ExecutionCommandResult) => {
+		expect(result.kind).toBe("applied")
+		if (result.kind !== "applied") throw new Error(result.reason)
+		return result
+	}
 
+	async function claimedChild() {
+		const store = provider.taskHistoryStore
+		const history = (id: string): HistoryItem => ({
+			id,
+			number: 1,
+			ts: 1,
+			task: id,
+			tokensIn: 0,
+			tokensOut: 0,
+			totalCost: 0,
+		})
+		const parent = applied(await store.claimNewTask(history("parent-1"), store.ownerForRuntime("parent")))
+		const intent = {
+			kind: "create_subtask" as const,
+			actionId: "create",
+			approvalText: "{}",
+			message: "Child",
+			mode: "code",
+			todos: [],
+		}
+		const pending = await store.lifecycleCommand(
+			"parent-1",
+			(item) => ({ ...item, pendingAction: intent }),
+			[],
+			false,
+			parent.token,
+		)
+		const receipt: DelegationAction = {
+			actionId: intent.actionId,
+			intent,
+			operationId: "operation",
+			childId: "child-1",
+			ownerToken: parent.token.owner.runtimeId,
+			executionToken: parent.token,
+			generation: parent.token.generation,
+			revision: pending.lifecycleRevision!,
+			phase: "prepared",
+			attempts: 1,
+			resultTs: 2,
+		}
+		await store.lifecycleCommand("parent-1", (item) => reserveDelegation(item, receipt), [], false, parent.token)
+		const child = applied(
+			await store.claimDelegationChild(
+				{
+					...history("child-1"),
+					parentTaskId: "parent-1",
+					rootTaskId: "parent-1",
+					delegationOrigin: { parentId: "parent-1", operationId: receipt.operationId },
+				},
+				store.ownerForRuntime("child"),
+				parent.token,
+				receipt,
+			),
+		)
+		await store.lifecycleCommand(
+			"parent-1",
+			(item) => commitDelegation(item, receipt),
+			["child-1"],
+			false,
+			parent.token,
+		)
 		Object.assign(mockTask1, {
 			taskId: "child-1",
-			instanceId: "instance-child",
-			rootTask: mockRootTask,
-			parentTask: mockParentTask,
+			instanceId: child.token.owner.runtimeId,
 			parentTaskId: "parent-1",
-			cancelCurrentRequest: vi.fn(),
-			abortTask: vi.fn().mockResolvedValue(undefined),
-			abandoned: false,
-			isStreaming: false,
-			didFinishAbortingStream: true,
-			isWaitingForFirstChunk: false,
+			executionToken: child.token,
+			apiConversationHistory: [],
+			clineMessages: [],
+			getPendingTaskAction: vi.fn<Task["getPendingTaskAction"]>(),
 		})
 		seedRegistry(provider, mockTask1)
-		provider.getTaskWithId = vi.fn().mockImplementation((id) => {
-			if (id === "child-1") {
-				return Promise.resolve({ historyItem: childHistory })
-			}
-			if (id === "parent-1") {
-				return Promise.resolve({ historyItem: parentHistory })
-			}
-			throw new Error(`unexpected task lookup: ${id}`)
-		}) as unknown as ClineProvider["getTaskWithId"]
+		const task = provider.getCurrentTask()!
+		provider["rememberExecution"](child.token, task)
+		return { store, task, child, parent: await store.readAuthoritative("parent-1") }
+	}
 
-		const updateTaskHistorySpy = vi.spyOn(provider, "updateTaskHistory").mockResolvedValue([])
-		const createTaskWithHistoryItemSpy = vi
-			.spyOn(provider, "createTaskWithHistoryItem")
-			.mockResolvedValue(undefined as unknown as CreatedHistoryTask)
-
+	it("marks a cancelled delegated child interrupted, preserves lineage and opens only a recovery observer", async () => {
+		const { store, task, child, parent } = await claimedChild()
+		const create = vi.spyOn(provider, "createTaskWithHistoryItem")
 		await provider.cancelTask()
-
-		// Child is marked interrupted, not detached
-		expect(updateTaskHistorySpy).toHaveBeenCalledWith(
-			expect.objectContaining({
-				id: "child-1",
-				status: "interrupted",
-			}),
-		)
-		// Parent is NOT transitioned to active — it stays delegated
-		expect(updateTaskHistorySpy).not.toHaveBeenCalledWith(expect.objectContaining({ id: "parent-1" }))
-		// Rehydrated child keeps its parent link so it can resume and report back
-		expect(createTaskWithHistoryItemSpy).toHaveBeenCalledWith(
-			expect.objectContaining({
-				id: "child-1",
-				parentTaskId: "parent-1",
-				rootTaskId: "root-1",
-			}),
-		)
+		const stopped = await store.readAuthoritative("child-1")
+		expect(stopped).toMatchObject({
+			status: "interrupted",
+			parentTaskId: "parent-1",
+			rootTaskId: "parent-1",
+			delegationOrigin: child.history.delegationOrigin,
+		})
+		expect(executionClaim(stopped)).toMatchObject({ phase: "settled", cleanupPending: false })
+		expect(await store.readAuthoritative("parent-1")).toEqual(parent)
+		expect(create).toHaveBeenCalledWith(stopped, { recoveryOnly: true, isCurrent: expect.any(Function) })
+		expect(task.executionToken).toEqual(child.token)
+		expect(provider.getCurrentTask()).toBe(mockTask2)
+		expect(mockTask2.executionToken).toBeUndefined()
+		expect(mockTask2.executionBlocked).toBe(true)
+		expect(mockTask2.hydrateForRecovery).toHaveBeenCalledOnce()
+		expect(mockTask2.run).not.toHaveBeenCalled()
+		expect(provider["recoveryPrompt"]?.presentation.choices).toEqual(["resume_linked"])
+		expect(await store.guardExecution(child.token)).toMatchObject({ kind: "refused", reason: "stale_generation" })
 	})
 
-	it("detaches runtime parent links when delegated parent detach fails", async () => {
-		const mockRootTask = { taskId: "root-1" }
-		const mockParentTask = { taskId: "parent-1" }
-		const childHistory: HistoryItem = {
-			id: "child-1",
-			number: 2,
-			task: "child task",
-			ts: Date.now(),
-			tokensIn: 10,
-			tokensOut: 20,
-			totalCost: 0.001,
-			workspace: "/test/workspace",
-			parentTaskId: "parent-1",
-			rootTaskId: "root-1",
-		}
-
-		Object.assign(mockTask1, {
-			taskId: "child-1",
-			instanceId: "instance-child",
-			rootTask: mockRootTask,
-			parentTask: mockParentTask,
-			parentTaskId: "parent-1",
-			cancelCurrentRequest: vi.fn(),
-			abortTask: vi.fn().mockResolvedValue(undefined),
-			abandoned: false,
-			isStreaming: false,
-			didFinishAbortingStream: true,
-			isWaitingForFirstChunk: false,
-		})
-		seedRegistry(provider, mockTask1)
-		provider.getTaskWithId = vi.fn().mockImplementation((id) => {
-			if (id === "child-1") {
-				return Promise.resolve({ historyItem: childHistory })
-			}
-			if (id === "parent-1") {
-				return Promise.reject(new Error("parent lookup failed"))
-			}
-			throw new Error(`unexpected task lookup: ${id}`)
-		}) as unknown as ClineProvider["getTaskWithId"]
-
-		const updateTaskHistorySpy = vi.spyOn(provider, "updateTaskHistory").mockResolvedValue([])
-		const createTaskWithHistoryItemSpy = vi
-			.spyOn(provider, "createTaskWithHistoryItem")
-			.mockResolvedValue(undefined as unknown as CreatedHistoryTask)
-
+	it("retains lineage and cleanup authority when cancellation snapshot persistence fails", async () => {
+		const { store, task, child, parent } = await claimedChild()
+		vi.spyOn(store, "saveExecutionSnapshot").mockRejectedValue(new Error("snapshot persist failed"))
+		const settle = vi.spyOn(store, "settleTaskExecution")
 		await provider.cancelTask()
-
 		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
-			expect.stringContaining("[cancelTask] Failed to mark child interrupted for child-1: parent lookup failed"),
+			expect.stringContaining("Fence/snapshot failed for child-1"),
 		)
-		expect(updateTaskHistorySpy).toHaveBeenCalledWith(
-			expect.objectContaining({
-				id: "child-1",
-				parentTaskId: undefined,
-				rootTaskId: undefined,
-			}),
-		)
-		expect(createTaskWithHistoryItemSpy).toHaveBeenCalledWith(
-			expect.objectContaining({
-				id: "child-1",
-				parentTaskId: undefined,
-				rootTaskId: undefined,
-				parentTask: undefined,
-				rootTask: undefined,
-			}),
-		)
-		expect(provider["cancelledDelegationChildIds"].has("child-1")).toBe(true)
+		expect(await store.readAuthoritative("child-1")).toMatchObject({
+			status: "interrupted",
+			parentTaskId: "parent-1",
+			rootTaskId: "parent-1",
+		})
+		expect(await store.readAuthoritative("parent-1")).toEqual(parent)
+		expect(executionClaim(await store.readAuthoritative("child-1"))).toMatchObject({
+			phase: "suspended",
+			cleanupPending: true,
+		})
+		expect(task.executionBlocked).toBe(true)
+		expect(settle).not.toHaveBeenCalled()
+		expect(mockTask2.executionToken).toBeUndefined()
+		expect(mockTask2.run).not.toHaveBeenCalled()
+		expect(provider["recoveryPrompt"]?.presentation).toMatchObject({ choices: [], reason: "cleanup_pending" })
+		expect(await store.guardExecution(child.token)).toMatchObject({ kind: "refused", reason: "stale_generation" })
 	})
 
-	it("does not rehydrate a cancelled child when standalone persistence also fails", async () => {
-		const childHistory: HistoryItem = {
-			id: "child-1",
-			number: 2,
-			task: "child task",
-			ts: Date.now(),
-			tokensIn: 10,
-			tokensOut: 20,
-			totalCost: 0.001,
-			workspace: "/test/workspace",
-			parentTaskId: "parent-1",
-			rootTaskId: "root-1",
-		}
-
-		Object.assign(mockTask1, {
-			taskId: "child-1",
-			instanceId: "instance-child",
-			parentTaskId: "parent-1",
-			cancelCurrentRequest: vi.fn(),
-			abortTask: vi.fn().mockResolvedValue(undefined),
-			abandoned: false,
-			isStreaming: false,
-			didFinishAbortingStream: true,
-			isWaitingForFirstChunk: false,
-		})
-		seedRegistry(provider, mockTask1)
-		provider.getTaskWithId = vi.fn().mockImplementation((id) => {
-			if (id === "child-1") {
-				return Promise.resolve({ historyItem: childHistory })
-			}
-			if (id === "parent-1") {
-				return Promise.reject(new Error("parent lookup failed"))
-			}
-			throw new Error(`unexpected task lookup: ${id}`)
-		}) as unknown as ClineProvider["getTaskWithId"]
-
-		vi.spyOn(provider, "updateTaskHistory").mockRejectedValue(new Error("standalone persist failed"))
-		const createTaskWithHistoryItemSpy = vi
-			.spyOn(provider, "createTaskWithHistoryItem")
-			.mockResolvedValue(undefined as unknown as CreatedHistoryTask)
-
-		await expect(provider.cancelTask()).rejects.toThrow("standalone persist failed")
-		expect(createTaskWithHistoryItemSpy).not.toHaveBeenCalled()
-		expect(provider["cancelledDelegationChildIds"].has("child-1")).toBe(true)
+	it("does not rehydrate or detach a cancelled child when authoritative persistence is unavailable", async () => {
+		const { store, task, child, parent } = await claimedChild()
+		const read = vi
+			.spyOn(store, "readAuthoritative")
+			.mockRejectedValue(new Error("authoritative history unavailable"))
+		const create = vi.spyOn(provider, "createTaskWithHistoryItem")
+		await expect(provider.cancelTask()).rejects.toThrow("authoritative history unavailable")
+		expect(create).not.toHaveBeenCalled()
+		expect(task.executionBlocked).toBe(true)
+		expect(task.abortTask).toHaveBeenCalledWith(true)
+		expect(provider.getCurrentTask()).toBe(task)
+		expect(provider["ownedExecutions"].get("child-1")?.snapshotFailed).toBe(true)
+		read.mockRestore()
+		expect(await store.readAuthoritative("child-1")).toEqual(child.history)
+		expect(await store.readAuthoritative("parent-1")).toEqual(parent)
 	})
 
-	it("marks a cancelled delegated child as 'interrupted' and keeps parent delegated", async () => {
-		const childHistory: HistoryItem = {
-			id: "child-1",
-			number: 2,
-			task: "child task",
-			ts: Date.now(),
-			tokensIn: 10,
-			tokensOut: 20,
-			totalCost: 0.001,
-			workspace: "/test/workspace",
-			parentTaskId: "parent-1",
-			rootTaskId: "root-1",
-			status: "active",
-		}
-		const parentHistory: HistoryItem = {
-			id: "parent-1",
-			number: 1,
-			task: "parent task",
-			ts: Date.now(),
-			tokensIn: 10,
-			tokensOut: 20,
-			totalCost: 0.001,
-			workspace: "/test/workspace",
-			status: "delegated",
-			awaitingChildId: "child-1",
-			delegatedToId: "child-1",
-		}
-
-		Object.assign(mockTask1, {
-			taskId: "child-1",
-			instanceId: "instance-child",
-			rootTask: { taskId: "root-1" },
-			parentTask: { taskId: "parent-1" },
-			parentTaskId: "parent-1",
-			cancelCurrentRequest: vi.fn(),
-			abortTask: vi.fn().mockResolvedValue(undefined),
-			abandoned: false,
-			isStreaming: false,
-			didFinishAbortingStream: true,
-			isWaitingForFirstChunk: false,
-		})
-		seedRegistry(provider, mockTask1)
-		provider.getTaskWithId = vi.fn().mockImplementation((id) => {
-			if (id === "child-1") return Promise.resolve({ historyItem: childHistory })
-			if (id === "parent-1") return Promise.resolve({ historyItem: parentHistory })
-			throw new Error(`unexpected task lookup: ${id}`)
-		}) as unknown as ClineProvider["getTaskWithId"]
-
-		const updateTaskHistorySpy = vi.spyOn(provider, "updateTaskHistory").mockResolvedValue([])
-		const createTaskWithHistoryItemSpy = vi
-			.spyOn(provider, "createTaskWithHistoryItem")
-			.mockResolvedValue(undefined as unknown as CreatedHistoryTask)
-
+	it("fences cancellation before unfinished cleanup without severing parent ownership", async () => {
+		const { store, task, child, parent } = await claimedChild()
+		vi.mocked(task.awaitExecutionCleanup).mockResolvedValue(false)
+		const settle = vi.spyOn(store, "settleTaskExecution")
 		await provider.cancelTask()
-
-		// Child should be marked interrupted, not have its parent link severed
-		expect(updateTaskHistorySpy).toHaveBeenCalledWith(
-			expect.objectContaining({
-				id: "child-1",
-				status: "interrupted",
-			}),
-		)
-
-		// Parent should remain delegated with awaitingChildId intact
-		expect(updateTaskHistorySpy).not.toHaveBeenCalledWith(expect.objectContaining({ id: "parent-1" }))
-
-		// Rehydrated child retains parent link
-		expect(createTaskWithHistoryItemSpy).toHaveBeenCalledWith(
-			expect.objectContaining({
-				id: "child-1",
-				parentTaskId: "parent-1",
-				rootTaskId: "root-1",
-			}),
-		)
+		expect(await store.readAuthoritative("child-1")).toMatchObject({
+			status: "interrupted",
+			parentTaskId: "parent-1",
+			rootTaskId: "parent-1",
+		})
+		expect(await store.readAuthoritative("parent-1")).toEqual(parent)
+		expect(executionClaim(await store.readAuthoritative("child-1")).cleanupPending).toBe(true)
+		expect(settle).not.toHaveBeenCalled()
+		expect(provider["recoveryPrompt"]?.presentation).toMatchObject({ choices: [], reason: "cleanup_pending" })
+		expect(await store.guardExecution(child.token)).toMatchObject({ kind: "refused", reason: "stale_generation" })
+		expect(mockTask2.executionToken).toBeUndefined()
+		expect(mockTask2.run).not.toHaveBeenCalled()
 	})
 
 	it("removeClineFromStack never mutates delegation metadata (pure lifecycle after refactor)", async () => {
 		// After the refactor, removeClineFromStack() is pure lifecycle: pop, abort, clean up.
-		// Delegation state is owned by reopenParentFromDelegation() and markDelegatedChildInterrupted().
+		// Delegation state is owned by authoritative completion and stop commands.
 		const childTask = {
 			taskId: "child-1",
 			instanceId: "inst-child",

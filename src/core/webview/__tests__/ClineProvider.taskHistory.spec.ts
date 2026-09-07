@@ -1,12 +1,15 @@
 // pnpm --filter roo-cline test core/webview/__tests__/ClineProvider.taskHistory.spec.ts
 
 import * as vscode from "vscode"
-import type { HistoryItem, ExtensionMessage } from "@roo-code/types"
+import { EventEmitter } from "events"
+import type { HistoryItem, ExtensionMessage, TaskEvents, ExecutionToken } from "@roo-code/types"
 import { RooCodeEventName } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 
 import { ContextProxy } from "../../config/ContextProxy"
 import { ClineProvider } from "../ClineProvider"
+import { claimWebviewHistory, installWebviewHistoryFiles } from "../../../__tests__/helpers/webview-fixtures"
+import { Task } from "../../task/Task"
 
 // Mock setup
 vi.mock("p-wait-for", () => ({
@@ -15,6 +18,7 @@ vi.mock("p-wait-for", () => ({
 }))
 
 vi.mock("fs/promises", () => ({
+	realpath: vi.fn(async (value: string) => value),
 	mkdir: vi.fn().mockResolvedValue(undefined),
 	writeFile: vi.fn().mockResolvedValue(undefined),
 	readFile: vi.fn().mockResolvedValue(""),
@@ -54,8 +58,11 @@ vi.mock("../../../utils/storage", () => ({
 }))
 
 vi.mock("../../../utils/safeWriteJson", () => ({
+	LOCK_STALE_MS: 31_000,
 	safeWriteJson: vi.fn().mockResolvedValue(undefined),
 }))
+
+vi.mock("proper-lockfile", () => ({ lock: vi.fn(async () => async () => {}) }))
 
 vi.mock("@modelcontextprotocol/sdk/types.js", () => ({
 	CallToolResultSchema: {},
@@ -261,6 +268,7 @@ describe("ClineProvider Task History Synchronization", () => {
 
 	beforeEach(async () => {
 		vi.clearAllMocks()
+		installWebviewHistoryFiles()
 
 		if (!TelemetryService.hasInstance()) {
 			TelemetryService.createInstance([])
@@ -735,22 +743,13 @@ describe("ClineProvider Task History Synchronization", () => {
 			// Temporarily make the store's safeWriteJson throw
 			const { safeWriteJson } = await import("../../../utils/safeWriteJson")
 			const mockSafeWriteJson = vi.mocked(safeWriteJson)
-			let callCount = 0
-			mockSafeWriteJson.mockImplementation(async () => {
-				callCount++
-				if (callCount === 1) {
-					throw new Error("simulated write failure")
-				}
-			})
+			mockSafeWriteJson.mockRejectedValueOnce(new Error("simulated write failure"))
 
 			// First call should fail (store write failure)
 			const item1 = createHistoryItem({ id: "fail-item", task: "Fail" })
 			await expect(provider.updateTaskHistory(item1, { broadcast: false })).rejects.toThrow(
 				"simulated write failure",
 			)
-
-			// Restore mock
-			mockSafeWriteJson.mockResolvedValue(undefined)
 
 			// Second call should still succeed (store lock not stuck)
 			const item2 = createHistoryItem({ id: "ok-item", task: "OK" })
@@ -783,32 +782,70 @@ describe("ClineProvider Task History Synchronization", () => {
 	})
 
 	describe("taskCreationCallback — onTaskCompleted listener", () => {
-		function makeFakeTask(taskId: string) {
-			const listeners: Record<string, ((...args: unknown[]) => unknown)[]> = {}
-			return {
+		function makeFakeTask(taskId: string, token?: ExecutionToken) {
+			const events = new EventEmitter<TaskEvents>()
+			const usage = { totalTokensIn: 0, totalTokensOut: 0, totalCost: 0, contextTokens: 0 }
+			// Real typed event delivery, with only the provider-facing Task surface and no model loop.
+			const task = Object.assign(Object.create(Task.prototype) as Task, {
 				taskId,
-				on: (event: string, fn: (...args: unknown[]) => unknown) => {
-					listeners[event] = listeners[event] ?? []
-					listeners[event].push(fn)
-				},
-				// Returns a promise that resolves when all async listeners have settled.
-				emit: async (event: string, ...args: unknown[]) => {
-					await Promise.all((listeners[event] ?? []).map((fn) => Promise.resolve(fn(...args))))
-				},
+				instanceId: token?.owner.runtimeId ?? "observer",
+				executionToken: token && Object.freeze({ ...token, owner: Object.freeze({ ...token.owner }) }),
+				clineMessages: [{ ts: 1, type: "say", say: "completion_result", text: "Done" }],
+				apiConversationHistory: [],
+				toolUsage: {},
+				getTokenUsage: vi.fn<Task["getTokenUsage"]>().mockReturnValue(usage),
+				abortTask: vi.fn<Task["abortTask"]>().mockResolvedValue(undefined),
+				dispose: vi.fn<Task["dispose"]>().mockResolvedValue(undefined),
+				awaitExecutionCleanup: vi.fn<Task["awaitExecutionCleanup"]>().mockResolvedValue(true),
+			} satisfies Partial<Task>)
+			task.on = (event, listener) => {
+				events.on(event, listener)
+				return task
+			}
+			task.off = (event, listener) => {
+				events.off(event, listener)
+				return task
+			}
+			task.emit = events.emit.bind(events)
+			task.guardExecution = vi.fn<Task["guardExecution"]>().mockImplementation(async () => {
+				if (!token || task.executionBlocked) return false
+				return (await provider.taskHistoryStore.guardExecution(token)).kind === "allowed"
+			})
+			if (token) provider["rememberExecution"](token, task)
+			provider["taskRegistry"].push(task)
+			provider["taskCreationCallback"](task)
+			return {
+				task,
+				// Await async event callbacks without pretending EventEmitter.emit awaits them.
+				complete: () =>
+					Promise.all(
+						events.listeners(RooCodeEventName.TaskCompleted).map((listener) => listener(taskId, usage, {})),
+					),
 			}
 		}
 
-		it("writes completed status when task is not already completed", async () => {
+		it("durably completes the owned task before publishing completion", async () => {
 			const existing = createHistoryItem({ id: "task-cb-1", task: "T" })
-			await provider.updateTaskHistory(existing, { broadcast: false })
-
-			const fakeTask = makeFakeTask("task-cb-1")
-			;(provider as any).taskCreationCallback(fakeTask)
-
-			await fakeTask.emit(RooCodeEventName.TaskCompleted, "task-cb-1", {}, {})
-
-			const stored = provider.taskHistoryStore.get("task-cb-1")
-			expect(stored?.status).toBe("completed")
+			const { executionToken } = await claimWebviewHistory(provider, existing)
+			const fake = makeFakeTask(existing.id, executionToken)
+			const published = vi.fn(() => {
+				expect(provider.taskHistoryStore.get(existing.id)).toMatchObject({
+					status: "completed",
+					completionResultSummary: "Done",
+					execution: { phase: "settled", cleanupPending: false },
+				})
+				expect(fake.task.dispose).toHaveBeenCalledOnce()
+			})
+			provider.on(RooCodeEventName.TaskCompleted, published)
+			await fake.complete()
+			expect(published).toHaveBeenCalledOnce()
+			expect(await provider.taskHistoryStore.readAuthoritative(existing.id)).toMatchObject({
+				status: "completed",
+			})
+			expect(fake.task.executionToken).toEqual(executionToken)
+			expect(provider["ownedExecutions"].get(existing.id)?.token.generation).toBeGreaterThan(
+				executionToken.generation,
+			)
 		})
 
 		it("skips the write when task is already completed", async () => {
@@ -817,10 +854,11 @@ describe("ClineProvider Task History Synchronization", () => {
 
 			const updateSpy = vi.spyOn(provider, "updateTaskHistory")
 
-			const fakeTask = makeFakeTask("task-cb-2")
-			;(provider as any).taskCreationCallback(fakeTask)
-
-			await fakeTask.emit(RooCodeEventName.TaskCompleted, "task-cb-2", {}, {})
+			const fake = makeFakeTask("task-cb-2")
+			const complete = vi.spyOn(provider.taskHistoryStore, "completeStandaloneTask")
+			await fake.complete()
+			expect(complete).not.toHaveBeenCalled()
+			expect(await provider.taskHistoryStore.readAuthoritative(existing.id)).toEqual(existing)
 
 			// updateTaskHistory is called initially to store the item, but should NOT be
 			// called again by onTaskCompleted since it's already completed.
@@ -832,19 +870,31 @@ describe("ClineProvider Task History Synchronization", () => {
 			expect(onTaskCompletedCalls.length).toBe(0)
 		})
 
-		it("logs and does not throw when updateTaskHistory rejects", async () => {
+		it("propagates durable completion failure without publishing success", async () => {
 			const existing = createHistoryItem({ id: "task-cb-3", task: "T" })
+			const { executionToken } = await claimWebviewHistory(provider, existing)
+			const fake = makeFakeTask(existing.id, executionToken)
+			const published = vi.fn()
+			provider.on(RooCodeEventName.TaskCompleted, published)
+			const { safeWriteJson } = await import("../../../utils/safeWriteJson")
+			vi.mocked(safeWriteJson).mockRejectedValueOnce(new Error("disk full"))
+			await expect(fake.complete()).rejects.toMatchObject({
+				certainty: "not_committed",
+				cause: { message: "disk full" },
+			})
+			expect(published).not.toHaveBeenCalled()
+			expect(await provider.taskHistoryStore.readAuthoritative(existing.id)).toMatchObject({ status: "active" })
+			expect(fake.task.dispose).not.toHaveBeenCalled()
+		})
+
+		it("does not turn ownerless history into completed execution from an event", async () => {
+			const existing = createHistoryItem({ id: "ownerless", task: "T", status: "active" })
 			await provider.updateTaskHistory(existing, { broadcast: false })
-
-			vi.spyOn(provider, "updateTaskHistory").mockRejectedValueOnce(new Error("disk full"))
-			const logSpy = vi.spyOn(provider as any, "log")
-
-			const fakeTask = makeFakeTask("task-cb-3")
-			;(provider as any).taskCreationCallback(fakeTask)
-
-			await fakeTask.emit(RooCodeEventName.TaskCompleted, "task-cb-3", {}, {})
-
-			expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("[onTaskCompleted] Failed to write"))
+			const fake = makeFakeTask(existing.id)
+			const complete = vi.spyOn(provider.taskHistoryStore, "completeStandaloneTask")
+			await fake.complete()
+			expect(complete).not.toHaveBeenCalled()
+			expect(await provider.taskHistoryStore.readAuthoritative(existing.id)).toEqual(existing)
 		})
 	})
 })

@@ -456,7 +456,11 @@ export async function executeCommandInTerminal(
 		}
 	}
 
+	await task.requireExecution()
 	const terminal = await TerminalRegistry.getOrCreateTerminal(workingDir, task.taskId, terminalProvider)
+	// Approval does not survive cancellation while terminal preparation awaits.
+	// Fence before runCommand: aborting its returned process cannot undo a launch.
+	await task.requireExecution()
 
 	if (terminal instanceof Terminal) {
 		terminal.terminal.show(true)

@@ -1,6 +1,7 @@
 import * as vscode from "vscode"
+import crypto from "crypto"
 
-import { RooCodeEventName, type HistoryItem, type PendingTaskAction } from "@roo-code/types"
+import { type PendingTaskAction } from "@roo-code/types"
 
 import { Task } from "../task/Task"
 import { formatResponse } from "../prompts/responses"
@@ -10,6 +11,7 @@ import { t } from "../../i18n"
 
 import { BaseTool, ToolCallbacks } from "./BaseTool"
 import { sanitizeToolUseId } from "../../utils/tool-id"
+import { ExecutionAuthorityError } from "../task-persistence/taskLifecycle"
 
 interface AttemptCompletionParams {
 	result: string
@@ -21,26 +23,11 @@ export interface AttemptCompletionCallbacks extends ToolCallbacks {
 	toolDescription: () => string
 }
 
-/**
- * Interface for provider methods needed by AttemptCompletionTool for delegation handling.
- */
-interface DelegationProvider {
-	log(message: string): void
-	getTaskWithId(id: string): Promise<{ historyItem: HistoryItem }>
-	setPendingTaskAction(taskId: string, pendingAction: PendingTaskAction): Promise<void>
-	clearPendingTaskAction(taskId: string, actionId: string): Promise<boolean>
-	reopenParentFromDelegation(params: {
-		parentTaskId: string
-		childTaskId: string
-		completionResultSummary: string
-		pendingActionId?: string
-	}): Promise<boolean>
-}
-
 export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 	readonly name = "attempt_completion" as const
 
 	async execute(params: AttemptCompletionParams, task: Task, callbacks: AttemptCompletionCallbacks): Promise<void> {
+		if (!(await task.guardExecution())) return
 		const { result } = params
 		const { handleError, pushToolResult, askFinishSubTaskApproval, toolCallId } = callbacks
 
@@ -83,131 +70,62 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 			task.consecutiveMistakeCount = 0
 
 			await task.say("completion_result", result, undefined, false)
+			if (!(await task.guardExecution())) return
+			const provider = task.providerRef.deref()
+			if (!provider) {
+				task.executionBlocked = true
+				return
+			}
 
-			// Whether this attempt_completion call is a stale replay of an already-completed
-			// subtask (user revisiting it from history) rather than a live model-initiated
-			// completion. Determined below, before telemetry is flushed, so a replay -- which
-			// runs this handler again on a fresh Task instance with a zero telemetry baseline
-			// -- doesn't produce a duplicate "attempt_completion" installment for work that
-			// was already reported when the subtask first completed.
-			let isStaleHistoryReplay = false
-			// Whether the delegation branch below already flushed telemetry (it needs to
-			// flush before delegateToParent, which may return early) -- prevents the shared
-			// fallthrough flush from double-reporting when delegation falls through to
-			// "continue" instead of returning.
-			let hasFlushedTelemetry = false
-
-			// Check for subtask using parentTaskId (metadata-driven delegation)
+			// History navigation has no token. A live linked task must use the exact
+			// pre-approval receipt; failed routing cannot become standalone completion.
 			if (task.parentTaskId) {
-				// Check if this subtask has already completed and returned to parent
-				// to prevent duplicate tool_results when user revisits from history
-				const provider = task.providerRef.deref() as DelegationProvider | undefined
-				if (provider) {
-					let historyLookupTaskId = task.taskId
-					try {
-						const { historyItem } = await provider.getTaskWithId(task.taskId)
-						const status = historyItem?.status
-
-						if (status === "completed") {
-							// Subtask already completed - skip delegation flow entirely
-							// Fall through to normal completion ask flow below (outside this if block)
-							// This shows the user the completion result and waits for acceptance
-							// without injecting another tool_result to the parent
-							isStaleHistoryReplay = true
-						} else if (status === "active" || status === "interrupted") {
-							historyLookupTaskId = task.parentTaskId
-							const { historyItem: parentHistory } = await provider.getTaskWithId(task.parentTaskId)
-
-							if (
-								(parentHistory?.status === "delegated" || parentHistory?.status === "active") &&
-								parentHistory?.awaitingChildId === task.taskId
-							) {
-								const pendingActionId = toolCallId ? sanitizeToolUseId(toolCallId) : undefined
-								if (pendingActionId) {
-									const pendingAction: PendingTaskAction = {
-										kind: "finish_subtask",
-										actionId: pendingActionId,
-										approvalText: JSON.stringify({ tool: "finishTask" }),
-										parentTaskId: task.parentTaskId,
-										result,
-									}
-									await provider.setPendingTaskAction(task.taskId, pendingAction)
-									task.setPendingTaskAction(pendingAction)
-								}
-								// Known not to be a stale history replay (status was "active", not
-								// "completed"), so flush telemetry before the delegation call, which
-								// may return early below. hasFlushedTelemetry prevents the shared
-								// fallthrough flush further down from double-reporting if delegation
-								// falls through to "continue" instead of returning.
-								task.flushTelemetryInstallment("attempt_completion")
-								hasFlushedTelemetry = true
-
-								const delegation = await this.delegateToParent(
-									task,
-									result,
-									provider,
-									pendingActionId,
-									askFinishSubTaskApproval,
-									pushToolResult,
-								)
-								if (delegation === "delegated") {
-									this.emitPublicTaskCompleted(task)
-								}
-								if (delegation !== "continue") return
-							} else {
-								// Parent already detached, such as when the user cancelled this child.
-								// Fall through to the normal completion ask flow.
-								const msg =
-									`[AttemptCompletionTool] Skipping delegation for child ${task.taskId}: ` +
-									`parent ${task.parentTaskId} is not awaiting this child. ` +
-									`Diagnostic: { childStatus: "${status}", parentStatus: "${parentHistory?.status}", awaitingChildId: "${parentHistory?.awaitingChildId}" }`
-								provider.log(msg)
-								console.warn(msg)
-							}
-						} else {
-							// Unexpected status (undefined or "delegated") - log error and skip delegation
-							// undefined indicates a bug in status persistence during child creation
-							// "delegated" would mean this child has its own grandchild pending (shouldn't reach attempt_completion)
-							provider.log(
-								`[AttemptCompletionTool] Unexpected child task status "${status}" for task ${task.taskId}. ` +
-									`Expected "active", "interrupted", or "completed". Skipping delegation to prevent data corruption.`,
-							)
-							// Fall through to normal completion ask flow
-						}
-					} catch (err) {
-						// If we can't get the history, log error and skip delegation
-						provider.log(
-							`[AttemptCompletionTool] Failed to get history for task ${historyLookupTaskId}: ${(err as Error)?.message ?? String(err)}. ` +
-								`Skipping delegation.`,
-						)
-						// Fall through to normal completion ask flow
-					}
+				const finish: Extract<PendingTaskAction, { kind: "finish_subtask" }> = {
+					kind: "finish_subtask",
+					actionId: toolCallId ? sanitizeToolUseId(toolCallId) : `internal-${crypto.randomUUID()}`,
+					approvalText: JSON.stringify({ tool: "finishTask" }),
+					parentTaskId: task.parentTaskId,
+					result,
 				}
+				await provider.setPendingTaskAction(task.taskId, finish, task)
+				if (!(await task.guardExecution())) return
+				task.setPendingTaskAction(finish)
+				const request = await provider.prepareDelegatedCompletion(task, finish)
+				if (!request) {
+					task.executionBlocked = true
+					return
+				}
+				if (!(await task.guardExecution())) return
+				task.flushTelemetryInstallment("attempt_completion")
+				const approved = await askFinishSubTaskApproval()
+				if (!(await task.guardExecution())) return
+				if (!approved) {
+					pushToolResult(formatResponse.toolDenied())
+					return
+				}
+				await provider.reopenParentFromDelegation({
+					origin: task,
+					request,
+					parentTaskId: task.parentTaskId,
+					childTaskId: task.taskId,
+					completionResultSummary: result,
+					pendingActionId: finish.actionId,
+				})
+				task.executionBlocked = true
+				return
 			}
 
-			// PostHog telemetry: report here, once per model-initiated attempt_completion
-			// call, regardless of whether the user goes on to accept, decline, or give
-			// feedback. Gating this on user acceptance previously meant a task that never
-			// got an explicit "yes" (declined, abandoned mid-review, etc.) reported nothing
-			// at all. This is independent of the public TaskCompleted API event, which still
-			// only fires once the task is genuinely finished. Skipped for a stale history
-			// replay (revisiting an already-completed subtask) since that reruns this handler
-			// on a fresh Task instance and would otherwise double-report work already flushed
-			// when the subtask first completed, and skipped if the delegation branch above
-			// already flushed.
-			if (!isStaleHistoryReplay && !hasFlushedTelemetry) {
-				task.emitFinalTokenUsageUpdate()
-				task.flushTelemetryInstallment("attempt_completion")
-			}
+			task.emitFinalTokenUsageUpdate()
+			task.flushTelemetryInstallment("attempt_completion")
 
 			const { response, text, images, queuedMessageId } = await task.ask("completion_result", "", false)
+			if (!(await task.guardExecution())) return
 
 			if (response === "yesButtonClicked") {
-				// A stale history replay reruns this handler on a fresh Task instance for a
-				// subtask that already completed (and already emitted TaskCompleted) the first
-				// time through -- re-acknowledging it from history must not emit it again.
-				if (!isStaleHistoryReplay) {
-					this.emitPublicTaskCompleted(task)
+				try {
+					await provider.completeTask(task, result)
+				} finally {
+					task.executionBlocked = true
 				}
 				return
 			}
@@ -225,51 +143,17 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 			const feedbackText = `<user_message>\n${text}\n</user_message>`
 			pushToolResult(formatResponse.toolResult(feedbackText, images))
 		} catch (error) {
+			if (error instanceof ExecutionAuthorityError || task.parentTaskId) {
+				task.executionBlocked = true
+				return
+			}
+			if (!(await task.guardExecution())) return
 			await handleError("inspecting site", error as Error)
 		}
 	}
 
-	/**
-	 * Handles the common delegation flow when a subtask completes.
-	 * Returns:
-	 * - "delegated" when completion was approved and parent resumed
-	 * - "denied" when user denied finishing the subtask
-	 * - "continue" when caller should fall through to normal completion ask flow
-	 */
-	private async delegateToParent(
-		task: Task,
-		result: string,
-		provider: DelegationProvider,
-		pendingActionId: string | undefined,
-		askFinishSubTaskApproval: () => Promise<boolean>,
-		pushToolResult: (result: string) => void,
-	): Promise<"delegated" | "denied" | "continue"> {
-		const didApprove = await askFinishSubTaskApproval()
-
-		if (!didApprove) {
-			pushToolResult(formatResponse.toolDenied())
-			return "denied"
-		}
-
-		const didReopen = await provider.reopenParentFromDelegation({
-			parentTaskId: task.parentTaskId!,
-			childTaskId: task.taskId,
-			completionResultSummary: result,
-			...(pendingActionId && { pendingActionId }),
-		})
-
-		if (didReopen === false) {
-			if (pendingActionId) {
-				await provider.clearPendingTaskAction(task.taskId, pendingActionId)
-			}
-			return "continue"
-		}
-
-		pushToolResult("")
-		return "delegated"
-	}
-
 	override async handlePartial(task: Task, block: ToolUse<"attempt_completion">): Promise<void> {
+		if (!(await task.guardExecution())) return
 		const result: string | undefined = block.params.result
 		const command: string | undefined = block.params.command
 
@@ -285,20 +169,6 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 		} else {
 			await task.say("completion_result", result ?? "", undefined, block.partial)
 		}
-	}
-
-	/**
-	 * Emits the public RooCodeEventName.TaskCompleted API event. Only called once the
-	 * task is genuinely finished (user accepted, or a subtask was successfully delegated
-	 * back to its parent) -- unlike the PostHog telemetry flush, which reports on every
-	 * model-initiated attempt_completion call regardless of outcome.
-	 */
-	private emitPublicTaskCompleted(task: Task): void {
-		// Force final token usage update before emitting TaskCompleted.
-		// This ensures the latest stats are captured regardless of throttle timer.
-		task.emitFinalTokenUsageUpdate()
-
-		task.emit(RooCodeEventName.TaskCompleted, task.taskId, task.getTokenUsage(), task.toolUsage)
 	}
 }
 

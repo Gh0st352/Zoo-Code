@@ -8,6 +8,15 @@ import { RooCodeEventName, type RooCodeAPI } from "@roo-code/types"
 
 import { isCompletedAsk, waitFor } from "./utils"
 
+let approveCompletion = true
+/** Manual feedback smoke tests must not race the harness's automatic accept. */
+export function suspendCompletionAutoApproval(): () => void {
+	approveCompletion = false
+	return () => {
+		approveCompletion = true
+	}
+}
+
 export async function run() {
 	const extension = vscode.extensions.getExtension<RooCodeAPI>("ZooCodeOrganization.zoo-code")
 
@@ -35,7 +44,7 @@ export async function run() {
 	// Automatically approve completion_result asks so tests don't stall waiting
 	// for a button that the webview routes to "start new task" rather than "yes".
 	api.on(RooCodeEventName.Message, ({ message }) => {
-		if (isCompletedAsk(message) && message.ask === "completion_result") {
+		if (approveCompletion && isCompletedAsk(message) && message.ask === "completion_result") {
 			void api.approveCurrentAsk().catch((error) => {
 				console.error("Failed to approve completion result", error)
 			})
@@ -75,7 +84,10 @@ export async function run() {
 		testFiles = await glob(`**/${specificFile}`, { cwd })
 		console.log(`Running specific test file: ${specificFile}`)
 	} else {
-		testFiles = await glob("**/**.test.js", { cwd, ignore: "**/suite/restart-persistence.test.js" })
+		testFiles = await glob("**/**.test.js", {
+			cwd,
+			ignore: ["**/suite/restart-persistence.test.js", "**/suite/loop-issue*.test.js"],
+		})
 	}
 
 	if (testFiles.length === 0) {

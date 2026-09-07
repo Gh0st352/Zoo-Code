@@ -498,6 +498,8 @@ export const ExtensionStateContextProvider: React.FC<{
 							return {
 								...merged,
 								currentTaskId: null,
+								currentTaskInstanceId: null,
+								taskRecovery: null,
 								currentTaskItem: undefined,
 								currentTaskTodos: [],
 								messageQueue: [],
@@ -505,7 +507,16 @@ export const ExtensionStateContextProvider: React.FC<{
 								clineMessagesSeq: 0,
 							}
 						}
-						return taskChanged ? { ...merged, clineMessages: [], clineMessagesSeq: 0 } : merged
+						return taskChanged
+							? {
+									...merged,
+									clineMessages: [],
+									clineMessagesSeq: 0,
+									currentTaskInstanceId: newState.currentTaskInstanceId ?? null,
+									taskRecovery:
+										newState.taskRecovery?.taskId === nextTaskId ? newState.taskRecovery : null,
+								}
+							: merged
 					})
 					if (taskCleared) {
 						setCurrentCheckpoint(undefined)
@@ -538,6 +549,13 @@ export const ExtensionStateContextProvider: React.FC<{
 					}
 					if (newState.marketplaceInstalledMetadata !== undefined) {
 						setMarketplaceInstalledMetadata(newState.marketplaceInstalledMetadata)
+					}
+					break
+				}
+				case "taskRecovery": {
+					const prompt = message.taskRecovery
+					if (prompt && prompt.taskId === activeTaskIdRef.current) {
+						setState((previous) => ({ ...previous, taskRecovery: prompt }))
 					}
 					break
 				}

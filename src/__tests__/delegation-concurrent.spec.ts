@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest"
 import type { HistoryItem } from "@roo-code/types"
 
 vi.mock("fs/promises", () => ({
+	realpath: vi.fn(async (value: string) => value),
 	mkdir: vi.fn().mockResolvedValue(undefined),
 	readFile: vi.fn().mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
 	readdir: vi.fn().mockResolvedValue([]),
@@ -20,8 +21,11 @@ vi.mock("fs", () => ({
 }))
 
 vi.mock("../utils/safeWriteJson", () => ({
+	LOCK_STALE_MS: 31_000,
 	safeWriteJson: vi.fn().mockResolvedValue(undefined),
 }))
+
+vi.mock("proper-lockfile", () => ({ lock: vi.fn(async () => async () => {}) }))
 
 vi.mock("../utils/storage", () => ({
 	getStorageBasePath: vi.fn().mockResolvedValue("/tmp/test-storage"),

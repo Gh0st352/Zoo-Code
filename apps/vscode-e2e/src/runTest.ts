@@ -16,6 +16,7 @@ import { addLongRuningSilentCommandFixtures } from "./fixtures/long-running-sile
 import { addColdShellInitFixtures } from "./fixtures/cold-shell-init"
 import { addTerminalProfileResultFixtures } from "./fixtures/terminal-profile"
 import { addListFilesResultFixtures } from "./fixtures/list-files"
+import { addLoopIssueFixtures } from "./fixtures/loop-issue"
 import { addReadFileResultFixtures } from "./fixtures/read-file"
 import { addSearchFilesResultFixtures } from "./fixtures/search-files"
 import { addSubtaskFixtures } from "./fixtures/subtasks"
@@ -23,6 +24,8 @@ import { addUseMcpToolResultFixtures } from "./fixtures/use-mcp-tool"
 import { addWriteToFileResultFixtures } from "./fixtures/write-to-file"
 import { createScenarioWorkspace, removeScenarioWorkspace } from "./restart/scenarioWorkspace"
 import { runRestartScenario } from "./restart/vscodeCoordinator"
+import { runLoopIssueScenario } from "./restart/loopIssueScenario"
+import { buildLoopIssueCandidate } from "./restart/loopIssueBuild"
 
 function getCliFlagValue(flag: string) {
 	return process.argv.find((arg, index) => process.argv[index - 1] === flag)
@@ -61,6 +64,11 @@ async function main() {
 	const isGeminiTest = testFile?.toLowerCase().includes("gemini.test") ?? false
 	const isBedrockTest = isBedrockTargetedRun(testFile, testGrep)
 	const isRestartPersistenceTest = isRestartPersistenceTargetedRun(testFile, testGrep)
+	const isLoopIssueTest = testFile?.includes("loop-issue") ?? false
+	const isLoopIssueRestart = testFile?.includes("loop-issue-restart") ?? false
+	if (isLoopIssueTest && (isRecord || process.env.USE_MOCK !== "true")) {
+		throw new Error("LoopIssue host suites require USE_MOCK=true and AIMOCK_RECORD=false")
+	}
 
 	if (isRecord && isDeepSeekTest && !process.env.DEEPSEEK_API_KEY) {
 		throw new Error("AIMOCK_RECORD=true requires DEEPSEEK_API_KEY to record DeepSeek fixtures")
@@ -99,7 +107,7 @@ async function main() {
 	try {
 		// Create a temporary workspace folder for regular tests. Restart scenarios own
 		// all of their paths under the dedicated scenario root below.
-		if (!isRestartPersistenceTest) {
+		if (!isRestartPersistenceTest && !isLoopIssueTest) {
 			testWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "roo-test-workspace-"))
 		}
 
@@ -137,6 +145,7 @@ async function main() {
 				addColdShellInitFixtures(mock)
 				addTerminalProfileResultFixtures(mock)
 				addListFilesResultFixtures(mock)
+				addLoopIssueFixtures(mock)
 				addReadFileResultFixtures(mock)
 				addSearchFilesResultFixtures(mock)
 				addSubtaskFixtures(mock)
@@ -187,7 +196,43 @@ async function main() {
 		const pkg = JSON.parse(readFileSync(path.resolve(__dirname, "../package.json"), "utf-8"))
 		const vscodeVersion = process.env.VSCODE_VERSION || pkg.devDependencies["@types/vscode"]
 
-		if (isRestartPersistenceTest) {
+		if (isLoopIssueTest) {
+			scenarioWorkspace = await createScenarioWorkspace()
+			// An explicitly extracted VSIX can exercise its unchanged entry/assets in the
+			// same disposable host. Never install into the user's active profile.
+			const packagedExtension = process.env.LOOP_ISSUE_PACKAGED_EXTENSION
+			const candidate = packagedExtension
+				? path.join(scenarioWorkspace.root, "extension")
+				: await buildLoopIssueCandidate(extensionDevelopmentPath, scenarioWorkspace.root)
+			if (packagedExtension) {
+				await fs.cp(path.resolve(packagedExtension), candidate, { recursive: true })
+				console.log(`[LoopIssue artifact] using extracted package bytes from ${packagedExtension}`)
+			}
+			if (isLoopIssueRestart) {
+				await runLoopIssueScenario({
+					version: vscodeVersion,
+					extensionDevelopmentPath: candidate,
+					extensionTestsPath,
+					environment: extensionTestsEnv,
+					workspace: scenarioWorkspace,
+				})
+			} else {
+				await runTests({
+					version: vscodeVersion,
+					extensionDevelopmentPath: candidate,
+					extensionTestsPath,
+					extensionTestsEnv,
+					launchArgs: [
+						scenarioWorkspace.workspace,
+						`--user-data-dir=${scenarioWorkspace.userData}`,
+						`--extensions-dir=${scenarioWorkspace.extensions}`,
+						"--disable-workspace-trust",
+						"--skip-welcome",
+						"--skip-release-notes",
+					],
+				})
+			}
+		} else if (isRestartPersistenceTest) {
 			scenarioWorkspace = await createScenarioWorkspace()
 			const vscodeExecutablePath = await downloadAndUnzipVSCode({
 				version: vscodeVersion,

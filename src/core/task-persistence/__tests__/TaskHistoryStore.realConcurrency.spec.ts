@@ -6,7 +6,7 @@ import type { HistoryItem } from "@roo-code/types"
 
 import { TaskHistoryStore } from "../TaskHistoryStore"
 
-type WriteTaskFile = (item: HistoryItem, delta?: Partial<HistoryItem>) => Promise<HistoryItem>
+type WriteTaskFile = TaskHistoryStore["atomicReadAndUpdate"]
 
 interface WriteBarrier {
 	arrivals(): number
@@ -36,14 +36,14 @@ function synchronizeNextWrites(stores: TaskHistoryStore[], timeoutMs = 2_000): W
 	void barrier.catch(() => {})
 
 	for (const store of stores) {
-		const value: unknown = Reflect.get(store, "writeTaskFile")
-		if (typeof value !== "function") throw new Error("TaskHistoryStore.writeTaskFile is unavailable")
+		const value: unknown = Reflect.get(store, "atomicReadAndUpdate")
+		if (typeof value !== "function") throw new Error("TaskHistoryStore.atomicReadAndUpdate is unavailable")
 		const original = value.bind(store) as WriteTaskFile
-		Reflect.set(store, "writeTaskFile", async (historyItem: HistoryItem, delta?: Partial<HistoryItem>) => {
+		Reflect.set(store, "atomicReadAndUpdate", async (...args: Parameters<WriteTaskFile>) => {
 			arrivals++
 			if (arrivals === stores.length) release()
 			await barrier
-			return original(historyItem, delta)
+			return original(...args)
 		})
 	}
 

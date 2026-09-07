@@ -4,6 +4,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest"
 import { Anthropic } from "@anthropic-ai/sdk"
 import { presentAssistantMessage } from "../presentAssistantMessage"
 import { Task } from "../../task/Task"
+import { withTaskExecution } from "../../../__tests__/helpers/execution-fixtures"
 
 // Mock dependencies
 vi.mock("../../task/Task")
@@ -29,7 +30,8 @@ describe("presentAssistantMessage - Image Handling in Native Tool Calling", () =
 
 	beforeEach(() => {
 		// Create a mock Task with minimal properties needed for testing
-		mockTask = {
+		mockTask = withTaskExecution({
+			assistantMessageSavedToHistory: true,
 			taskId: "test-task-id",
 			instanceId: "test-instance",
 			abort: false,
@@ -59,7 +61,7 @@ describe("presentAssistantMessage - Image Handling in Native Tool Calling", () =
 			},
 			say: vi.fn().mockResolvedValue(undefined),
 			ask: vi.fn().mockResolvedValue({ response: "yesButtonClicked" }),
-		}
+		})
 
 		// Add pushToolResultToUserContent method after mockTask is created so it can reference mockTask
 		mockTask.pushToolResultToUserContent = vi.fn().mockImplementation((toolResult: any) => {

@@ -9,6 +9,7 @@ import type { HistoryItem } from "@roo-code/types"
 import { TaskHistoryStore, assertValidTransition } from "../TaskHistoryStore"
 import { GlobalFileNames } from "../../../shared/globalFileNames"
 import { ClineProvider } from "../../webview/ClineProvider"
+import { createCompletionTask } from "../../../__tests__/helpers/completion-fixtures"
 
 vi.mock("../../../utils/storage", () => ({
 	getStorageBasePath: vi.fn().mockImplementation((defaultPath: string) => {
@@ -18,6 +19,7 @@ vi.mock("../../../utils/storage", () => ({
 
 // Mock safeWriteJson to use plain fs writes in tests (avoids proper-lockfile issues)
 vi.mock("../../../utils/safeWriteJson", () => ({
+	LOCK_STALE_MS: 31_000,
 	safeWriteJson: vi.fn().mockImplementation(async (filePath: string, data: any) => {
 		await fs.mkdir(path.dirname(filePath), { recursive: true })
 		await fs.writeFile(filePath, JSON.stringify(data, null, "\t"), "utf8")
@@ -96,8 +98,25 @@ describe("TaskHistoryStore", () => {
 	describe("pending action persistence", () => {
 		it("persists set and clear operations across store reinitialization", async () => {
 			await store.initialize()
-			await store.upsert(makeHistoryItem({ id: "pending-action-task" }))
-			const provider = { taskHistoryStore: store, recentTasksCache: undefined } as unknown as ClineProvider
+			const claim = await store.claimNewTask(
+				makeHistoryItem({ id: "pending-action-task" }),
+				store.ownerForRuntime("pending-runtime"),
+			)
+			if (claim.kind !== "applied") throw new Error(claim.reason)
+			const token = Object.freeze({ ...claim.token, owner: Object.freeze({ ...claim.token.owner }) })
+			const provider = Object.create(ClineProvider.prototype) as ClineProvider
+			Object.assign(provider, { taskHistoryStore: store })
+			provider["ownedExecutions"] = new Map()
+			provider["delegationEpoch"] = 0
+			const task = createCompletionTask(provider, {
+				taskId: token.taskId,
+				instanceId: token.owner.runtimeId,
+				executionToken: token,
+				executionGeneration: token.generation,
+				guardExecution: async () => (await store.guardExecution(token)).kind === "allowed",
+			})
+			provider.getCurrentTask = () => task
+			provider["rememberExecution"](token, task)
 			const pendingAction = {
 				kind: "finish_subtask" as const,
 				actionId: "finish-action",
@@ -106,23 +125,15 @@ describe("TaskHistoryStore", () => {
 				result: "Done",
 			}
 
-			await ClineProvider.prototype.setPendingTaskAction.call(provider, "pending-action-task", pendingAction)
+			await provider.setPendingTaskAction(task.taskId, pendingAction, task)
 			store.dispose()
-			store = new TaskHistoryStore(tmpDir)
+			// Reload the store, not the live runtime: retain its exact local provider identity.
+			store = new TaskHistoryStore(tmpDir, { providerId: token.owner.providerId })
 			await store.initialize()
 			expect(store.get("pending-action-task")?.pendingAction).toEqual(pendingAction)
 
-			const reloadedProvider = {
-				taskHistoryStore: store,
-				recentTasksCache: undefined,
-			} as unknown as ClineProvider
-			await expect(
-				ClineProvider.prototype.clearPendingTaskAction.call(
-					reloadedProvider,
-					"pending-action-task",
-					"finish-action",
-				),
-			).resolves.toBe(true)
+			Object.assign(provider, { taskHistoryStore: store })
+			await expect(provider.clearPendingTaskAction(task.taskId, "finish-action", task)).resolves.toBe(true)
 			store.dispose()
 			store = new TaskHistoryStore(tmpDir)
 			await store.initialize()

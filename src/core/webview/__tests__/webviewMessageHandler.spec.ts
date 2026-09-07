@@ -310,6 +310,7 @@ vi.mock("../../mentions/resolveImageMentions", () => ({
 }))
 
 import { resolveImageMentions } from "../../mentions/resolveImageMentions"
+import type { Task } from "../../task/Task"
 import { Terminal } from "../../../integrations/terminal/Terminal"
 import { TerminalRegistry } from "../../../integrations/terminal/TerminalRegistry"
 import { providerIdentifiers, retiredProviderIdentifiers } from "@roo-code/types/provider-identifiers"
@@ -395,11 +396,14 @@ describe("webviewMessageHandler - image mentions", () => {
 
 	it("should resolve image mentions for askResponse payloads", async () => {
 		const mockHandleWebviewAskResponse = vi.fn()
-		vi.mocked(mockClineProvider.getCurrentTask).mockReturnValue({
+		const task: Pick<Task, "cwd" | "rooIgnoreController" | "guardExecution" | "handleWebviewAskResponse"> = {
 			cwd: "/mock/workspace",
 			rooIgnoreController: undefined,
+			guardExecution: vi.fn<Task["guardExecution"]>().mockResolvedValue(true),
 			handleWebviewAskResponse: mockHandleWebviewAskResponse,
-		} as any)
+		}
+		// This handler unit needs only the selected Task APIs, not constructor/editor dependencies.
+		vi.mocked(mockClineProvider.getCurrentTask).mockReturnValue(task as Task)
 
 		await webviewMessageHandler(mockClineProvider, {
 			type: "askResponse",

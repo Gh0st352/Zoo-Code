@@ -2,12 +2,15 @@ import * as path from "path"
 import * as fs from "fs/promises"
 
 import { Anthropic } from "@anthropic-ai/sdk"
+import type { DelegationAction, DelegatedCompletionReceipt } from "@roo-code/types"
+import deepEqual from "fast-deep-equal"
 
 import { safeWriteJson } from "../../utils/safeWriteJson"
 import { GlobalFileNames } from "../../shared/globalFileNames"
 import { getTaskDirectoryPath } from "../../utils/storage"
 import { ensureMessageIdentifiers, mergeApiMessageSnapshots } from "./mergeMessageSnapshots"
 import { getErrorCode, readFileWithMissingRetry } from "./readFileWithMissingRetry"
+import { ExecutionAuthorityError } from "./taskLifecycle"
 
 export type ApiMessage = Anthropic.MessageParam & {
 	messageId?: string
@@ -160,4 +163,172 @@ export async function saveApiMessages({
 			: undefined,
 	)
 	return savedMessages
+}
+
+/** Repair the original call, not the latest tool by name. Never replace a result. */
+export function withDelegationFailure(messages: ApiMessage[], receipt: DelegationAction): ApiMessage[] {
+	if (
+		messages.some(
+			(message) =>
+				message.role === "user" &&
+				Array.isArray(message.content) &&
+				message.content.some((block) => block.type === "tool_result" && block.tool_use_id === receipt.actionId),
+		)
+	)
+		return messages
+	const index = messages.findIndex(
+		(message) =>
+			message.role === "assistant" &&
+			Array.isArray(message.content) &&
+			message.content.some(
+				(block) => block.type === "tool_use" && block.id === receipt.actionId && block.name === "new_task",
+			),
+	)
+	// Internal/legacy calls without a native identity receive only a UI receipt.
+	if (index === -1) return messages
+	const result: Anthropic.ToolResultBlockParam = {
+		type: "tool_result",
+		tool_use_id: receipt.actionId,
+		is_error: true,
+		content: receipt.reason ?? "Delegation stopped",
+	}
+	const updated = [...messages]
+	const next = messages[index + 1]
+	if (next?.role === "user") {
+		updated[index + 1] = {
+			...next,
+			content: [
+				result,
+				...(Array.isArray(next.content) ? next.content : [{ type: "text" as const, text: next.content }]),
+			],
+		}
+	} else {
+		updated.splice(index + 1, 0, {
+			role: "user",
+			content: [result],
+			ts: receipt.resultTs,
+			messageId: `delegation:${receipt.operationId}:result`,
+		})
+	}
+	return updated
+}
+
+export async function saveDelegationFailureResult(
+	taskId: string,
+	globalStoragePath: string,
+	receipt: DelegationAction,
+): Promise<void> {
+	const filePath = path.join(
+		await getTaskDirectoryPath(globalStoragePath, taskId),
+		GlobalFileNames.apiConversationHistory,
+	)
+	await safeWriteJson(filePath, [], {
+		merge: (existing) => {
+			if (!Array.isArray(existing))
+				throw new ApiMessagesReadError("invalid", `Cannot repair unreadable history for ${taskId}`)
+			const messages: ApiMessage[] = existing
+			const results = messages.flatMap((message) =>
+				message.role === "user" && Array.isArray(message.content)
+					? message.content.filter(
+							(block) => block.type === "tool_result" && block.tool_use_id === receipt.actionId,
+						)
+					: [],
+			)
+			if (
+				results.length &&
+				(results.length !== 1 ||
+					results[0].type !== "tool_result" ||
+					!results[0].is_error ||
+					results[0].content !== (receipt.reason ?? "Delegation stopped"))
+			)
+				throw new ExecutionAuthorityError("transcript_conflict")
+			return withDelegationFailure(messages, receipt)
+		},
+	})
+}
+
+/** Unlike ordinary history loading, this read never migrates/writes before authority validation. */
+export async function readApiMessagesForCompletion(taskId: string, globalStoragePath: string): Promise<ApiMessage[]> {
+	const directory = await getTaskDirectoryPath(globalStoragePath, taskId)
+	const messages = await readApiMessagesFile(taskId, path.join(directory, GlobalFileNames.apiConversationHistory))
+	if (messages === undefined) throw new ExecutionAuthorityError("history_missing")
+	return messages
+}
+
+/** Exact native identity, exactly one actual new_task use, and immutable durable outcome. */
+export function withDelegationCompletion(messages: ApiMessage[], receipt: DelegatedCompletionReceipt): ApiMessage[] {
+	if (receipt.finish.kind !== "finish_subtask") throw new ExecutionAuthorityError("action_mismatch")
+	const calls = messages.flatMap((message, index) =>
+		message.role === "assistant" && Array.isArray(message.content)
+			? message.content
+					.filter((block) => block.type === "tool_use" && block.id === receipt.creating.actionId)
+					.map((block) => ({ index, block }))
+			: [],
+	)
+	if (calls.length !== 1 || calls[0].block.type !== "tool_use" || calls[0].block.name !== "new_task")
+		throw new ExecutionAuthorityError("receipt_mismatch")
+	const results = messages.flatMap((message) =>
+		message.role === "user" && Array.isArray(message.content)
+			? message.content.filter(
+					(block) => block.type === "tool_result" && block.tool_use_id === receipt.creating.actionId,
+				)
+			: [],
+	)
+	if (results.length) {
+		if (
+			results.length !== 1 ||
+			results[0].type !== "tool_result" ||
+			results[0].is_error ||
+			results[0].content !== receipt.finish.result
+		)
+			throw new ExecutionAuthorityError("transcript_conflict")
+		return messages
+	}
+	const result: Anthropic.ToolResultBlockParam = {
+		type: "tool_result",
+		tool_use_id: receipt.creating.actionId,
+		content: receipt.finish.result,
+	}
+	const index = calls[0].index
+	const updated = [...messages]
+	const next = messages[index + 1]
+	if (next?.role === "user") {
+		updated[index + 1] = {
+			...next,
+			content: [
+				result,
+				...(Array.isArray(next.content) ? next.content : [{ type: "text" as const, text: next.content }]),
+			],
+		}
+	} else {
+		updated.splice(index + 1, 0, {
+			role: "user",
+			content: [result],
+			ts: receipt.resultTs,
+			messageId: `completion:${receipt.operationId}:result`,
+		})
+	}
+	return updated
+}
+
+/** Called only while the store holds the storage lifecycle lock. */
+export async function saveDelegationCompletionResult(
+	taskId: string,
+	globalStoragePath: string,
+	receipt: DelegatedCompletionReceipt,
+): Promise<ApiMessage[]> {
+	const current = await readApiMessagesForCompletion(taskId, globalStoragePath)
+	const updated = withDelegationCompletion(current, receipt)
+	if (updated === current) return current
+	await safeWriteJson(
+		path.join(await getTaskDirectoryPath(globalStoragePath, taskId), GlobalFileNames.apiConversationHistory),
+		updated,
+		{
+			merge: (disk) => {
+				if (!deepEqual(disk, current)) throw new ExecutionAuthorityError("transcript_conflict")
+				return updated
+			},
+		},
+	)
+	return updated
 }

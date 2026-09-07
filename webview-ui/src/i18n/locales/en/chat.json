@@ -107,6 +107,21 @@
 		"title": "Continue",
 		"tooltip": "Resume the current task"
 	},
+	"sendStatus": {
+		"pending": "Waiting for the extension to accept your message…",
+		"unknown": "Message acceptance is not confirmed. Your draft is preserved. Retry checks the same submission without sending it twice.",
+		"refused": "Message not sent. Your draft is preserved. This task may be paused, completed, or no longer current. Use an available recovery action or start a new task."
+	},
+	"recovery": {
+		"paused": "This history is paused or open for inspection. Sending text cannot restart it. Use an available recovery action, or start a new task. Your draft will not be sent automatically.",
+		"completed": "This task is completed and cannot be restarted. Start a new task to send your draft.",
+		"pending": "Checking recovery permission… Your draft is preserved.",
+		"refused": "Recovery was refused or its scope changed. Your draft is preserved. Reopen the history to refresh available actions, or start a new task.",
+		"applied": "Recovery was recorded. Execution still depends on the task's current permissions. Your draft has not been sent.",
+		"resume_linked": "Resume with parent",
+		"resume_independent": "Resume independently",
+		"retain_delegation": "Resume with existing delegation"
+	},
 	"terminate": {
 		"title": "New task",
 		"tooltip": "Start a new task"

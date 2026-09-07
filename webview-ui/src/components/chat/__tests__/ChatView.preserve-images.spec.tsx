@@ -1,7 +1,16 @@
 // npx vitest run src/components/chat/__tests__/ChatView.preserve-images.spec.tsx
 
 import React from "react"
-import { renderWithExtensionState, waitFor, act } from "@/utils/test-utils"
+import type { WebviewMessage } from "@roo-code/types"
+import {
+	renderWithExtensionState,
+	waitFor,
+	act,
+	fireEvent,
+	dispatchExtensionMessage,
+	hydrateExtensionState,
+} from "@/utils/test-utils"
+import { vscode } from "@src/utils/vscode"
 
 import ChatView, { ChatViewProps } from "../ChatView"
 
@@ -391,23 +400,30 @@ describe("ChatView - Preserve Images During Chat Activity", () => {
 		})
 	})
 
-	it("should still clear images when user sends a message", async () => {
-		const { getByTestId } = renderChatView()
+	it("should preserve text and images until the host accepts the submitted message", async () => {
+		const { getByTestId, getByRole, queryByRole } = renderChatView()
+		const taskId = "image-task"
+		const instanceId = "image-runtime"
+		const askTs = Date.now()
+		const draft = "Here is my image"
+		const selectedImages = ["data:image/png;base64,testimage"]
 
 		// Hydrate with an active task that has a followup ask (so sending is enabled)
-		await act(async () => {
-			mockPostMessage({
+		act(() => {
+			hydrateExtensionState({
+				currentTaskId: taskId,
+				currentTaskInstanceId: instanceId,
 				clineMessages: [
 					{
 						type: "say",
 						say: "task",
-						ts: Date.now() - 5000,
+						ts: askTs - 5000,
 						text: "Initial task",
 					},
 					{
 						type: "ask",
 						ask: "followup",
-						ts: Date.now(),
+						ts: askTs,
 						text: "What do you want to do?",
 					},
 				],
@@ -423,7 +439,7 @@ describe("ChatView - Preserve Images During Chat Activity", () => {
 			window.postMessage(
 				{
 					type: "selectedImages",
-					images: ["data:image/png;base64,testimage"],
+					images: selectedImages,
 				},
 				"*",
 			)
@@ -431,31 +447,47 @@ describe("ChatView - Preserve Images During Chat Activity", () => {
 
 		// Verify image is set
 		await waitFor(() => {
-			const textArea = getByTestId("chat-textarea")
-			const images = JSON.parse(textArea.getAttribute("data-selected-images") || "[]")
-			expect(images).toHaveLength(1)
+			expect(getByTestId("chat-textarea")).toHaveAttribute("data-selected-images", JSON.stringify(selectedImages))
 		})
 
 		// Type something and send (Enter key triggers onSend -> handleSendMessage)
-		const input = mockInputRef.current!
-		await act(async () => {
-			// Set input value first
-			input.focus()
-			// Fire change event to set the input value
-			input.value = "Here is my image"
-			input.dispatchEvent(new Event("change", { bubbles: true }))
+		const input = getByRole("textbox")
+		fireEvent.change(input, { target: { value: draft } })
+		expect(input).toHaveValue(draft)
+		vi.mocked(vscode.postMessage).mockClear()
+		fireEvent.keyDown(input, { key: "Enter" })
+
+		const submission = vi
+			.mocked(vscode.postMessage)
+			.mock.calls.map(([message]) => message as WebviewMessage)
+			.findLast((message) => message.type === "submitChatMessage")
+		const chatInput = submission?.chatInput
+		if (!chatInput) throw new Error("No chat input submitted")
+		expect(vscode.postMessage).toHaveBeenCalledTimes(1)
+		expect(chatInput).toEqual({
+			requestId: expect.any(String),
+			kind: "response",
+			scope: { taskId, instanceId },
+			askTs,
+			text: draft,
+			images: selectedImages,
 		})
 
-		await act(async () => {
-			// Press Enter to send
-			input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }))
+		// Publishing the request is not acceptance: both parts of the draft remain visible.
+		expect(getByRole("status")).toHaveTextContent("chat:sendStatus.pending")
+		expect(input).toHaveValue(draft)
+		expect(getByTestId("chat-textarea")).toHaveAttribute("data-selected-images", JSON.stringify(selectedImages))
+
+		act(() => {
+			dispatchExtensionMessage({
+				type: "chatInputResult",
+				chatInputResult: { requestId: chatInput.requestId, kind: "accepted", taskId },
+			})
 		})
 
-		// After sending, images should be cleared
-		await waitFor(() => {
-			const textArea = getByTestId("chat-textarea")
-			const images = JSON.parse(textArea.getAttribute("data-selected-images") || "[]")
-			expect(images).toHaveLength(0)
-		})
+		// Only the matching accepted receipt clears the unchanged text and images.
+		expect(input).toHaveValue("")
+		expect(getByTestId("chat-textarea")).toHaveAttribute("data-selected-images", "[]")
+		expect(queryByRole("status")).not.toBeInTheDocument()
 	})
 })

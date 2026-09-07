@@ -4,6 +4,7 @@ import { webviewMessageHandler } from "../webviewMessageHandler"
 import { saveTaskMessages } from "../../task-persistence"
 import { handleCheckpointRestoreOperation } from "../checkpointRestoreHandler"
 import { MessageManager } from "../../message-manager"
+import type { Task } from "../../task/Task"
 
 // Mock dependencies
 vi.mock("../../task-persistence", async (importOriginal) => ({
@@ -37,6 +38,7 @@ describe("webviewMessageHandler - checkpoint operations", () => {
 		// Setup mock Cline instance
 		mockCline = {
 			taskId: "test-task-123",
+			guardExecution: vi.fn<Task["guardExecution"]>().mockResolvedValue(true),
 			isInitialized: true,
 			clineMessages: [
 				{ ts: 1, type: "user", say: "user", text: "First message" },
@@ -240,9 +242,8 @@ describe("webviewMessageHandler - checkpoint operations", () => {
 		})
 
 		it("does not restore when task identity changes during cancellation", async () => {
-			mockProvider.getCurrentTask.mockReturnValueOnce(mockCline).mockReturnValue({
-				...mockCline,
-				taskId: "different-task-id",
+			mockProvider.cancelTask.mockImplementationOnce(async () => {
+				mockProvider.getCurrentTask.mockReturnValue({ ...mockCline, taskId: "different-task-id" })
 			})
 
 			await webviewMessageHandler(mockProvider, { type: "completionCheckpointRestore" })
@@ -250,7 +251,8 @@ describe("webviewMessageHandler - checkpoint operations", () => {
 			expect(mockProvider.cancelTask).toHaveBeenCalled()
 			expect(mockCline.checkpointRestore).not.toHaveBeenCalled()
 			const vscode = await import("vscode")
-			expect(vscode.window.showErrorMessage).toHaveBeenCalledWith("errors.checkpoint_failed")
+			// A stale operation must not report an error into the newly focused task either.
+			expect(vscode.window.showErrorMessage).not.toHaveBeenCalled()
 		})
 	})
 })

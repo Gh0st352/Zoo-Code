@@ -2,9 +2,57 @@ import { z } from "zod"
 
 import { RooCodeEventName } from "./events.js"
 import type { RooCodeSettings } from "./global-settings.js"
+import { taskRecoveryChoices, type ExecutionRefusalReason, type TaskRecoveryChoice } from "./history.js"
 import type { ClineMessage, QueuedMessage, TokenUsage } from "./message.js"
 import type { ToolUsage, ToolName } from "./tool.js"
 import type { TodoItem } from "./todo.js"
+
+/** Client-safe projection. The provider retains the authoritative recovery scope. */
+export interface TaskRecoveryPrompt {
+	taskId: string
+	promptId: string
+	choices: TaskRecoveryChoice[]
+	reason?: ExecutionRefusalReason
+}
+
+/** A decision identifies a server-held prompt; it never supplies execution authority. */
+export const taskRecoveryDecisionSchema = z
+	.object({
+		taskId: z.string().min(1),
+		promptId: z.string().min(1),
+		choice: z.enum(taskRecoveryChoices),
+		intent: z.literal("explicit_user_resume"),
+	})
+	.strict()
+
+export type TaskRecoveryDecision = z.infer<typeof taskRecoveryDecisionSchema>
+
+export type TaskRecoveryResponse =
+	| { kind: "applied"; taskId: string; promptId: string }
+	| { kind: "refused"; taskId: string; promptId?: string; reason: ExecutionRefusalReason }
+
+/** Routing identity only, never execution authority. */
+const chatInputScopeSchema = z.object({ taskId: z.string().min(1), instanceId: z.string().min(1) }).strict()
+const chatInputContent = {
+	requestId: z.string().min(1).max(128),
+	text: z.string(),
+	images: z.array(z.string()),
+}
+export const chatInputSchema = z.discriminatedUnion("kind", [
+	z.object({ ...chatInputContent, kind: z.literal("new"), scope: z.null() }).strict(),
+	z.object({ ...chatInputContent, kind: z.literal("queue"), scope: chatInputScopeSchema }).strict(),
+	z
+		.object({ ...chatInputContent, kind: z.literal("response"), scope: chatInputScopeSchema, askTs: z.number() })
+		.strict(),
+])
+export type ChatInput = z.infer<typeof chatInputSchema>
+export type ChatInputResult =
+	| { requestId: string; kind: "accepted"; taskId: string }
+	| {
+			requestId: string
+			kind: "refused"
+			reason: "invalid_input" | "stale_scope" | "execution_refused" | "input_failed"
+	  }
 
 /**
  * TaskProviderLike
@@ -23,7 +71,10 @@ export interface TaskProviderLike {
 	): Promise<TaskLike>
 	cancelTask(): Promise<void>
 	clearTask(): Promise<void>
+	/** Opens task history for viewing; does not authorize execution. */
 	resumeTask(taskId: string): void
+	previewTaskRecovery(taskId: string): Promise<TaskRecoveryPrompt>
+	recoverTask(request: TaskRecoveryDecision): Promise<TaskRecoveryResponse>
 
 	// Modes
 	getModes(): Promise<{ slug: string; name: string }[]>

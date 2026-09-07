@@ -1,15 +1,28 @@
-import type { HistoryItem } from "../packages/types/src/history"
+import assert from "node:assert/strict"
+import type { DelegatedCompletionReceipt, DelegatedCompletionRequest, HistoryItem } from "../packages/types/src/history"
 
 import {
 	abandonDelegatedChild,
-	completeDelegatedChild,
-	delegateTaskToChild,
 	interruptDelegatedChild,
+	assertExecutionAllowed,
+	hasExactDelegation,
+	commitDelegatedCompletion,
+	completionState,
+	executionToken,
+	LifecycleTransitionError,
+	prepareDelegatedCompletion,
+	previewTaskRecovery,
+	recoverTaskExecution,
+	settleExecution,
+	validateCompletionPrefix,
+	validateDelegatedCompletion,
 } from "../src/core/task-persistence/taskLifecycle"
+import { completionRequest, delegate, finishChild, ownedTask } from "./check-task-execution-protocol"
 import {
 	computeHistoryDelta,
 	DeltaRejectedError,
 	mergeHistoryDelta,
+	mergeTaskMessageMetadata,
 } from "../src/core/task-persistence/taskStoreConcurrency"
 
 const hosts = ["A", "B"] as const
@@ -31,6 +44,7 @@ interface PreparedWrite {
 	taskId: TaskId
 	incoming: HistoryItem
 	delta: Partial<HistoryItem>
+	expected?: HistoryItem
 }
 
 interface OperationState {
@@ -39,6 +53,8 @@ interface OperationState {
 	writes?: PreparedWrite[]
 	writeIndex: number
 	candidate?: HistoryItem
+	request?: DelegatedCompletionRequest
+	receipt?: DelegatedCompletionReceipt
 }
 
 interface CommitEntry {
@@ -53,9 +69,11 @@ interface ModelState {
 	disk: RecordMap
 	caches: Record<Host, RecordMap>
 	hostMutexes: Partial<Record<Host, OperationId>>
+	storageMutex?: OperationId
 	locks: Partial<Record<TaskId, OperationId>>
 	operations: Partial<Record<OperationId, OperationState>>
 	commits: CommitEntry[]
+	transcripts: Array<{ parentId: string; childId: string; actionId: string; result: string }>
 }
 
 interface OperationSpec {
@@ -64,6 +82,7 @@ interface OperationSpec {
 	externalSnapshot?: boolean
 	allowRefreshAfterRead?: boolean
 	publishCacheAtEnd?: boolean
+	authoritative?: boolean
 	isEnabled?(snapshot: RecordMap): boolean
 	buildWrites(snapshot: RecordMap): HistoryItem[]
 }
@@ -71,7 +90,6 @@ interface OperationSpec {
 interface Scenario {
 	name: string
 	operations: OperationSpec[]
-	targetViolation?: { issue: "#1469" | "#1021"; message: string; expectedActions: string[] }
 	check(state: ModelState): string[]
 }
 
@@ -84,13 +102,19 @@ const MAX_DEPTH = 32
 const MAX_STATES = 100_000
 const commonInvariantNames = [
 	"host mutex ownership",
+	"storage command mutex ownership",
+	"message metadata cannot restore detached lineage (#1021)",
 	"file lock ownership",
 	"disk field preservation",
 	"childIds union",
 	"pair write order",
 	"whole-delta rejection",
+	"old completion cannot clear newer handoff or orphan its live child (#1469)",
+	"completion authority before transcript effect; refused completion has no effects",
+	"durable completion prefix before transcript and child-before-parent commit",
+	"claimed live links require exact ownership or a nonexecuting allocation prefix",
 ] as const
-const expectedPhases = ["read", "prepare", "revalidate", "commit", "refresh", "reject", "fail"] as const
+const expectedPhases = ["read", "prepare", "revalidate", "commit", "refresh", "reject", "fail", "transcript"] as const
 const semanticLandmarks = {
 	"stale-cache-newer-disk": (state: ModelState) =>
 		state.commits.length > 0 &&
@@ -103,16 +127,23 @@ const semanticLandmarks = {
 		(["complete-a", "abandon-b"] as OperationId[]).some((operationId) => {
 			const operation = state.operations[operationId]
 			return (
-				operation?.writeIndex === 1 &&
+				operation?.writeIndex === (operationId === "complete-a" ? 2 : 1) &&
 				(operation.phase === "prepared" || operation.phase === "revalidated") &&
-				state.commits.filter((entry) => entry.operationId === operationId).length === 1
+				state.commits.filter((entry) => entry.operationId === operationId).length === operation.writeIndex
 			)
 		}),
 	"pair-first-commit-second-failed": (state: ModelState) =>
 		state.operations["complete-a"]?.phase === "failed" &&
-		state.commits.filter((entry) => entry.operationId === "complete-a").length === 1 &&
+		state.commits.filter((entry) => entry.operationId === "complete-a").length === 2 &&
 		state.caches.A["child-a"]?.status === "completed" &&
 		state.caches.A.parent?.status === "delegated",
+	"old-causal-schedule-refused-without-transcript": (state: ModelState) =>
+		state.operations["complete-a"]?.phase === "rejected" &&
+		state.operations["complete-a"].snapshot?.parent?.awaitingChildId === "child-a" &&
+		state.operations["redelegate-b"]?.phase === "done" &&
+		state.disk.parent?.awaitingChildId === "child-b" &&
+		state.transcripts.length === 0 &&
+		!state.commits.some((entry) => entry.operationId === "complete-a"),
 } satisfies Record<string, (state: ModelState) => boolean>
 
 function item(id: TaskId, overrides: Partial<HistoryItem> = {}): HistoryItem {
@@ -142,6 +173,11 @@ function baseRecords(): RecordMap {
 	}
 }
 
+function claimedRecords(): RecordMap {
+	const graph = delegate(ownedTask("parent"), "child-a")
+	return { parent: graph.parent, "child-a": finishChild(graph.child) }
+}
+
 function clone<T>(value: T): T {
 	return structuredClone(value)
 }
@@ -156,6 +192,7 @@ function initialState(operationIds: OperationId[], disk = baseRecords()): ModelS
 			operationIds.map((id) => [id, { phase: "idle", writeIndex: 0 } satisfies OperationState]),
 		),
 		commits: [],
+		transcripts: [],
 	}
 }
 
@@ -190,7 +227,7 @@ const operationSpecs: Record<OperationId, OperationSpec> = {
 		id: "complete-a",
 		host: "A",
 		externalSnapshot: true,
-		publishCacheAtEnd: true,
+		authoritative: true,
 		isEnabled: (snapshot) => {
 			const parent = snapshot.parent
 			const child = snapshot["child-a"]
@@ -200,27 +237,40 @@ const operationSpecs: Record<OperationId, OperationSpec> = {
 				(child?.status === "active" || child?.status === "interrupted")
 			)
 		},
-		buildWrites: (snapshot) => {
-			const completed = completeDelegatedChild(
-				getRequired(snapshot, "parent"),
-				getRequired(snapshot, "child-a"),
-				"child-a result",
-			)
-			return [completed.child, completed.parent]
+		// Completion uses its captured immutable request, not a freshly invented approval.
+		buildWrites: () => {
+			throw new Error("Completion must use the authoritative receipt path")
 		},
 	},
 	"redelegate-b": {
 		id: "redelegate-b",
 		host: "B",
+		authoritative: true,
 		isEnabled: (snapshot) =>
 			snapshot.parent?.status === "delegated" &&
 			snapshot.parent.awaitingChildId === "child-a" &&
 			snapshot["child-a"]?.status === "active",
 		buildWrites: (snapshot) => {
 			const parent = getRequired(snapshot, "parent")
-			const interrupted = interruptDelegatedChild(parent, getRequired(snapshot, "child-a"))
-			const delegated = delegateTaskToChild(parent, "child-b", "interrupted")
-			return [interrupted, item("child-b", { parentTaskId: "parent", rootTaskId: "parent" }), delegated]
+			const child = getRequired(snapshot, "child-a")
+			// Composite competitor: cleanup/settlement, explicit retain-delegation recovery,
+			// then reserve/claim/commit. These are reducer endpoints, not a physical transaction.
+			const interrupted = settleExecution(child, executionToken(child), true)
+			const settled = settleExecution(parent, executionToken(parent), true)
+			const preview = previewTaskRecovery(settled, undefined, interrupted)
+			const resumed = recoverTaskExecution(
+				settled,
+				{
+					scope: preview.scope,
+					intent: "explicit_user_resume",
+					choice: "retain_delegation",
+					owner: executionToken(parent).owner,
+				},
+				undefined,
+				interrupted,
+			)
+			const replacement = delegate(resumed, "child-b", undefined, interrupted)
+			return [interrupted, replacement.child, replacement.parent]
 		},
 	},
 	"stale-save-a": {
@@ -258,18 +308,36 @@ const operationSpecs: Record<OperationId, OperationSpec> = {
 }
 
 function prepareWrites(state: ModelState, spec: OperationSpec, operation: OperationState): PreparedWrite[] {
-	return spec.buildWrites(operation.snapshot!).map((built) => {
+	let records: HistoryItem[]
+	if (spec.id === "complete-a") {
+		const parent = getRequired(state.disk, "parent")
+		const child = getRequired(state.disk, "child-a")
+		assert(operation.request)
+		assert.equal(validateDelegatedCompletion(parent, child, operation.request), undefined)
+		const prepared = prepareDelegatedCompletion(parent, child, operation.request)
+		operation.receipt = completionState(prepared).receipts[0]!
+		const completed = commitDelegatedCompletion(prepared, child, operation.receipt)
+		records = [prepared, completed.child, completed.parent]
+	} else records = spec.buildWrites(spec.authoritative ? state.disk : operation.snapshot!)
+	const expected = clone(state.disk)
+	return records.map((built) => {
 		const taskId = built.id as TaskId
-		const cached = state.caches[spec.host][taskId]
-		// Task.saveClineMessages rebuilds lineage from the live Task but preserves the
-		// store's current status before upsert, so stale lineage is not accompanied by
-		// a stale status transition.
-		const incoming = spec.id === "stale-save-a" && cached?.status ? { ...built, status: cached.status } : built
-		return {
+		const cached = spec.authoritative
+			? expected[taskId]
+			: spec.id === "stale-save-a"
+				? state.disk[taskId]
+				: state.caches[spec.host][taskId]
+		// updateMessageMetadata uses fresh disk authority, discarding ALL protected
+		// lifecycle/lineage fields in the captured stale live-task metadata.
+		const incoming = spec.id === "stale-save-a" && cached ? mergeTaskMessageMetadata(cached, built) : built
+		const write = {
 			taskId,
 			incoming,
 			delta: cached ? { id: taskId, ...computeHistoryDelta(cached, incoming) } : { ...incoming },
+			...(spec.authoritative ? { expected: cached } : {}),
 		}
+		expected[taskId] = incoming
+		return write
 	})
 }
 
@@ -286,29 +354,71 @@ function nextSteps(state: ModelState, scenario: Scenario): TraceStep[] {
 		if (
 			operation.phase === "idle" &&
 			!state.hostMutexes[spec.host] &&
+			(spec.externalSnapshot || !state.storageMutex) &&
 			(spec.isEnabled?.(state.caches[spec.host]) ?? true)
 		) {
 			result.push(
 				transition(state, `${spec.id}.read`, (next) => {
 					const target = next.operations[spec.id]!
-					if (!spec.externalSnapshot) next.hostMutexes[spec.host] = spec.id
+					if (!spec.externalSnapshot) {
+						next.hostMutexes[spec.host] = spec.id
+						next.storageMutex = spec.id
+					}
 					target.phase = "read"
 					target.snapshot = clone(next.caches[spec.host])
+					if (spec.id === "complete-a")
+						target.request = completionRequest(
+							getRequired(target.snapshot, "parent"),
+							getRequired(target.snapshot, "child-a"),
+						)
 				}),
 			)
 		} else if (
 			operation.phase === "read" &&
+			(!state.storageMutex || state.storageMutex === spec.id) &&
 			(spec.externalSnapshot ? !state.hostMutexes[spec.host] : state.hostMutexes[spec.host] === spec.id)
 		) {
 			result.push(
 				transition(state, `${spec.id}.prepare`, (next) => {
 					const target = next.operations[spec.id]!
-					if (spec.externalSnapshot) next.hostMutexes[spec.host] = spec.id
-					target.writes = prepareWrites(next, spec, target)
-					target.phase = "prepared"
+					if (spec.externalSnapshot) {
+						next.hostMutexes[spec.host] = spec.id
+						next.storageMutex = spec.id
+					}
+					try {
+						target.writes = prepareWrites(next, spec, target)
+						target.phase = "prepared"
+					} catch (error) {
+						if (!(error instanceof LifecycleTransitionError)) throw error
+						target.phase = "rejected"
+						delete next.hostMutexes[spec.host]
+						delete next.storageMutex
+					}
 				}),
 			)
 		} else if (operation.phase === "prepared") {
+			if (spec.id === "complete-a" && operation.writeIndex === 1 && !state.transcripts.length) {
+				result.push(
+					transition(state, `${spec.id}.transcript`, (next) => {
+						assert.equal(next.storageMutex, spec.id)
+						const receipt = next.operations[spec.id]!.receipt!
+						validateCompletionPrefix(
+							getRequired(next.disk, "parent"),
+							getRequired(next.disk, "child-a"),
+							receipt,
+						)
+						assert.equal(receipt.finish.kind, "finish_subtask")
+						if (receipt.finish.kind !== "finish_subtask") throw new Error("Invalid finish intent")
+						next.transcripts.push({
+							parentId: receipt.parentToken.taskId,
+							childId: receipt.childToken.taskId,
+							actionId: receipt.creating.actionId,
+							result: receipt.finish.result,
+						})
+					}),
+				)
+				continue
+			}
 			const write = operation.writes![operation.writeIndex]!
 			if (!state.locks[write.taskId]) {
 				result.push(
@@ -317,17 +427,26 @@ function nextSteps(state: ModelState, scenario: Scenario): TraceStep[] {
 						const targetWrite = target.writes![target.writeIndex]!
 						next.locks[targetWrite.taskId] = spec.id
 						try {
-							target.candidate = mergeHistoryDelta(
-								next.disk[targetWrite.taskId],
-								targetWrite.incoming,
-								targetWrite.delta,
-							)
+							if (spec.authoritative) {
+								assert.deepEqual(
+									next.disk[targetWrite.taskId],
+									targetWrite.expected,
+									"Lifecycle CAS changed under storage lock",
+								)
+								target.candidate = targetWrite.incoming
+							} else
+								target.candidate = mergeHistoryDelta(
+									next.disk[targetWrite.taskId],
+									targetWrite.incoming,
+									targetWrite.delta,
+								)
 							target.phase = "revalidated"
 						} catch (error) {
 							if (!(error instanceof DeltaRejectedError)) throw error
 							target.phase = "rejected"
 							delete next.locks[targetWrite.taskId]
 							delete next.hostMutexes[spec.host]
+							delete next.storageMutex
 						}
 					}),
 				)
@@ -362,10 +481,14 @@ function nextSteps(state: ModelState, scenario: Scenario): TraceStep[] {
 							}
 						}
 						delete next.hostMutexes[spec.host]
+						delete next.storageMutex
 					}
 				}),
 			)
-			if (spec.publishCacheAtEnd && operation.writeIndex > 0) {
+			if (
+				(spec.publishCacheAtEnd && operation.writeIndex > 0) ||
+				(spec.id === "complete-a" && operation.writeIndex === 2)
+			) {
 				result.push(
 					transition(state, `${spec.id}.fail(${write.taskId})`, (next) => {
 						const target = next.operations[spec.id]!
@@ -380,6 +503,7 @@ function nextSteps(state: ModelState, scenario: Scenario): TraceStep[] {
 						target.phase = "failed"
 						delete next.locks[targetWrite.taskId]
 						delete next.hostMutexes[spec.host]
+						delete next.storageMutex
 					}),
 				)
 			}
@@ -397,7 +521,7 @@ function nextSteps(state: ModelState, scenario: Scenario): TraceStep[] {
 						(operation.phase === "read" && !spec.allowRefreshAfterRead))
 				)
 			})
-		if (!hostHasPreparedWork && canonical(state.caches[host]) !== canonical(state.disk)) {
+		if (!state.storageMutex && !hostHasPreparedWork && canonical(state.caches[host]) !== canonical(state.disk)) {
 			result.push(
 				transition(state, `${host}.refresh`, (next) => {
 					next.caches[host] = clone(next.disk)
@@ -410,6 +534,56 @@ function nextSteps(state: ModelState, scenario: Scenario): TraceStep[] {
 
 function commonViolations(state: ModelState, scenario: Scenario): string[] {
 	const violations: string[] = []
+	const replacement = state.commits.find((entry) => entry.operationId === "redelegate-b" && entry.taskId === "parent")
+	if (
+		replacement &&
+		state.disk["child-b"]?.status === "active" &&
+		state.disk["child-b"]?.parentTaskId === "parent" &&
+		(state.disk.parent?.status !== "delegated" || state.disk.parent.awaitingChildId !== "child-b")
+	)
+		violations.push("#1469 stale child completion cleared a newer parent handoff / live linked orphan")
+	const completion = state.operations["complete-a"]
+	for (const child of Object.values(state.disk)) {
+		if (!child?.execution || !child.parentTaskId || !["active", "delegated"].includes(child.status!)) continue
+		const parent = state.disk[child.parentTaskId as TaskId]
+		if (hasExactDelegation(parent, child)) continue
+		// Exclusive paused allocation is not a live linked orphan: parent commit still
+		// holds the command lock, and the production execution guard must reject it.
+		const allocation =
+			child.id === "child-b" &&
+			state.storageMutex === "redelegate-b" &&
+			state.operations["redelegate-b"]?.phase !== "done"
+		if (!allocation) violations.push(`Claimed live linked orphan: ${child.id}`)
+		else assert.throws(() => assertExecutionAllowed(child, executionToken(child), parent), LifecycleTransitionError)
+	}
+	if (
+		completion?.phase === "rejected" &&
+		(state.transcripts.length || state.commits.some((entry) => entry.operationId === "complete-a"))
+	)
+		violations.push("Refused completion mutated transcript or lifecycle")
+	if (state.transcripts.length > 1) violations.push("Duplicate completion result")
+	for (const effect of state.transcripts) {
+		const prefix = state.commits.find((entry) => entry.operationId === "complete-a" && entry.taskId === "parent")
+		if (
+			!prefix ||
+			prefix.previous?.awaitingChildId !== effect.childId ||
+			effect.parentId !== prefix.previous.id ||
+			completion?.receipt?.creating.actionId !== effect.actionId
+		)
+			violations.push("Completion result entered an unowned parent or preceded the prepared receipt")
+		if (replacement) violations.push("Old completion result entered a replacement handoff")
+	}
+	if (completion && completion.writeIndex >= 2 && state.transcripts.length !== 1)
+		violations.push("Completion child commit preceded transcript durability")
+	if (completion?.receipt && completion.writeIndex > 0 && completion.phase !== "done") {
+		validateCompletionPrefix(
+			getRequired(state.disk, "parent"),
+			getRequired(state.disk, "child-a"),
+			completion.receipt,
+		)
+	}
+	if (Object.values(state.hostMutexes).some((owner) => owner !== state.storageMutex))
+		violations.push("Host writer lacks storage command mutex")
 	for (const [host, owner] of Object.entries(state.hostMutexes) as Array<[Host, OperationId]>) {
 		const operation = state.operations[owner]
 		if (!operation || !["read", "prepared", "revalidated"].includes(operation.phase)) {
@@ -423,6 +597,14 @@ function commonViolations(state: ModelState, scenario: Scenario): string[] {
 		}
 	}
 	for (const commit of state.commits) {
+		if (
+			commit.operationId === "stale-save-a" &&
+			commit.previous &&
+			(commit.next.parentTaskId !== commit.previous.parentTaskId ||
+				commit.next.rootTaskId !== commit.previous.rootTaskId)
+		) {
+			violations.push("#1021 metadata save changed authoritative lineage")
+		}
 		if (commit.previous) {
 			for (const [key, value] of Object.entries(commit.previous)) {
 				if (!(key in commit.delta) && !deepEqual(value, commit.next[key as keyof HistoryItem])) {
@@ -466,6 +648,7 @@ function phaseName(action: string): string {
 	if (action.includes(".commit(")) return "commit"
 	if (action.includes(".fail(")) return "fail"
 	if (action.endsWith(".refresh")) return "refresh"
+	if (action.endsWith(".transcript")) return "transcript"
 	return "reject"
 }
 
@@ -477,65 +660,19 @@ function formatTrace(scenario: Scenario, message: string, trace: TraceStep[]): s
 	].join("\n")
 }
 
-function targetViolation(state: ModelState, scenario: Scenario): string | undefined {
-	if (scenario.targetViolation?.issue === "#1469") {
-		const completionDone = state.operations["complete-a"]?.phase === "done"
-		const redelegationDone = state.operations["redelegate-b"]?.phase === "done"
-		const redelegationParentCommit = state.commits.findIndex(
-			(entry) => entry.operationId === "redelegate-b" && entry.taskId === "parent",
-		)
-		const completionParentCommit = state.commits.findIndex(
-			(entry) => entry.operationId === "complete-a" && entry.taskId === "parent",
-		)
-		const parent = state.disk.parent
-		const child = state.disk["child-b"]
-		if (
-			completionDone &&
-			redelegationDone &&
-			redelegationParentCommit >= 0 &&
-			redelegationParentCommit < completionParentCommit &&
-			child?.status === "active" &&
-			child.parentTaskId === "parent"
-		) {
-			if (parent?.status !== "delegated" || parent.awaitingChildId !== "child-b") {
-				return scenario.targetViolation.message
-			}
-		}
-	}
-	if (scenario.targetViolation?.issue === "#1021") {
-		const abandonDone = state.operations["abandon-b"]?.phase === "done"
-		const staleSaveDone = state.operations["stale-save-a"]?.phase === "done"
-		const detachCommit = state.commits.findIndex(
-			(entry) =>
-				entry.operationId === "abandon-b" &&
-				entry.taskId === "child-a" &&
-				entry.next.parentTaskId === undefined &&
-				entry.next.rootTaskId === undefined,
-		)
-		const reattachCommit = state.commits.findIndex(
-			(entry) =>
-				entry.operationId === "stale-save-a" &&
-				entry.taskId === "child-a" &&
-				entry.previous?.parentTaskId === undefined &&
-				entry.next.parentTaskId === "parent",
-		)
-		if (abandonDone && staleSaveDone && detachCommit >= 0 && detachCommit < reattachCommit) {
-			return scenario.targetViolation.message
-		}
-	}
-	return undefined
-}
-
 function runScenario(scenario: Scenario): {
 	states: number
-	witness?: TraceStep[]
 	phases: Set<string>
 	landmarks: Set<string>
+	actions: Set<string>
+	depth: number
 } {
 	const startDisk =
 		scenario.name === "status rejection"
 			? { parent: item("parent", { status: "completed", mode: "stable" }) }
-			: baseRecords()
+			: scenario.operations.some((spec) => spec.authoritative)
+				? claimedRecords()
+				: baseRecords()
 	const start = initialState(
 		scenario.operations.map((operation) => operation.id),
 		startDisk,
@@ -547,7 +684,8 @@ function runScenario(scenario: Scenario): {
 	const frontier: ModelState[] = []
 	const phases = new Set<string>()
 	const landmarks = new Set<string>()
-	let witness: TraceStep[] | undefined
+	const actions = new Set<string>()
+	let depth = 0
 
 	for (let index = 0; index < queue.length; index++) {
 		const node = queue[index]!
@@ -556,34 +694,29 @@ function runScenario(scenario: Scenario): {
 		}
 		const violations = [...commonViolations(node.state, scenario), ...scenario.check(node.state)]
 		if (violations.length) throw new Error(formatTrace(scenario, violations.join("; "), node.trace))
-		const expectedViolation = targetViolation(node.state, scenario)
-		if (expectedViolation && !witness) witness = node.trace
 		if (node.trace.length - 1 === MAX_DEPTH) {
 			frontier.push(node.state)
 			continue
 		}
 
 		for (const step of nextSteps(node.state, scenario)) {
+			actions.add(step.action)
 			phases.add(phaseName(step.action))
 			if (step.state.operations["reject-a"]?.phase === "rejected") phases.add("reject")
 			const key = canonical(step.state)
 			if (visited.has(key)) continue
 			visited.add(key)
+			depth = Math.max(depth, node.trace.length)
 			queue.push({ state: step.state, trace: [...node.trace, step] })
 			if (visited.size > MAX_STATES) throw new Error(`${scenario.name} exceeded ${MAX_STATES} states`)
 		}
 	}
 
-	if (scenario.targetViolation && !witness) {
-		throw new Error(
-			`${scenario.name} no longer reproduces ${scenario.targetViolation.issue}; promote it to an invariant`,
-		)
-	}
 	const unseen = frontier
 		.flatMap((state) => nextSteps(state, scenario))
 		.find((step) => !visited.has(canonical(step.state)))
 	if (unseen) throw new Error(`${scenario.name} truncated before unseen action ${unseen.action}`)
-	return { states: visited.size, witness, phases, landmarks }
+	return { states: visited.size, phases, landmarks, actions, depth }
 }
 
 const scenarios: Scenario[] = [
@@ -637,48 +770,11 @@ const scenarios: Scenario[] = [
 	{
 		name: "stale completion ownership",
 		operations: [operationSpecs["complete-a"], operationSpecs["redelegate-b"]],
-		targetViolation: {
-			issue: "#1469",
-			message: "stale child completion cleared a newer parent handoff",
-			expectedActions: [
-				"complete-a.read",
-				"complete-a.prepare",
-				"redelegate-b.read",
-				"redelegate-b.prepare",
-				"redelegate-b.revalidate(child-a)",
-				"redelegate-b.commit(child-a)",
-				"complete-a.revalidate(child-a)",
-				"complete-a.commit(child-a)",
-				"redelegate-b.revalidate(child-b)",
-				"redelegate-b.commit(child-b)",
-				"redelegate-b.revalidate(parent)",
-				"redelegate-b.commit(parent)",
-				"complete-a.revalidate(parent)",
-				"complete-a.commit(parent)",
-			],
-		},
 		check: () => [],
 	},
 	{
 		name: "stale save detachment",
 		operations: [operationSpecs["stale-save-a"], operationSpecs["abandon-b"]],
-		targetViolation: {
-			issue: "#1021",
-			message: "stale live-task save reattached abandoned lineage",
-			expectedActions: [
-				"stale-save-a.read",
-				"abandon-b.read",
-				"abandon-b.prepare",
-				"abandon-b.revalidate(child-a)",
-				"abandon-b.commit(child-a)",
-				"abandon-b.revalidate(parent)",
-				"abandon-b.commit(parent)",
-				"A.refresh",
-				"stale-save-a.prepare",
-				"stale-save-a.revalidate(child-a)",
-				"stale-save-a.commit(child-a)",
-			],
-		},
 		check: () => [],
 	},
 ]
@@ -686,30 +782,49 @@ const scenarios: Scenario[] = [
 let totalStates = 0
 const reachedPhases = new Set<string>()
 const reachedLandmarks = new Set<string>()
+const reachedActions = new Set<string>()
+let reachedDepth = 0
 for (const scenario of scenarios) {
 	const result = runScenario(scenario)
 	totalStates += result.states
 	for (const phase of result.phases) reachedPhases.add(phase)
 	for (const landmark of result.landmarks) reachedLandmarks.add(landmark)
-	if (scenario.targetViolation) {
-		const actions = result.witness!.slice(1).map((step) => step.action)
-		if (canonical(actions) !== canonical(scenario.targetViolation.expectedActions)) {
-			throw new Error(
-				formatTrace(
-					scenario,
-					`${scenario.targetViolation.issue} shortest causal witness changed`,
-					result.witness!,
-				),
-			)
-		}
-		console.log(
-			`Known unsafe ${scenario.targetViolation.issue}: ${scenario.targetViolation.message}\n  ${result
-				.witness!.slice(1)
-				.map((step) => step.action)
-				.join(" -> ")}`,
-		)
-	}
+	for (const action of result.actions) reachedActions.add(action)
+	reachedDepth = Math.max(reachedDepth, result.depth)
+	for (const operation of scenario.operations)
+		assert(result.actions.has(`${operation.id}.prepare`), `Unreachable operation ${operation.id}`)
+	console.log(
+		`  ${scenario.name}: ${result.states} states, ${result.actions.size} actions, reached depth ${result.depth}`,
+	)
 }
+
+// Retain the reviewed stage-1 causal schedule, not merely an arbitrary rejection.
+// The old unsafe suffix (child commit, then clearing the parent) is now disabled.
+const causalScenario = scenarios.find((scenario) => scenario.name === "stale completion ownership")!
+let causal = initialState(["complete-a", "redelegate-b"], claimedRecords())
+const causalActions = [
+	"complete-a.read",
+	"redelegate-b.read",
+	"redelegate-b.prepare",
+	"redelegate-b.revalidate(child-a)",
+	"redelegate-b.commit(child-a)",
+	"redelegate-b.revalidate(child-b)",
+	"redelegate-b.commit(child-b)",
+	"redelegate-b.revalidate(parent)",
+	"redelegate-b.commit(parent)",
+	"complete-a.prepare",
+]
+for (const action of causalActions) {
+	const step = nextSteps(causal, causalScenario).find((entry) => entry.action === action)
+	assert(step, `Reviewed #1469 causal action disappeared: ${action}`)
+	causal = step.state
+	assert.deepEqual(commonViolations(causal, causalScenario), [])
+}
+assert(semanticLandmarks["old-causal-schedule-refused-without-transcript"](causal))
+assert(!nextSteps(causal, causalScenario).some((step) => step.action.startsWith("complete-a.")))
+console.log(
+	`Promoted #1469 / retained causal refusal (zero transcript/lifecycle writes): ${causalActions.join(" -> ")}`,
+)
 
 const missingPhases = expectedPhases.filter((phase) => !reachedPhases.has(phase))
 if (missingPhases.length) throw new Error(`Shared-store model has unreachable phases: ${missingPhases.join(", ")}`)
@@ -719,5 +834,5 @@ if (missingLandmarks.length) {
 }
 
 console.log(
-	`Shared-store model check passed: ${totalStates} states, ${scenarios.length} scenarios, ${commonInvariantNames.length} invariants, ${expectedPhases.length}/${expectedPhases.length} phases reachable, ${Object.keys(semanticLandmarks).length}/${Object.keys(semanticLandmarks).length} landmarks reached`,
+	`Shared-store model check passed: ${totalStates} states, ${scenarios.length} scenarios, ${reachedActions.size} actions, ${commonInvariantNames.length} invariants, ${expectedPhases.length}/${expectedPhases.length} phases reachable, ${Object.keys(semanticLandmarks).length}/${Object.keys(semanticLandmarks).length} landmarks reached; depth <= ${MAX_DEPTH} (reached ${reachedDepth}), budget ${MAX_STATES}/scenario; no retained unsafe witnesses`,
 )

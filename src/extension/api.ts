@@ -31,6 +31,7 @@ import { TerminalRegistry } from "../integrations/terminal/TerminalRegistry"
 import { openClineInNewTab } from "../activate/registerCommands"
 import { getCommands } from "../services/command/commands"
 import { getModels } from "../api/providers/fetchers/modelCache"
+import { createLoopIssueTestApi } from "./loopIssueTestApi"
 
 export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 	private readonly outputChannel: vscode.OutputChannel
@@ -315,6 +316,11 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 		return this.sidebarProvider.viewLaunched
 	}
 
+	/** Only available in VS Code's isolated ExtensionMode.Test; not a public API contract. */
+	public getLoopIssueTestApi() {
+		return createLoopIssueTestApi(this.sidebarProvider, this.outputChannel)
+	}
+
 	public captureWebviewThemeFixture(): Promise<WebviewThemeFixture> {
 		return this.sidebarProvider.requestWebviewThemeFixture()
 	}
@@ -344,16 +350,6 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 			task.on(RooCodeEventName.TaskStarted, async () => {
 				this.emit(RooCodeEventName.TaskStarted, task.taskId)
 				await this.fileLog(`[${new Date().toISOString()}] taskStarted -> ${task.taskId}\n`)
-			})
-
-			task.on(RooCodeEventName.TaskCompleted, async (_, tokenUsage, toolUsage) => {
-				this.emit(RooCodeEventName.TaskCompleted, task.taskId, tokenUsage, toolUsage, {
-					isSubtask: !!task.parentTaskId,
-				})
-
-				await this.fileLog(
-					`[${new Date().toISOString()}] taskCompleted -> ${task.taskId} | ${JSON.stringify(tokenUsage, null, 2)} | ${JSON.stringify(toolUsage, null, 2)}\n`,
-				)
 			})
 
 			task.on(RooCodeEventName.TaskAborted, () => {
@@ -445,6 +441,18 @@ export class API extends EventEmitter<RooCodeEvents> implements RooCodeAPI {
 			// Let's go!
 
 			this.emit(RooCodeEventName.TaskCreated, task.taskId)
+		})
+
+		// Completion is published only after durable persistence and runtime cleanup.
+		// The Task's listeners have been disposed by then; raw Task events are not
+		// commit evidence and must not bypass the provider's completion boundary.
+		provider.on(RooCodeEventName.TaskCompleted, (taskId, tokenUsage, toolUsage) => {
+			this.emit(RooCodeEventName.TaskCompleted, taskId, tokenUsage, toolUsage, {
+				isSubtask: !!provider.taskHistoryStore.get(taskId)?.parentTaskId,
+			})
+			void this.fileLog(
+				`[${new Date().toISOString()}] taskCompleted -> ${taskId} | ${JSON.stringify(tokenUsage, null, 2)} | ${JSON.stringify(toolUsage, null, 2)}\n`,
+			)
 		})
 
 		// Delegation events are emitted by the provider, not by individual task instances.

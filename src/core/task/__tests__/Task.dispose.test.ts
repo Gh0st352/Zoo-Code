@@ -3,13 +3,26 @@ import path from "node:path"
 import { type ProviderSettings, RooCodeEventName } from "@roo-code/types"
 
 import { Task } from "../Task"
-import { ClineProvider } from "../../webview/ClineProvider"
 import { OutputInterceptor } from "../../../integrations/terminal/OutputInterceptor"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
 import { getTaskDirectoryPath } from "../../../utils/storage"
+import {
+	createClaimedTask,
+	createTaskProvider,
+	installTaskHistoryFiles,
+} from "../../../__tests__/helpers/task-fixtures"
 
 // Mock dependencies
-vi.mock("../../webview/ClineProvider")
+vi.mock("fs/promises", async (importOriginal) => ({
+	...(await importOriginal<typeof import("fs/promises")>()),
+	realpath: vi.fn(async (value: string) => value),
+	readdir: vi.fn().mockResolvedValue([]),
+	mkdir: vi.fn().mockResolvedValue(undefined),
+	readFile: vi.fn(),
+	unlink: vi.fn(),
+}))
+vi.mock("../../../utils/safeWriteJson", () => ({ LOCK_STALE_MS: 31_000, safeWriteJson: vi.fn() }))
+vi.mock("proper-lockfile", () => ({ lock: vi.fn(async () => async () => {}) }))
 vi.mock("../../../integrations/terminal/TerminalRegistry", () => ({
 	TerminalRegistry: {
 		releaseTerminalsForTask: vi.fn(),
@@ -17,6 +30,7 @@ vi.mock("../../../integrations/terminal/TerminalRegistry", () => ({
 }))
 // Keep disposal tests independent of the real filesystem and output interceptor.
 vi.mock("../../../utils/storage", () => ({
+	getStorageBasePath: vi.fn(async (storage: string) => storage),
 	getTaskDirectoryPath: vi.fn().mockResolvedValue("/test/path/tasks/test-task"),
 }))
 vi.mock("../../../integrations/terminal/OutputInterceptor", () => ({
@@ -46,30 +60,22 @@ vi.mock("@roo-code/telemetry", () => ({
 }))
 
 describe("Task dispose method", () => {
-	let mockProvider: {
-		context: { globalStorageUri: { fsPath: string } }
-		getState: ReturnType<typeof vi.fn>
-		log: ReturnType<typeof vi.fn>
-		flushPostStateToWebviewThrottled: ReturnType<typeof vi.fn>
-	}
+	let mockProvider: ReturnType<typeof createTaskProvider>
+	let historyFiles: ReturnType<typeof installTaskHistoryFiles>
 	let mockApiConfiguration: ProviderSettings
 	let task: Task
 	let skipCleanup: boolean
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		// Reset all mocks
 		vi.clearAllMocks()
 		skipCleanup = false
+		historyFiles = installTaskHistoryFiles()
+		vi.mocked(getTaskDirectoryPath).mockReset().mockResolvedValue("/test/path/tasks/test-task")
+		vi.mocked(OutputInterceptor.cleanup).mockReset().mockResolvedValue(undefined)
 
 		// Mock provider
-		mockProvider = {
-			context: {
-				globalStorageUri: { fsPath: "/test/path" },
-			},
-			getState: vi.fn().mockResolvedValue({ mode: "code" }),
-			log: vi.fn(),
-			flushPostStateToWebviewThrottled: vi.fn().mockResolvedValue(undefined),
-		}
+		mockProvider = createTaskProvider("/test/path")
 
 		// Mock API configuration
 		mockApiConfiguration = {
@@ -78,17 +84,21 @@ describe("Task dispose method", () => {
 		} as ProviderSettings
 
 		// Create task instance without starting it
-		task = new Task({
-			provider: mockProvider as unknown as ClineProvider,
+		task = await createClaimedTask({
+			provider: mockProvider,
+			taskId: "test-task",
 			apiConfiguration: mockApiConfiguration,
 			startTask: false,
 		})
+		vi.mocked(getTaskDirectoryPath).mockClear()
 	})
 
 	afterEach(async () => {
 		if (task && !skipCleanup) {
 			await task.dispose().catch(() => {})
 		}
+		mockProvider.taskHistoryStore.dispose()
+		historyFiles.restore()
 	})
 
 	test("should expose completion of deferred command output cleanup", async () => {
@@ -104,7 +114,7 @@ describe("Task dispose method", () => {
 		void disposal.then(() => {
 			disposalComplete = true
 		})
-		await Promise.resolve()
+		await vi.waitFor(() => expect(getTaskDirectoryPath).toHaveBeenCalledOnce())
 
 		expect(disposalComplete).toBe(false)
 		expect(OutputInterceptor.cleanup).not.toHaveBeenCalled()
@@ -126,14 +136,9 @@ describe("Task dispose method", () => {
 		})
 
 		const disposal = task.dispose()
-		let rejection: unknown
-		void disposal.catch((error) => {
-			rejection = error
-		})
-		await Promise.resolve()
-
-		expect(rejection).toBe(disposalError)
+		await expect(disposal).rejects.toBe(disposalError)
 		expect(task.dispose()).toBe(disposal)
+		expect(task.cleanupSettled).toBe(false)
 	})
 
 	test("should report command output cleanup failures before disposal completes", async () => {
@@ -153,10 +158,11 @@ describe("Task dispose method", () => {
 		void disposal.then(() => {
 			disposalComplete = true
 		})
+		await vi.waitFor(() => expect(getTaskDirectoryPath).toHaveBeenCalledOnce())
 		rejectTaskDirectory(cleanupError)
 		await vi.waitFor(() => expect(consoleErrorSpy).toHaveBeenCalled())
 
-		expect(consoleErrorSpy).toHaveBeenCalledWith("Error cleaning up command output artifacts:", cleanupError)
+		expect(consoleErrorSpy).toHaveBeenCalledWith("Error cleaning up shared task resources:", cleanupError)
 		await disposal
 		expect(disposalComplete).toBe(true)
 		consoleErrorSpy.mockRestore()
@@ -203,8 +209,9 @@ describe("Task dispose method", () => {
 				resolveReversion = resolve
 			}),
 		)
-		const saveMessages = vi.fn().mockResolvedValue(true)
-		Object.defineProperty(task, "saveClineMessages", { value: saveMessages })
+		const saveMessages = vi.fn(task["saveClineMessages"].bind(task))
+		task["saveClineMessages"] = saveMessages
+		const saveSnapshot = vi.spyOn(mockProvider.taskHistoryStore, "saveExecutionSnapshot")
 
 		const abort = task.abortTask()
 		await vi.waitFor(() => expect(revertChangesSpy).toHaveBeenCalledOnce())
@@ -213,6 +220,8 @@ describe("Task dispose method", () => {
 		resolveReversion()
 		await abort
 		expect(saveMessages).toHaveBeenCalledOnce()
+		expect(saveMessages).toHaveResolvedWith(false)
+		expect(saveSnapshot).not.toHaveBeenCalled()
 
 		let disposalComplete = false
 		void task.dispose().then(() => {
@@ -250,20 +259,24 @@ describe("Task dispose method", () => {
 		expect(disposalComplete).toBe(true)
 	})
 
-	test("should log rejected diff reversion and continue final abort persistence", async () => {
+	test("should log rejected diff reversion without permitting fenced abort persistence", async () => {
 		const reversionError = new Error("reversion failed")
 		const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
 		task.isStreaming = true
 		task.diffViewProvider.isEditing = true
 		vi.spyOn(task.diffViewProvider, "revertChanges").mockRejectedValue(reversionError)
-		const saveMessages = vi.fn().mockResolvedValue(true)
-		Object.defineProperty(task, "saveClineMessages", { value: saveMessages })
+		const saveMessages = vi.fn(task["saveClineMessages"].bind(task))
+		task["saveClineMessages"] = saveMessages
+		const saveSnapshot = vi.spyOn(mockProvider.taskHistoryStore, "saveExecutionSnapshot")
 
 		await expect(task.abortTask()).resolves.toBeUndefined()
 		await expect(task.dispose()).resolves.toBeUndefined()
 
-		expect(consoleErrorSpy).toHaveBeenCalledWith(reversionError)
+		expect(consoleErrorSpy).toHaveBeenCalledWith("Error reverting diff changes:", reversionError)
+		expect(task.cleanupSettled).toBe(false)
 		expect(saveMessages).toHaveBeenCalledOnce()
+		expect(saveMessages).toHaveResolvedWith(false)
+		expect(saveSnapshot).not.toHaveBeenCalled()
 		consoleErrorSpy.mockRestore()
 	})
 
@@ -392,65 +405,72 @@ describe("Task dispose method", () => {
 })
 
 describe("Task.run() idempotency", () => {
-	// Reuses the mock setup from the outer describe block above.
-	let mockProvider: ReturnType<typeof buildMockProvider>
+	const originalStartTask = Task.prototype["startTask"]
+	let mockProvider: ReturnType<typeof createTaskProvider>
 	let mockApiConfiguration: ProviderSettings
-
-	function buildMockProvider() {
-		return {
-			context: { globalStorageUri: { fsPath: "/test/path" } },
-			getState: vi.fn().mockResolvedValue({ mode: "code" }),
-			log: vi.fn(),
-		}
-	}
+	let historyFiles: ReturnType<typeof installTaskHistoryFiles>
 
 	beforeEach(() => {
 		vi.clearAllMocks()
-		mockProvider = buildMockProvider()
+		historyFiles = installTaskHistoryFiles()
+		mockProvider = createTaskProvider("/test/path")
 		mockApiConfiguration = { apiProvider: providerIdentifiers.anthropic, apiKey: "test-key" } as ProviderSettings
+	})
+
+	afterEach(() => {
+		Task.prototype["startTask"] = originalStartTask
+		mockProvider.taskHistoryStore.dispose()
+		historyFiles.restore()
+		vi.restoreAllMocks()
 	})
 
 	test("run() does not invoke startTask when task was already started by constructor", async () => {
 		// Spy on the prototype before construction so we capture the constructor's call too.
-		const startTaskSpy = vi.spyOn(Task.prototype as any, "startTask").mockResolvedValue(undefined)
+		const startTaskSpy = vi.fn<Task["startTask"]>().mockResolvedValue(undefined)
+		Task.prototype["startTask"] = startTaskSpy
 
-		const t = new Task({
-			provider: mockProvider as unknown as ClineProvider,
+		const t = await createClaimedTask({
+			provider: mockProvider,
+			taskId: "test-task",
 			apiConfiguration: mockApiConfiguration,
 			task: "hello",
 			startTask: true,
 		})
 
-		const callsBefore = startTaskSpy.mock.calls.length // constructor fired it once
-		void t.run()
-		expect(startTaskSpy.mock.calls.length).toBe(callsBefore) // run() must not add a second call
+		await vi.waitFor(() => expect(startTaskSpy).toHaveBeenCalledOnce())
+		await t.run()
+		expect(startTaskSpy).toHaveBeenCalledOnce()
 		await t.dispose()
-		startTaskSpy.mockRestore()
+		Task.prototype["startTask"] = originalStartTask
 	})
 
 	test("run() does not invoke startTask when task was already started by start()", async () => {
-		const startTaskSpy = vi.spyOn(Task.prototype as any, "startTask").mockResolvedValue(undefined)
+		const startTaskSpy = vi.fn<Task["startTask"]>().mockResolvedValue(undefined)
+		Task.prototype["startTask"] = startTaskSpy
 
-		const t = new Task({
-			provider: mockProvider as unknown as ClineProvider,
+		const t = await createClaimedTask({
+			provider: mockProvider,
+			taskId: "test-task",
 			apiConfiguration: mockApiConfiguration,
 			task: "hello",
 			startTask: false,
 		})
 		t.start()
-		const callsAfterStart = startTaskSpy.mock.calls.length // start() fired it once
+		await vi.waitFor(() => expect(startTaskSpy).toHaveBeenCalledOnce())
 
-		void t.run()
-		expect(startTaskSpy.mock.calls.length).toBe(callsAfterStart) // no additional call
+		await t.run()
+		expect(startTaskSpy).toHaveBeenCalledOnce()
 		await t.dispose()
-		startTaskSpy.mockRestore()
+		Task.prototype["startTask"] = originalStartTask
 	})
 
 	test("run() returns the same promise on repeated calls", async () => {
-		const startTaskSpy = vi.spyOn(Task.prototype as any, "startTask").mockResolvedValue(undefined)
+		const startTaskSpy = vi.fn<Task["startTask"]>().mockResolvedValue(undefined)
+		Task.prototype["startTask"] = startTaskSpy
 
-		const t = new Task({
-			provider: mockProvider as unknown as ClineProvider,
+		const t = await createClaimedTask({
+			provider: mockProvider,
+			taskId: "test-task",
 			apiConfiguration: mockApiConfiguration,
 			task: "hello",
 			startTask: false,
@@ -460,7 +480,8 @@ describe("Task.run() idempotency", () => {
 		const p2 = t.run()
 		expect(p1).toBe(p2)
 		await p1
+		expect(startTaskSpy).toHaveBeenCalledOnce()
 		await t.dispose()
-		startTaskSpy.mockRestore()
+		Task.prototype["startTask"] = originalStartTask
 	})
 })

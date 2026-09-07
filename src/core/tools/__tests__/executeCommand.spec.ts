@@ -48,6 +48,7 @@ describe("executeCommand", () => {
 		mockTask = {
 			cwd: "/test/project",
 			taskId: "test-task-123",
+			requireExecution: vitest.fn().mockResolvedValue(undefined),
 			providerRef: {
 				deref: vitest.fn().mockResolvedValue(mockProvider),
 			},

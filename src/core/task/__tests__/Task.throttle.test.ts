@@ -1,12 +1,32 @@
 import { RooCodeEventName, ProviderSettings, TokenUsage, ToolUsage } from "@roo-code/types"
 
 import { Task } from "../Task"
-import { ClineProvider } from "../../webview/ClineProvider"
 import { hasToolUsageChanged, hasTokenUsageChanged } from "../../../shared/getApiMetrics"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
+import {
+	createClaimedTask,
+	createTaskProvider,
+	installTaskHistoryFiles,
+} from "../../../__tests__/helpers/task-fixtures"
 
 // Mock dependencies
-vi.mock("../../webview/ClineProvider")
+vi.mock("fs/promises", async (importOriginal) => ({
+	...(await importOriginal<typeof import("fs/promises")>()),
+	realpath: vi.fn(async (value: string) => value),
+	readdir: vi.fn().mockResolvedValue([]),
+	mkdir: vi.fn().mockResolvedValue(undefined),
+	readFile: vi.fn(),
+	unlink: vi.fn(),
+}))
+vi.mock("../../../utils/safeWriteJson", () => ({ LOCK_STALE_MS: 31_000, safeWriteJson: vi.fn() }))
+vi.mock("proper-lockfile", () => ({ lock: vi.fn(async () => async () => {}) }))
+vi.mock("../../task-persistence/taskMessages", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../task-persistence/taskMessages")>()),
+	saveTaskMessages: vi.fn().mockResolvedValue(undefined),
+}))
+vi.mock("../../../integrations/terminal/OutputInterceptor", () => ({
+	OutputInterceptor: { cleanup: vi.fn().mockResolvedValue(undefined) },
+}))
 vi.mock("../../../integrations/terminal/TerminalRegistry", () => ({
 	TerminalRegistry: {
 		releaseTerminalsForTask: vi.fn(),
@@ -62,28 +82,19 @@ vi.mock("../../task-persistence", async (importOriginal) => ({
 }))
 
 describe("Task token usage throttling", () => {
-	let mockProvider: any
+	let mockProvider: ReturnType<typeof createTaskProvider>
+	let historyFiles: ReturnType<typeof installTaskHistoryFiles>
 	let mockApiConfiguration: ProviderSettings
 	let task: Task
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		// Reset all mocks
 		vi.clearAllMocks()
 		vi.useFakeTimers()
+		historyFiles = installTaskHistoryFiles()
 
 		// Mock provider
-		mockProvider = {
-			context: {
-				globalStorageUri: { fsPath: "/test/path" },
-			},
-			getState: vi.fn().mockResolvedValue({ mode: "code" }),
-			log: vi.fn(),
-			postStateToWebview: vi.fn().mockResolvedValue(undefined),
-			postStateToWebviewWithoutTaskHistory: vi.fn().mockResolvedValue(undefined),
-			postStateToWebviewThrottled: vi.fn().mockResolvedValue(undefined),
-			flushPostStateToWebviewThrottled: vi.fn().mockResolvedValue(undefined),
-			updateTaskHistory: vi.fn().mockResolvedValue(undefined),
-		}
+		mockProvider = createTaskProvider("/test/path")
 
 		// Mock API configuration
 		mockApiConfiguration = {
@@ -92,8 +103,9 @@ describe("Task token usage throttling", () => {
 		} as ProviderSettings
 
 		// Create task instance without starting it
-		task = new Task({
-			provider: mockProvider as ClineProvider,
+		task = await createClaimedTask({
+			provider: mockProvider,
+			taskId: "test-task-id",
 			apiConfiguration: mockApiConfiguration,
 			startTask: false,
 		})
@@ -101,16 +113,16 @@ describe("Task token usage throttling", () => {
 
 	afterEach(async () => {
 		vi.useRealTimers()
-		if (task && !task.abort) {
-			await task.dispose()
-		}
+		await task.dispose()
+		mockProvider.taskHistoryStore.dispose()
+		historyFiles.restore()
 	})
 
 	test("should emit TaskTokenUsageUpdated immediately on first change", async () => {
 		const emitSpy = vi.spyOn(task, "emit")
 
 		// Add a message to trigger saveClineMessages
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -157,7 +169,7 @@ describe("Task token usage throttling", () => {
 		const emitSpy = vi.spyOn(task, "emit")
 
 		// First message - should emit
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -170,7 +182,7 @@ describe("Task token usage throttling", () => {
 
 		// Second message immediately after - should NOT emit due to throttle
 		vi.advanceTimersByTime(500) // Advance only 500ms
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -186,7 +198,7 @@ describe("Task token usage throttling", () => {
 
 		// Third message after 2+ seconds - should emit
 		vi.advanceTimersByTime(1600) // Total time: 2100ms
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -211,7 +223,7 @@ describe("Task token usage throttling", () => {
 		}
 
 		// Add a message to trigger emission
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -236,7 +248,7 @@ describe("Task token usage throttling", () => {
 		}
 
 		// Add a message first
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -292,7 +304,7 @@ describe("Task token usage throttling", () => {
 		})
 
 		// Add initial message
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -300,11 +312,12 @@ describe("Task token usage throttling", () => {
 		})
 
 		// Get the initial snapshot
-		const initialSnapshot = (task as any).tokenUsageSnapshot
+		const initialSnapshot = task["tokenUsageSnapshot"]
+		if (!initialSnapshot) throw new Error("First save did not emit a token snapshot")
 
 		// Add another message within throttle window
 		vi.advanceTimersByTime(500)
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -312,11 +325,11 @@ describe("Task token usage throttling", () => {
 		})
 
 		// Snapshot should still be the same (throttled)
-		expect((task as any).tokenUsageSnapshot).toBe(initialSnapshot)
+		expect(task["tokenUsageSnapshot"]).toBe(initialSnapshot)
 
 		// Add message after throttle window
 		vi.advanceTimersByTime(1600) // Total: 2100ms
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -324,9 +337,9 @@ describe("Task token usage throttling", () => {
 		})
 
 		// Snapshot should be updated now (new object reference)
-		expect((task as any).tokenUsageSnapshot).not.toBe(initialSnapshot)
+		expect(task["tokenUsageSnapshot"]).not.toBe(initialSnapshot)
 		// Values should be different
-		expect((task as any).tokenUsageSnapshot.totalTokensIn).toBeGreaterThan(initialSnapshot.totalTokensIn)
+		expect(task["tokenUsageSnapshot"]?.totalTokensIn).toBeGreaterThan(initialSnapshot.totalTokensIn)
 	})
 
 	test("should not emit if token usage has not changed even after throttle period", async () => {
@@ -358,7 +371,7 @@ describe("Task token usage throttling", () => {
 		const emitSpy = vi.spyOn(task, "emit")
 
 		// Add first message
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -371,7 +384,7 @@ describe("Task token usage throttling", () => {
 
 		// Wait for throttle period and add another message
 		vi.advanceTimersByTime(2100)
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -415,7 +428,7 @@ describe("Task token usage throttling", () => {
 		const emitSpy = vi.spyOn(task, "emit")
 
 		// Add first message - should emit
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -435,7 +448,7 @@ describe("Task token usage throttling", () => {
 		}
 
 		// Add another message
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -452,7 +465,7 @@ describe("Task token usage throttling", () => {
 
 	test("should update toolUsageSnapshot when emission occurs", async () => {
 		// Add initial message
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -460,9 +473,9 @@ describe("Task token usage throttling", () => {
 		})
 
 		// Initially toolUsageSnapshot should be set to current toolUsage (empty object)
-		const initialSnapshot = (task as any).toolUsageSnapshot
+		const initialSnapshot = task["toolUsageSnapshot"]
 		expect(initialSnapshot).toBeDefined()
-		expect(Object.keys(initialSnapshot)).toHaveLength(0)
+		expect(initialSnapshot).toEqual({})
 
 		// Wait for throttle period
 		vi.advanceTimersByTime(2100)
@@ -474,7 +487,7 @@ describe("Task token usage throttling", () => {
 		}
 
 		// Add another message
-		await (task as any).addToClineMessages({
+		await task["addToClineMessages"]({
 			ts: Date.now(),
 			type: "say",
 			say: "text",
@@ -482,7 +495,8 @@ describe("Task token usage throttling", () => {
 		})
 
 		// Snapshot should be updated to match the new toolUsage
-		const newSnapshot = (task as any).toolUsageSnapshot
+		const newSnapshot = task["toolUsageSnapshot"]
+		if (!newSnapshot) throw new Error("Save did not emit a tool snapshot")
 		expect(newSnapshot).not.toBe(initialSnapshot)
 		expect(newSnapshot.read_file).toEqual({ attempts: 3, failures: 0 })
 		expect(newSnapshot.write_to_file).toEqual({ attempts: 2, failures: 1 })
@@ -492,8 +506,8 @@ describe("Task token usage throttling", () => {
 		const emitSpy = vi.spyOn(task, "emit")
 
 		// Set initial tool usage and simulate previous emission
-		;(task as any).tokenUsageSnapshot = task.getTokenUsage()
-		;(task as any).toolUsageSnapshot = {}
+		task["tokenUsageSnapshot"] = task.getTokenUsage()
+		task["toolUsageSnapshot"] = {}
 
 		// Change tool usage
 		task.toolUsage = {

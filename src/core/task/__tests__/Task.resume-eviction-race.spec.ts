@@ -198,12 +198,11 @@ describe("Task resume/eviction race (Work #1 (no message) regression)", () => {
 			startTask: false,
 		})
 
-		// Fire task.run() without awaiting — mirrors the fire-and-forget pattern
-		// in ClineProvider#createTaskWithHistoryItem. For history tasks, run()
-		// calls resumeTaskFromHistory(), which starts with an async disk read.
-		const runPromise = task.run().catch(() => {
-			// After abort, downstream steps (e.g. ask()) throw — expected.
-		})
+		// Navigation hydrates an observer, never adopts execution from history.
+		// Hold that actual read open while eviction fences the observer.
+		const runPromise = task.hydrateForRecovery()
+		expect(task.executionToken).toBeUndefined()
+		expect(mockReadTaskMessages).toHaveBeenCalledOnce()
 
 		// Abort while the disk read is still in flight, as evictCurrentTask()
 		// does when the user navigates away before messages load.
@@ -220,6 +219,7 @@ describe("Task resume/eviction race (Work #1 (no message) regression)", () => {
 			{ ts: historyItem.ts + 1, type: "say", say: "completion_result", text: "Done." },
 		])
 		await runPromise
+		await task.dispose()
 
 		// The abandoned hydration must not resume and persist after its read settles.
 		expect(mockSaveTaskMessages).not.toHaveBeenCalled()

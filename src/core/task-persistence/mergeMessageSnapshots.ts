@@ -131,5 +131,27 @@ export function mergeClineMessageSnapshots(existing: unknown, incoming: unknown)
 }
 
 export function mergeApiMessageSnapshots(existing: unknown, incoming: unknown): unknown {
-	return mergeTimestampedSnapshots(existing, incoming)
+	return mergeTimestampedSnapshots(existing, incoming, (disk, next) => {
+		if (
+			disk.role !== "user" ||
+			next.role !== "user" ||
+			!Array.isArray(disk.content) ||
+			!Array.isArray(next.content)
+		)
+			return next
+		const results = disk.content.filter((block: unknown) => isRecord(block) && block.type === "tool_result")
+		if (!results.length) return next
+		// A durable tool outcome is immutable, including a repaired delegation error.
+		// Preserve other tools/text while refusing a stale snapshot's overwrite.
+		const ids = new Set(results.map((block: MessageRecord) => block.tool_use_id))
+		return {
+			...next,
+			content: [
+				...results,
+				...next.content.filter(
+					(block: unknown) => !isRecord(block) || block.type !== "tool_result" || !ids.has(block.tool_use_id),
+				),
+			],
+		}
+	})
 }

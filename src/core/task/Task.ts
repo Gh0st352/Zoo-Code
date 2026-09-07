@@ -1,6 +1,7 @@
 import * as path from "path"
 import * as vscode from "vscode"
 import os from "os"
+import { delegationBlocked, executionClaim, ExecutionAuthorityError } from "../task-persistence/taskLifecycle"
 import crypto from "crypto"
 import { v7 as uuidv7 } from "uuid"
 import EventEmitter from "events"
@@ -11,6 +12,7 @@ import { RateLimitClock, createRateLimitClock } from "./RateLimitClock"
 import { Anthropic } from "@anthropic-ai/sdk"
 import OpenAI from "openai"
 import debounce from "lodash.debounce"
+import deepEqual from "fast-deep-equal"
 import delay from "delay"
 import pWaitFor from "p-wait-for"
 import { serializeError } from "serialize-error"
@@ -33,6 +35,9 @@ import {
 	type ToolProgressStatus,
 	type HistoryItem,
 	type PendingTaskAction,
+	type ExecutionToken,
+	type ExecutionRefusalReason,
+	type TaskRecoveryChoice,
 	type CreateTaskOptions,
 	type ModelInfo,
 	type ClineApiReqCancelReason,
@@ -114,9 +119,7 @@ import {
 	type ApiMessage,
 	ensureMessageIdentifiers,
 	readApiMessages,
-	saveApiMessages,
 	readTaskMessages,
-	saveTaskMessages,
 	taskMetadata,
 } from "../task-persistence"
 import { getEnvironmentDetails } from "../environment/getEnvironmentDetails"
@@ -182,6 +185,8 @@ export interface TaskOptions extends CreateTaskOptions {
 	task?: string
 	images?: string[]
 	historyItem?: HistoryItem
+	/** Preclaimed by the provider; history alone never grants execution authority. */
+	executionToken?: ExecutionToken
 	experiments?: Record<string, boolean>
 	startTask?: boolean
 	rootTask?: Task
@@ -202,6 +207,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	readonly parentTaskId?: string
 	childTaskId?: string
 	pendingNewTaskToolCallId?: string
+	private _executionBlocked = false
+	private executionRefusalReason: ExecutionRefusalReason = "recovery_required"
+	public readonly executionToken?: ExecutionToken
+	public readonly executionGeneration: number
 
 	readonly instanceId: string
 	readonly metadata: TaskMetadata
@@ -327,7 +336,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	rooIgnoreController?: RooIgnoreController
 	rooProtectedController?: RooProtectedController
 	fileContextTracker: FileContextTracker
-	terminalProcess?: RooTerminalProcess
+	private _terminalProcess?: RooTerminalProcess
+	private readonly outstandingCommands = new Set<RooTerminalProcess>()
 
 	// Editing
 	diffViewProvider: DiffViewProvider
@@ -375,6 +385,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private abortPromise?: Promise<void>
 	private disposalPromise?: Promise<void>
 	private diffReversionPromise: Promise<void> = Promise.resolve()
+	private disposalFinished = false
+	private cleanupFailed = false
+	private readonly executionWork = new Set<Promise<unknown>>()
+	private readonly requestStreams = new Set<ApiStream>()
+	private readonly requestControllers = new Map<ApiStream, AbortController>()
+	private readonly closingStreams = new WeakMap<ApiStream, Promise<void>>()
 
 	// Checkpoints
 	enableCheckpoints: boolean
@@ -504,6 +520,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		task,
 		images,
 		historyItem,
+		executionToken,
 		experiments: experimentsConfig,
 		startTask = true,
 		rootTask,
@@ -552,7 +569,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			? parentTask.workspacePath
 			: (workspacePath ?? getWorkspacePath(path.join(os.homedir(), "Desktop")))
 
-		this.instanceId = crypto.randomUUID().slice(0, 8)
+		this.executionToken = executionToken
+			? Object.freeze({ ...executionToken, owner: Object.freeze({ ...executionToken.owner }) })
+			: undefined
+		this.instanceId = this.executionToken?.owner.runtimeId ?? crypto.randomUUID().slice(0, 8)
 		this.taskNumber = -1
 
 		this.rooIgnoreController = new RooIgnoreController(this.cwd)
@@ -579,6 +599,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this.taskNumber = taskNumber
 		this.initialStatus = initialStatus
 		this.pendingAction = historyItem?.pendingAction
+		this.executionGeneration = this.executionToken?.generation ?? historyItem?.executionGeneration ?? 0
+		this.executionBlocked = !this.executionToken || (!!historyItem && delegationBlocked(historyItem))
 
 		// Store the task's mode and API config name when it's created.
 		// For history items, use the stored values; for new tasks, we'll set them
@@ -660,19 +682,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		onCreated?.(this)
 
 		if (startTask) {
-			this._started = true
-			this.startIdleTelemetryCheck()
-			if (task || images) {
-				void this.startTask(task, images).catch((error) => {
-					console.error("[Task#constructor] startTask failed:", error)
-				})
-			} else if (historyItem) {
-				void this.resumeTaskFromHistory().catch((error) => {
-					console.error("[Task#constructor] resumeTaskFromHistory failed:", error)
-				})
-			} else {
-				throw new Error("Either historyItem or task/images must be provided")
-			}
+			void this.run().catch((error) => {
+				console.error("[Task#constructor] run failed:", error)
+			})
 		}
 	}
 
@@ -911,6 +923,147 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	public setPendingTaskAction(pendingAction: PendingTaskAction): void {
 		this.pendingAction = pendingAction
 	}
+	public getPendingTaskAction(): PendingTaskAction | undefined {
+		return this.pendingAction
+	}
+
+	public get executionBlocked(): boolean {
+		return this._executionBlocked
+	}
+
+	/** A stopped incarnation can never be reauthorized by a flag or refreshed history. */
+	public set executionBlocked(blocked: boolean) {
+		if (!blocked) return
+		this._executionBlocked = true
+		this.userMessageContentReady = true
+		try {
+			this.cancelCurrentRequest()
+		} catch (error) {
+			this.cleanupFailed = true
+			console.error("Error cancelling fenced request:", error)
+		}
+		this.cancelAutoApprovalTimeout()
+		this.isStreaming = false
+		this.isWaitingForFirstChunk = false
+	}
+
+	public async guardExecution(): Promise<boolean> {
+		if (this.abort || this.abandoned || this.executionBlocked || !this.executionToken) {
+			this.executionBlocked = true
+			return false
+		}
+		try {
+			if (this.executionToken.taskId !== this.taskId) throw new ExecutionAuthorityError("owner_mismatch")
+			const provider = this.providerRef.deref()
+			if (!provider) throw new ExecutionAuthorityError("owner_unknown")
+			const result = await provider.taskHistoryStore.guardExecution(this.executionToken)
+			if (result.kind !== "allowed") {
+				this.executionRefusalReason = result.reason
+				this.executionBlocked = true
+				return false
+			}
+			// Cancellation may race with the storage lock. Never adopt result.history's token.
+			if (this.abort || this.abandoned || this.executionBlocked) {
+				this.executionBlocked = true
+				return false
+			}
+			return true
+		} catch (error) {
+			this.executionRefusalReason = error instanceof ExecutionAuthorityError ? error.reason : "history_io_error"
+			this.executionBlocked = true
+			return false
+		}
+	}
+
+	public async requireExecution(): Promise<void> {
+		if (!(await this.guardExecution())) throw new ExecutionAuthorityError(this.executionRefusalReason)
+	}
+
+	/** Track actual work, not the run promise (which can be awaiting its own handoff). */
+	public trackExecutionWork<T>(work: Promise<T>): Promise<T> {
+		this.executionWork.add(work)
+		void work.then(
+			() => this.executionWork.delete(work),
+			() => this.executionWork.delete(work),
+		)
+		return work
+	}
+
+	public get terminalProcess(): RooTerminalProcess | undefined {
+		return this._terminalProcess
+	}
+
+	public set terminalProcess(process: RooTerminalProcess | undefined) {
+		this._terminalProcess = process
+		if (!process || this.outstandingCommands.has(process)) return
+		this.outstandingCommands.add(process)
+		// A command's continue/completed promise can resolve while the shell is still
+		// running. Only positive shell-exit evidence releases cleanup ownership.
+		const settled = () => {
+			this.outstandingCommands.delete(process)
+			process.removeListener("shell_execution_complete", settled)
+			process.removeListener("no_shell_integration", noShellIntegration)
+		}
+		const noShellIntegration = (details: { commandSubmitted: boolean }) => {
+			if (!details.commandSubmitted) settled()
+		}
+		process.once("shell_execution_complete", settled)
+		process.once("no_shell_integration", noShellIntegration)
+		if (this.abort || this.abandoned || this.executionBlocked) process.abort()
+	}
+
+	public get cleanupSettled(): boolean {
+		return (
+			this.disposalFinished &&
+			!this.cleanupFailed &&
+			this.executionWork.size === 0 &&
+			this.requestStreams.size === 0 &&
+			this.outstandingCommands.size === 0 &&
+			!this.diffViewProvider.isEditing
+		)
+	}
+
+	public async awaitExecutionCleanup(): Promise<boolean> {
+		await this.dispose()
+		await Promise.allSettled([...this.executionWork])
+		return this.cleanupSettled
+	}
+
+	public async hydrateForRecovery(fallbackReason?: string): Promise<void> {
+		this.executionBlocked = true
+		this.userMessageContentReady = true
+		this.cancelCurrentRequest()
+		this.isStreaming = false
+		this.isWaitingForFirstChunk = false
+		this.interactiveAsk = undefined
+		this.resumableAsk = undefined
+		this.idleAsk = undefined
+		const provider = this.providerRef.deref()
+		// Observer hydration never repairs or writes history. The provider/store owns repair.
+		const messages = await this.getSavedClineMessages()
+		const api = await this.getSavedApiConversationHistory()
+		if (this.abort || this.abandoned) return
+		this.hydrateClineMessages(messages)
+		this.hydrateApiConversationHistory(api)
+		this.pendingAction = provider?.taskHistoryStore.get(this.taskId)?.pendingAction
+		if (
+			fallbackReason &&
+			!messages.some((message) => message.say === "error" && message.messageId?.startsWith("delegation:"))
+		) {
+			// In-memory fallback for unavailable storage/uncertain commits; never claim a
+			// durable failure result when commit outcome is not known. Ordinary observers
+			// use the provider's typed recovery state, not a manufactured transcript error.
+			this.clineMessages.push({
+				ts: Date.now(),
+				type: "say",
+				say: "error",
+				text: fallbackReason,
+				messageId: `delegation:${this.taskId}:blocked`,
+			})
+		}
+		this.isInitialized = true
+		await provider?.postClineMessagesSnapshot(this.taskId, { bumpSeq: true })
+	}
 
 	public async persistQueuedFeedbackAndAcknowledge(
 		messageId: string,
@@ -943,7 +1096,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		const provider = this.providerRef.deref()
-		const cleared = await provider?.clearPendingTaskAction(this.taskId, actionId)
+		await this.requireExecution()
+		const cleared = await provider?.clearPendingTaskAction(this.taskId, actionId, this)
+		if (!(await this.guardExecution())) return
 		if (cleared) {
 			if (this.pendingAction?.actionId === actionId) {
 				this.pendingAction = undefined
@@ -973,20 +1128,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	static create(options: TaskOptions): [Task, Promise<void>] {
 		const instance = new Task({ ...options, startTask: false })
-		const { images, task, historyItem } = options
-		let promise
-
-		instance.startIdleTelemetryCheck()
-
-		if (images || task) {
-			promise = instance.startTask(task, images)
-		} else if (historyItem) {
-			promise = instance.resumeTaskFromHistory()
-		} else {
+		if (!options.images && !options.task && !options.historyItem) {
 			throw new Error("Either historyItem or task/images must be provided")
 		}
-
-		return [instance, promise]
+		return [instance, instance.run()]
 	}
 
 	// API Messages
@@ -1057,6 +1202,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * So we usually only need to flush the pending user message with tool_results.
 	 */
 	public async flushPendingToolResultsToHistory(): Promise<boolean> {
+		// Prepared delegation can flush, but a fenced/observer incarnation cannot save.
+		if (this.abort || this.abandoned || this.executionBlocked || !this.executionToken) return false
 		// Only flush if there's actually pending content to save
 		if (this.userMessageContent.length === 0) {
 			return true
@@ -1076,7 +1223,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// - Reset to false at the start of each API request
 		// - Set to true after the assistant message is saved in recursivelyMakeClineRequests
 		if (!this.assistantMessageSavedToHistory) {
-			await pWaitFor(() => this.assistantMessageSavedToHistory || this.abort, {
+			await pWaitFor(() => this.assistantMessageSavedToHistory || this.abort || this.executionBlocked, {
 				interval: 50,
 				timeout: 30_000, // 30 second timeout as safety net
 			}).catch(() => {
@@ -1088,7 +1235,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		// If task was aborted while waiting, don't flush
-		if (this.abort) {
+		if (this.abort || this.abandoned || this.executionBlocked || !this.assistantMessageSavedToHistory) {
 			return false
 		}
 
@@ -1121,15 +1268,21 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	private async saveApiConversationHistory(merge = true): Promise<boolean> {
+		if (this.abort || this.abandoned || this.executionBlocked || !this.executionToken) return false
 		try {
-			await saveApiMessages({
-				messages: structuredClone(this.apiConversationHistory),
-				taskId: this.taskId,
-				globalStoragePath: this.globalStoragePath,
-				merge,
-			})
-			return true
+			if (this.executionToken.taskId !== this.taskId) throw new ExecutionAuthorityError("owner_mismatch")
+			const provider = this.providerRef.deref()
+			if (!provider) throw new ExecutionAuthorityError("owner_unknown")
+			await this.trackExecutionWork(
+				provider.taskHistoryStore.saveExecutionSnapshot(this.executionToken, {
+					apiMessages: structuredClone(this.apiConversationHistory),
+					merge,
+				}),
+			)
+			return !this.abort && !this.abandoned && !this.executionBlocked
 		} catch (error) {
+			this.executionRefusalReason = error instanceof ExecutionAuthorityError ? error.reason : "history_io_error"
+			this.executionBlocked = true
 			console.error("Failed to save API conversation history:", error)
 			return false
 		}
@@ -1144,6 +1297,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const delays = [100, 500, 1500]
 
 		for (let attempt = 0; attempt < delays.length; attempt++) {
+			if (this.abort || this.abandoned || this.executionBlocked) return false
 			await new Promise<void>((resolve) => setTimeout(resolve, delays[attempt]))
 			console.warn(
 				`[Task#${this.taskId}] retrySaveApiConversationHistory: retry attempt ${attempt + 1}/${delays.length}`,
@@ -1242,30 +1396,39 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	private async saveClineMessages(merge = true): Promise<boolean> {
+		if (this.abort || this.abandoned || this.executionBlocked || !this.executionToken) return false
 		try {
-			await saveTaskMessages({
-				messages: structuredClone(this.clineMessages),
-				taskId: this.taskId,
-				globalStoragePath: this.globalStoragePath,
-				merge,
-			})
-
+			if (this.executionToken.taskId !== this.taskId) throw new ExecutionAuthorityError("owner_mismatch")
 			if (this._taskApiConfigName === undefined) {
 				await this.taskApiConfigReady
 			}
 
+			const messages = structuredClone(this.clineMessages)
 			const { historyItem, tokenUsage } = await taskMetadata({
 				taskId: this.taskId,
 				rootTaskId: this.rootTaskId,
 				parentTaskId: this.parentTaskId,
 				taskNumber: this.taskNumber,
-				messages: this.clineMessages,
+				messages,
 				globalStoragePath: this.globalStoragePath,
 				workspace: this.cwd,
 				mode: this._taskMode || defaultModeSlug, // Use the task's own mode, not the current provider mode.
 				apiConfigName: this._taskApiConfigName, // Use the task's own provider profile, not the current provider profile.
 				initialStatus: this.initialStatus,
 			})
+			if (this.abort || this.abandoned || this.executionBlocked) return false
+			const provider = this.providerRef.deref()
+			if (!provider) throw new ExecutionAuthorityError("owner_unknown")
+			// Build metadata outside the lock; validate the captured token while holding
+			// the lock through BOTH transcript and metadata writes. No raw saves.
+			await this.trackExecutionWork(
+				provider.taskHistoryStore.saveExecutionSnapshot(this.executionToken, {
+					clineMessages: messages,
+					metadata: historyItem,
+					merge,
+				}),
+			)
+			if (this.abort || this.abandoned || this.executionBlocked) return false
 
 			// Emit token/tool usage updates using debounced function
 			// The debounce with maxWait ensures:
@@ -1274,11 +1437,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// - Final state is emitted when updates stop (trailing: true)
 			this.debouncedEmitTokenUsage(tokenUsage, this.toolUsage)
 
-			const provider = this.providerRef.deref()
-			const existingStatus = provider?.taskHistoryStore.get(this.taskId)?.status
-			await provider?.updateTaskHistory(existingStatus ? { ...historyItem, status: existingStatus } : historyItem)
 			return true
 		} catch (error) {
+			this.executionRefusalReason = error instanceof ExecutionAuthorityError ? error.reason : "history_io_error"
+			this.executionBlocked = true
 			console.error("Failed to save Roo messages:", error)
 			return false
 		}
@@ -1315,6 +1477,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		if (this.abort) {
 			throw new Error(`[RooCode#ask] task ${this.taskId}.${this.instanceId} aborted`)
 		}
+		await this.requireExecution()
 
 		let askTs: number
 
@@ -1326,6 +1489,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// rendered, leaving them stuck on-screen).
 		const provider = this.providerRef.deref()
 		const state = provider ? await provider.getState() : undefined
+		await this.requireExecution()
 		const queuedMessage =
 			partial === true || type === "command_output" ? undefined : this.messageQueueService.claimNextMessage()
 		const queuedAskResolution = queuedMessage ? queuedResponseForAsk(type, text) : undefined
@@ -1336,6 +1500,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const approval = queuedAskResolution
 			? ({ decision: "ask" } as const)
 			: await checkAutoApproval({ state, cwd: this.cwd, ask: type, text, isProtected })
+		if (!(await this.guardExecution())) {
+			if (queuedMessage) this.messageQueueService.releaseMessage(queuedMessage.id)
+			throw new ExecutionAuthorityError(this.executionRefusalReason)
+		}
 		const isAutoAnswered = approval.decision === "approve" || approval.decision === "deny"
 		const autoApprovalDecision = isAutoAnswered ? approval.decision : undefined
 
@@ -1443,6 +1611,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			})
 		}
 
+		if (!(await this.guardExecution())) {
+			// Publication can await persistence or transport while cancellation fences
+			// this runtime. Refusal must not strand the feedback claimed above.
+			if (queuedMessage) this.messageQueueService.releaseMessage(queuedMessage.id)
+			throw new ExecutionAuthorityError(this.executionRefusalReason)
+		}
 		const timeouts: NodeJS.Timeout[] = []
 
 		if (approval.decision === "approve") {
@@ -1516,8 +1690,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		// Wait for askResponse to be set
 		await pWaitFor(
-			() => {
-				if (this.abort || this.askResponse !== undefined || this.lastMessageTs !== askTs) {
+			async () => {
+				if (!(await this.guardExecution()) || this.askResponse !== undefined || this.lastMessageTs !== askTs) {
 					return true
 				}
 
@@ -1536,13 +1710,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			},
 			{ interval: 100 },
 		)
+		timeouts.forEach((timeout) => clearTimeout(timeout))
 
 		/* v8 ignore next 3 -- abort-while-waiting path; covered by e2e standalone-resume test */
-		if (this.abort) {
+		if (!(await this.guardExecution())) {
 			if (queuedMessageId) {
 				this.messageQueueService.releaseMessage(queuedMessageId)
 			}
-			throw new Error(`[ZooCode#ask] task ${this.taskId}.${this.instanceId} aborted`)
+			throw new ExecutionAuthorityError(this.executionRefusalReason)
 		}
 
 		if (this.lastMessageTs !== askTs) {
@@ -1580,7 +1755,27 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return result
 	}
 
+	/** Accept one user reply to the exact published ask, never a later ask or runtime. */
+	public acceptChatResponse(askTs: number, text: string, images?: string[]): boolean {
+		const ask = this.findMessageByTimestamp(askTs)
+		if (
+			this.abort ||
+			this.abandoned ||
+			this.executionBlocked ||
+			!this.executionToken ||
+			this.lastMessageTs !== askTs ||
+			this.askResponse !== undefined ||
+			ask?.type !== "ask" ||
+			ask.partial ||
+			ask.isAnswered
+		)
+			return false
+		this.handleWebviewAskResponse("messageResponse", text, images)
+		return true
+	}
+
 	handleWebviewAskResponse(askResponse: ClineAskResponse, text?: string, images?: string[]) {
+		if (this.abort || this.abandoned || this.executionBlocked || !this.executionToken) return
 		// Clear any pending auto-approval timeout when user responds
 		this.cancelAutoApprovalTimeout()
 
@@ -1592,7 +1787,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// Use allowEmpty=true to ensure a checkpoint is recorded even if there are no file changes.
 		// Suppress the checkpoint_saved chat row for this particular checkpoint to keep the timeline clean.
 		if (askResponse === "messageResponse") {
-			void this.checkpointSave(false, true)
+			void this.checkpointSave(false, true).catch((error: unknown) => {
+				if (!(error instanceof ExecutionAuthorityError)) console.error("Response checkpoint failed:", error)
+			})
 		}
 
 		// Mark the last follow-up question as answered
@@ -1676,6 +1873,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		providerProfile?: string,
 	): Promise<void> {
 		try {
+			await this.requireExecution()
 			text = (text ?? "").trim()
 			images = images ?? []
 
@@ -1697,12 +1895,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					// Update this task's API configuration to match the new profile
 					// This ensures the parser state is synchronized with the selected model
 					const newState = await provider.getState()
+					await this.requireExecution()
 					this.setTaskApiConfigName(newState?.currentApiConfigName ?? providerProfile)
 					if (newState?.apiConfiguration) {
 						this.updateApiConfiguration(newState.apiConfiguration)
 					}
 				}
 
+				await this.requireExecution()
 				this.emit(RooCodeEventName.TaskUserMessage, this.taskId)
 
 				// Handle the message directly instead of routing through the webview.
@@ -1719,6 +1919,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	async handleTerminalOperation(terminalOperation: "continue" | "abort") {
 		if (terminalOperation === "continue") {
+			await this.requireExecution()
 			this.terminalProcess?.continue()
 		} else if (terminalOperation === "abort") {
 			this.terminalProcess?.abort()
@@ -1735,6 +1936,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	public async condenseContext(): Promise<void> {
+		await this.requireExecution()
 		// CRITICAL: Flush any pending tool results before condensing
 		// to ensure tool_use/tool_result pairs are complete in history
 		await this.flushPendingToolResultsToHistory()
@@ -1790,6 +1992,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const environmentDetails = await getEnvironmentDetails(this, true)
 
 		const filesReadByRoo = await this.getFilesReadByRooSafely("condenseContext")
+		await this.requireExecution()
 
 		const {
 			messages,
@@ -1799,19 +2002,22 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			error,
 			errorDetails,
 			condenseId,
-		} = await summarizeConversation({
-			messages: this.apiConversationHistory,
-			apiHandler: this.api,
-			systemPrompt,
-			taskId: this.taskId,
-			isAutomaticTrigger: false,
-			customCondensingPrompt,
-			metadata,
-			environmentDetails,
-			filesReadByRoo,
-			cwd: this.cwd,
-			rooIgnoreController: this.rooIgnoreController,
-		})
+		} = await this.trackExecutionWork(
+			summarizeConversation({
+				messages: this.apiConversationHistory,
+				apiHandler: this.api,
+				systemPrompt,
+				taskId: this.taskId,
+				isAutomaticTrigger: false,
+				customCondensingPrompt,
+				metadata,
+				environmentDetails,
+				filesReadByRoo,
+				cwd: this.cwd,
+				rooIgnoreController: this.rooIgnoreController,
+			}),
+		)
+		await this.requireExecution()
 		if (error) {
 			await this.say(
 				"condense_context_error",
@@ -1864,6 +2070,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		if (this.abort) {
 			throw new Error(`[RooCode#say] task ${this.taskId}.${this.instanceId} aborted`)
 		}
+		await this.requireExecution()
 
 		if (partial !== undefined) {
 			const lastMessage = this.clineMessages.at(-1)
@@ -2029,19 +2236,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * must be in place before the task begins writing history or emitting asks.
 	 */
 	public start(): void {
-		if (this._started) {
-			return
-		}
-		this._started = true
-		this.startIdleTelemetryCheck()
-
-		const { task, images } = this.metadata
-
-		if (task || images) {
-			void this.startTask(task ?? undefined, images ?? undefined).catch((error) => {
-				console.error("[Task#start] startTask failed:", error)
-			})
-		}
+		if (this.abort || this.abandoned || this.executionBlocked || !this.executionToken) return
+		void this.run().catch((error) => console.error("[Task#start] run failed:", error))
 	}
 
 	/**
@@ -2058,20 +2254,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			return Promise.resolve()
 		}
 		this._started = true
-		this.startIdleTelemetryCheck()
-
-		const { task, images } = this.metadata
-
-		this._runPromise = this._isHistoryTask
-			? this.resumeTaskFromHistory()
-			: task || images
-				? this.startTask(task ?? undefined, images ?? undefined)
-				: Promise.resolve()
+		this._runPromise = (async () => {
+			if (!(await this.guardExecution())) return
+			this.startIdleTelemetryCheck()
+			const { task, images } = this.metadata
+			if (this._isHistoryTask) await this.resumeTaskFromHistory()
+			else if (task || images) await this.startTask(task ?? undefined, images ?? undefined)
+		})()
 		return this._runPromise
 	}
 
 	private async startTask(task?: string, images?: string[]): Promise<void> {
 		try {
+			if (!(await this.guardExecution())) return
 			// `conversationHistory` (for API) and `clineMessages` (for webview)
 			// need to be in sync.
 			// If the extension process were killed, then on restart the
@@ -2090,6 +2285,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			// Check for too many MCP tools and warn the user
 			const { enabledToolCount, enabledServerCount } = await this.getEnabledMcpToolsCount()
+			if (!(await this.guardExecution())) return
 			if (enabledToolCount > MAX_MCP_TOOLS_THRESHOLD) {
 				await this.say(
 					"too_many_tools_warning",
@@ -2134,11 +2330,22 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 	}
 
-	private async resumeTaskFromHistory() {
+	public async resumeAfterRecovery(choice: TaskRecoveryChoice): Promise<void> {
+		if (this._started || !(await this.guardExecution())) return
+		// Concurrent callbacks must not launch two loops after the guard's storage wait.
+		if (this._started) return
+		this._started = true
+		this.startIdleTelemetryCheck()
+		this._runPromise = this.resumeTaskFromHistory(choice)
+		await this._runPromise
+	}
+
+	private async resumeTaskFromHistory(recoveryChoice?: TaskRecoveryChoice) {
 		try {
+			if (!(await this.guardExecution())) return
 			const modifiedClineMessages = [...(await this.getSavedClineMessages())]
 
-			if (this.abort || this.abandoned) {
+			if (!(await this.guardExecution())) {
 				return
 			}
 
@@ -2199,7 +2406,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// or abandoned after the UI read completes but before this point, the
 			// abort guard below will fire and neither history will be written.
 			const savedApiConversationHistory = await this.getSavedApiConversationHistory()
-			if (this.abort || this.abandoned) {
+			if (!(await this.guardExecution())) {
 				return
 			}
 
@@ -2229,18 +2436,18 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				await this.clearPendingActionAfterDurableResult(this.pendingAction.actionId)
 			}
 
-			if (this.abort || this.abandoned) {
+			if (!(await this.guardExecution())) {
 				return
 			}
 
 			// Publish the transcript after both histories hydrate, before any resume prompt or pending-action replay.
 			await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, { bumpSeq: true })
 
-			if (this.abort || this.abandoned) {
+			if (!(await this.guardExecution())) {
 				return
 			}
 
-			if (this.pendingAction) {
+			if (this.pendingAction && !recoveryChoice) {
 				this.isInitialized = true
 				await this.resumePendingTaskAction(this.pendingAction)
 				return
@@ -2260,7 +2467,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			this.isInitialized = true
 
-			const { response, text, images } = await this.ask(askType)
+			const { response, text, images } = recoveryChoice
+				? { response: "yesButtonClicked" as const, text: undefined, images: undefined }
+				: await this.ask(askType)
+			if (!(await this.guardExecution())) return
 
 			let responseText: string | undefined
 			let responseImages: string[] | undefined
@@ -2274,6 +2484,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// Make sure that the api conversation history can be resumed by the API,
 			// even if it goes out of sync with cline messages.
 			const existingApiConversationHistory: ApiMessage[] = await this.getSavedApiConversationHistory()
+			if (!(await this.guardExecution())) return
 
 			// Tool blocks are always preserved; native tool calling only.
 
@@ -2380,6 +2591,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 
 			const newUserContent: Anthropic.Messages.ContentBlockParam[] = [...modifiedOldUserContent]
+			if (recoveryChoice) {
+				// Plain conversation context, not a tool call or a replacement for the
+				// original failure result. The explicit decision was committed by provider.
+				newUserContent.push({ type: "text", text: `Explicit recovery choice: ${recoveryChoice}.` })
+			}
 
 			const agoText = ((): string => {
 				const timestamp = lastClineMessage?.ts ?? Date.now()
@@ -2422,13 +2638,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 
 			await this.overwriteApiConversationHistory(modifiedApiConversationHistory)
+			if (!(await this.guardExecution())) return
 
 			// Task resuming from history item.
 			await this.initiateTaskLoop(newUserContent)
 		} catch (error) {
 			// Resume and cancellation can race when users issue repeated cancels.
 			// Treat intentional abort/abandon flows as expected and avoid process-level crashes.
-			if (this.abandoned === true || this.abort === true || this.abortReason === "user_cancelled") {
+			if (error instanceof ExecutionAuthorityError || this.abandoned || this.abort || this.executionBlocked) {
 				return
 			}
 			throw error
@@ -2436,65 +2653,80 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	private async resumePendingTaskAction(action: PendingTaskAction): Promise<void> {
-		const provider = this.providerRef.deref()
-		if (!provider) {
-			throw new Error(`[Task#resumePendingTaskAction] Provider unavailable for task ${this.taskId}`)
-		}
+		if (!(await this.guardExecution())) return
+		try {
+			const provider = this.providerRef.deref()
+			if (!provider) {
+				throw new Error(`[Task#resumePendingTaskAction] Provider unavailable for task ${this.taskId}`)
+			}
 
-		let { response, text, images, queuedMessageId } = await this.ask("tool", action.approvalText, false)
+			if (action.kind === "create_subtask" && !(await provider.validateTaskDelegation(this, action))) return
+			const request =
+				action.kind === "finish_subtask" ? await provider.prepareDelegatedCompletion(this, action) : undefined
+			if (action.kind === "finish_subtask" && !request) {
+				this.executionBlocked = true
+				return
+			}
+			if (!(await this.guardExecution())) return
+			const { response, text, images, queuedMessageId } = await this.ask("tool", action.approvalText, false)
+			if (!(await this.guardExecution())) return
 
-		if (response === "yesButtonClicked") {
-			if (action.kind === "create_subtask") {
-				await provider.delegateParentAndOpenChild({
-					parentTaskId: this.taskId,
-					message: action.message,
-					initialTodos: action.todos,
-					mode: action.mode,
+			if (response === "yesButtonClicked") {
+				if (action.kind === "create_subtask") {
+					await provider.delegateParentAndOpenChild({
+						origin: this,
+						parentTaskId: this.taskId,
+						message: action.message,
+						initialTodos: action.todos,
+						mode: action.mode,
+						pendingActionId: action.actionId,
+					})
+					return
+				}
+
+				const didReopen = await provider.reopenParentFromDelegation({
+					origin: this,
+					request,
+					parentTaskId: action.parentTaskId,
+					childTaskId: this.taskId,
+					completionResultSummary: action.result,
 					pendingActionId: action.actionId,
 				})
+				// Refusal never consumes intent or becomes standalone completion. Success
+				// also ends this incarnation; provider owns post-commit events/continuation.
+				this.executionBlocked = true
+				if (!didReopen) this.executionRefusalReason = "receipt_mismatch"
 				return
 			}
 
-			const didReopen = await provider.reopenParentFromDelegation({
-				parentTaskId: action.parentTaskId,
-				childTaskId: this.taskId,
-				completionResultSummary: action.result,
-				pendingActionId: action.actionId,
-			})
-			if (didReopen) {
-				return
+			if (queuedMessageId) {
+				const persisted = await this.persistQueuedFeedbackAndAcknowledge(queuedMessageId, text, images)
+				if (!persisted) {
+					throw new Error(
+						`[Task#resumePendingTaskAction] Failed to persist queued feedback ${queuedMessageId}; task loop was not resumed`,
+					)
+				}
+			} else if (text || images?.length) {
+				await this.say("user_feedback", text ?? "", images)
 			}
 
-			await this.clearPendingActionAfterDurableResult(action.actionId)
-			if (this.pendingAction) {
-				await this.resumePendingTaskAction(this.pendingAction)
+			const deniedContent = text ? formatResponse.toolDeniedWithFeedback(text) : formatResponse.toolDenied()
+			if (!(await this.guardExecution())) return
+			if (action.kind === "create_subtask") {
+				await provider.denyTaskDelegation(this, action)
 				return
 			}
-			;({ response, text, images, queuedMessageId } = await this.ask("completion_result", "", false))
-			if (response === "yesButtonClicked") {
-				return
-			}
+			await this.initiateTaskLoop([
+				{
+					type: "tool_result",
+					tool_use_id: action.actionId,
+					content: formatResponse.toolResult(deniedContent, images),
+				},
+			])
+		} catch (error) {
+			this.executionBlocked = true
+			console.error("Pending action execution stopped:", error)
 		}
-
-		if (queuedMessageId) {
-			const persisted = await this.persistQueuedFeedbackAndAcknowledge(queuedMessageId, text, images)
-			if (!persisted) {
-				throw new Error(
-					`[Task#resumePendingTaskAction] Failed to persist queued feedback ${queuedMessageId}; task loop was not resumed`,
-				)
-			}
-		} else if (text || images?.length) {
-			await this.say("user_feedback", text ?? "", images)
-		}
-
-		const deniedContent = text ? formatResponse.toolDeniedWithFeedback(text) : formatResponse.toolDenied()
-		await this.initiateTaskLoop([
-			{
-				type: "tool_result",
-				tool_use_id: action.actionId,
-				content: formatResponse.toolResult(deniedContent, images),
-			},
-		])
 	}
 
 	/**
@@ -2502,6 +2734,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * This immediately aborts the underlying stream rather than waiting for the next chunk.
 	 */
 	public cancelCurrentRequest(): void {
+		// The foreground loop can finish before its usage drain. Keep every issued
+		// request cancellable until the underlying iterator has actually closed.
+		for (const controller of this.requestControllers.values()) controller.abort()
 		if (this.currentRequestAbortController) {
 			console.log(`[Task#${this.taskId}.${this.instanceId}] Aborting current HTTP request`)
 			this.currentRequestAbortController.abort()
@@ -2526,7 +2761,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		this.abort = true
-		this.abortPromise ??= this.abortTaskOnce()
+		this.executionBlocked = true
+		this.abortPromise ??= this.abortTaskOnce().catch((error: unknown) => {
+			this.cleanupFailed = true
+			throw error
+		})
 		return this.abortPromise
 	}
 
@@ -2559,6 +2798,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// final task state is saved. Artifact deletion is drained separately.
 			await this.diffReversionPromise
 		} catch (error) {
+			this.cleanupFailed = true
 			console.error(`Error during task ${this.taskId}.${this.instanceId} disposal:`, error)
 			// Don't rethrow - we want abort to always succeed
 		}
@@ -2583,7 +2823,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			return this.disposalPromise
 		}
 
-		this.disposalPromise = this.disposeOnce()
+		this.executionBlocked = true
+		this.disposalPromise = this.disposeOnce().then(
+			() => {
+				this.disposalFinished = true
+			},
+			(error: unknown) => {
+				this.cleanupFailed = true
+				throw error
+			},
+		)
 		return this.disposalPromise
 	}
 
@@ -2606,8 +2855,18 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		try {
 			this.cancelCurrentRequest()
 		} catch (error) {
+			this.cleanupFailed = true
 			console.error("Error cancelling current request:", error)
 		}
+		for (const process of this.outstandingCommands) {
+			try {
+				process.abort()
+			} catch (error) {
+				this.cleanupFailed = true
+				console.error("Error aborting command:", error)
+			}
+		}
+		for (const stream of this.requestStreams) void this.closeRequestStream(stream)
 
 		// Dispose message queue and remove event listeners.
 		try {
@@ -2618,6 +2877,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			this.messageQueueService.dispose()
 		} catch (error) {
+			this.cleanupFailed = true
 			console.error("Error disposing message queue:", error)
 		}
 
@@ -2628,23 +2888,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			console.error("Error removing event listeners:", error)
 		}
 
-		// Release any terminals associated with this task.
-		try {
-			// Release any terminals associated with this task.
-			TerminalRegistry.releaseTerminalsForTask(this.taskId)
-		} catch (error) {
-			console.error("Error releasing terminals:", error)
-		}
-
-		// Cleanup command output artifacts
-		const pendingCleanup = getTaskDirectoryPath(this.globalStoragePath, this.taskId)
-			.then((taskDir) => {
-				const outputDir = path.join(taskDir, "command-output")
-				return OutputInterceptor.cleanup(outputDir)
-			})
-			.catch((error) => {
-				console.error("Error cleaning up command output artifacts:", error)
-			})
+		// These resources are keyed by persistent ID, unlike the instance-owned work
+		// above. An observer or replaced incarnation must not clean up a live peer.
+		const pendingCleanup = this.cleanupSharedTaskResources().catch((error: unknown) => {
+			this.cleanupFailed = true
+			console.error("Error cleaning up shared task resources:", error)
+		})
 
 		try {
 			if (this.rooIgnoreController) {
@@ -2652,6 +2901,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				this.rooIgnoreController = undefined
 			}
 		} catch (error) {
+			this.cleanupFailed = true
 			console.error("Error disposing RooIgnoreController:", error)
 			// This is the critical one for the leak fix.
 		}
@@ -2659,15 +2909,22 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		try {
 			this.fileContextTracker.dispose()
 		} catch (error) {
+			this.cleanupFailed = true
 			console.error("Error disposing file context tracker:", error)
 		}
 
 		try {
 			// If we're not streaming then `abortStream` won't be called.
-			if (this.isStreaming && this.diffViewProvider.isEditing) {
-				this.diffReversionPromise = this.diffViewProvider.revertChanges().catch(console.error)
+			if (this.diffViewProvider.isEditing) {
+				this.diffReversionPromise = this.trackExecutionWork(this.diffViewProvider.revertChanges()).catch(
+					(error: unknown) => {
+						this.cleanupFailed = true
+						console.error("Error reverting diff changes:", error)
+					},
+				)
 			}
 		} catch (error) {
+			this.cleanupFailed = true
 			console.error("Error reverting diff changes:", error)
 		}
 
@@ -2675,17 +2932,88 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		await this.diffReversionPromise
 	}
 
+	private async ownsSharedTaskResources(): Promise<boolean> {
+		const token = this.executionToken
+		if (!token || token.taskId !== this.taskId) return false
+		const store = this.providerRef.deref()?.taskHistoryStore
+		if (!store) throw new ExecutionAuthorityError("owner_unknown")
+		if (!deepEqual(token.owner, store.ownerForRuntime(this.instanceId))) return false
+		const claim = executionClaim(await store.readAuthoritative(this.taskId))
+		if (!deepEqual(claim.owner, token.owner) || claim.phase === "settled") return false
+		// Provider interruption/completion fences execution by advancing the generation
+		// before disposal, but retains this runtime's cleanup claim. Do not adopt a
+		// replacement generation: only that immediate, cleanup-pending fence is valid.
+		return (
+			claim.generation === token.generation ||
+			(claim.generation === token.generation + 1 && claim.phase === "suspended" && claim.cleanupPending)
+		)
+	}
+
+	private async cleanupSharedTaskResources(): Promise<void> {
+		if (!(await this.ownsSharedTaskResources())) return
+		const taskDir = await getTaskDirectoryPath(this.globalStoragePath, this.taskId)
+		// Path resolution can await storage configuration. Recheck the fresh claim,
+		// not a cache or requireExecution (this runtime is already blocked).
+		if (!(await this.ownsSharedTaskResources())) return
+		try {
+			TerminalRegistry.releaseTerminalsForTask(this.taskId)
+		} catch (error) {
+			this.cleanupFailed = true
+			console.error("Error releasing terminals:", error)
+		}
+		// Provider handoffs must still await disposal before transferring the claim:
+		// the legacy ID-scoped artifact API cannot fence a transfer during its I/O.
+		await OutputInterceptor.cleanup(path.join(taskDir, "command-output"))
+	}
+
+	private closeRequestStream(stream: ApiStream): Promise<void> {
+		const closing = this.closingStreams.get(stream)
+		if (closing) return closing
+		const work = (async () => {
+			try {
+				const result = await stream.return(undefined)
+				if (!result.done) {
+					this.cleanupFailed = true
+					return
+				}
+				this.requestStreams.delete(stream)
+				this.requestControllers.delete(stream)
+			} catch (error) {
+				this.cleanupFailed = true
+				console.error("Error closing request stream:", error)
+			}
+		})()
+		this.closingStreams.set(stream, work)
+		return this.trackExecutionWork(work)
+	}
+
 	// Subtasks
 	// Spawn / Wait / Complete
 
 	public async startSubtask(message: string, initialTodos: TodoItem[], mode: string) {
+		await this.requireExecution()
 		const provider = this.providerRef.deref()
 
 		if (!provider) {
 			throw new Error("Provider not available")
 		}
 
-		const child = await (provider as any).delegateParentAndOpenChild({
+		const action: PendingTaskAction = {
+			kind: "create_subtask",
+			actionId: `internal-${crypto.randomUUID()}`,
+			approvalText: JSON.stringify({ tool: "newTask", content: message }),
+			message,
+			todos: initialTodos,
+			mode,
+		}
+		await provider.setPendingTaskAction(this.taskId, action, this)
+		await this.requireExecution()
+		this.setPendingTaskAction(action)
+		if (!(await provider.validateTaskDelegation(this, action))) throw new Error("Delegation blocked")
+		await this.requireExecution()
+		const child = await provider.delegateParentAndOpenChild({
+			origin: this,
+			pendingActionId: action.actionId,
 			parentTaskId: this.taskId,
 			message,
 			initialTodos,
@@ -2700,20 +3028,18 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 *
 	 * This method:
 	 * - Clears any pending ask states
-	 * - Resets abort and streaming flags
+	 * - Resets streaming flags in a freshly authorized incarnation
 	 * - Ensures next API call includes full context
 	 * - Immediately continues task loop without user interaction
 	 */
 	public async resumeAfterDelegation(): Promise<void> {
+		if (!(await this.guardExecution())) return
 		// Clear any ask states that might have been set during history load
 		this.idleAsk = undefined
 		this.resumableAsk = undefined
 		this.interactiveAsk = undefined
 
-		// Reset abort and streaming state to ensure clean continuation
-		this.abort = false
-		this.abandoned = false
-		this.abortReason = undefined
+		// Never reverse abort/abandon on the outgoing incarnation.
 		this.didFinishAbortingStream = false
 		this.isStreaming = false
 		this.isWaitingForFirstChunk = false
@@ -2727,12 +3053,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		// Load conversation history if not already loaded
 		if (this.apiConversationHistory.length === 0) {
-			this.hydrateApiConversationHistory(await this.getSavedApiConversationHistory())
+			const history = await this.getSavedApiConversationHistory()
+			if (!(await this.guardExecution())) return
+			this.hydrateApiConversationHistory(history)
 		}
 
 		// Add environment details to the existing last user message (which contains the tool_result)
 		// This avoids creating a new user message which would cause consecutive user messages
 		const environmentDetails = await getEnvironmentDetails(this, true)
+		if (!(await this.guardExecution())) return
 		let lastUserMsgIndex = -1
 		for (let i = this.apiConversationHistory.length - 1; i >= 0; i--) {
 			if (this.apiConversationHistory[i].role === "user") {
@@ -2762,6 +3091,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		// Save the updated history
 		await this.saveApiConversationHistory()
+		if (!(await this.guardExecution())) return
 
 		// Continue task loop - pass empty array to signal no new user content needed
 		// The initiateTaskLoop will handle this by skipping user message addition
@@ -2771,19 +3101,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	// Task Loop
 
 	private async initiateTaskLoop(userContent: Anthropic.Messages.ContentBlockParam[]): Promise<void> {
+		if (!(await this.guardExecution())) return
 		// Kicks off the checkpoints initialization process in the background.
 		// `getCheckpointService` wraps its full body in a try/catch and returns
 		// `undefined` on failure (see src/core/checkpoints/index.ts), so the
 		// returned promise cannot reject. `void` is sufficient — no `.catch`
 		// arm needed.
-		void getCheckpointService(this)
+		void this.trackExecutionWork(getCheckpointService(this))
 
 		let nextUserContent = userContent
 		let includeFileDetails = true
 
 		this.emit(RooCodeEventName.TaskStarted)
 
-		while (!this.abort) {
+		while (await this.guardExecution()) {
 			const didEndLoop = await this.recursivelyMakeClineRequests(nextUserContent, includeFileDetails)
 			includeFileDetails = false // We only need file details the first time.
 
@@ -2822,6 +3153,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const stack: StackItem[] = [{ userContent, includeFileDetails, retryAttempt: 0 }]
 
 		while (stack.length > 0) {
+			if (!(await this.guardExecution())) return true
 			const currentItem = stack.pop()!
 			const currentUserContent = currentItem.userContent
 			const currentIncludeFileDetails = currentItem.includeFileDetails
@@ -2888,6 +3220,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// subsequent requests (including subtasks) still honour the
 			// provider rate-limit window.
 			await this.maybeWaitForProviderRateLimit(currentItem.retryAttempt ?? 0)
+			if (!(await this.guardExecution())) return true
 			this.rateLimitClock.recordRequest()
 
 			await this.say(
@@ -2904,6 +3237,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			const includeDiagnosticMessages = state?.includeDiagnosticMessages ?? true
 			const maxDiagnosticMessages = state?.maxDiagnosticMessages ?? 50
 			const currentMode = await this.getTaskMode()
+			if (!(await this.guardExecution())) return true
 
 			const { content: parsedUserContent, mode: slashCommandMode } = await processUserContentMentions({
 				userContent: currentUserContent,
@@ -2918,10 +3252,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			})
 
 			// Switch mode if specified in a slash command's frontmatter
+			if (!(await this.guardExecution())) return true
 			if (slashCommandMode) {
 				const provider = this.providerRef.deref()
 				if (provider) {
 					const state = await provider.getState()
+					if (!(await this.guardExecution())) return true
 					const targetMode = getModeBySlug(slashCommandMode, state?.customModes)
 					if (targetMode) {
 						await provider.handleModeSwitch(slashCommandMode)
@@ -2930,6 +3266,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 
 			const environmentDetails = await getEnvironmentDetails(this, currentIncludeFileDetails)
+			if (!(await this.guardExecution())) return true
 
 			// Remove any existing environment_details blocks before adding fresh ones.
 			// This prevents duplicate environment details when resuming tasks,
@@ -3039,7 +3376,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 				const abortStream = async (cancelReason: ClineApiReqCancelReason, streamingFailedMessage?: string) => {
 					if (this.diffViewProvider.isEditing) {
-						await this.diffViewProvider.revertChanges() // closes diff view
+						try {
+							await this.trackExecutionWork(this.diffViewProvider.revertChanges())
+						} catch (error) {
+							this.cleanupFailed = true
+							throw error
+						}
 					}
 
 					// if last message is a partial we need to update and save it
@@ -3085,9 +3427,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				this.streamingToolCallIndices.clear()
 				const nativeToolCallParserScope = NativeToolCallParser.createScope()
 
-				await this.diffViewProvider.reset()
+				await this.trackExecutionWork(this.diffViewProvider.reset())
 
 				await this.safeEnsureModelFetched()
+				if (!(await this.guardExecution())) return true
 
 				// Cache model info once per API request to avoid repeated calls during streaming
 				// This is especially important for tools and background usage collection
@@ -3109,25 +3452,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 					// Helper to race iterator.next() with abort signal
 					const nextChunkWithAbort = async () => {
+						await this.requireExecution()
 						const nextPromise = iterator.next()
 
 						// If we have an abort controller, race it with the next chunk
 						if (this.currentRequestAbortController) {
-							const abortPromise = new Promise<never>((_, reject) => {
-								const signal = this.currentRequestAbortController!.signal
-								if (signal.aborted) {
-									reject(new Error("Request cancelled by user"))
-								} else {
-									signal.addEventListener(
-										"abort",
-										() => {
-											reject(new Error("Request cancelled by user"))
-										},
-										{ once: true },
-									)
-								}
-							})
-							return await Promise.race([nextPromise, abortPromise])
+							return await this.waitForRequestChunk(
+								nextPromise,
+								this.currentRequestAbortController.signal,
+							)
 						}
 
 						// No abort controller, just return the next chunk normally
@@ -3138,6 +3471,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					while (!item.done) {
 						const chunk = item.value
 						item = await nextChunkWithAbort()
+						if (!(await this.guardExecution())) break
 						if (!chunk) {
 							// Sometimes chunk is undefined, no idea that can cause
 							// it, but this workaround seems to fix it.
@@ -3230,7 +3564,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 										}
 
 										// Store the ID for native protocol
-										;(partialToolUse as any).id = event.id
+										partialToolUse.id = event.id
 
 										// Add to content and present
 										this.assistantMessageContent.push(partialToolUse)
@@ -3250,7 +3584,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 											const toolUseIndex = this.streamingToolCallIndices.get(event.id)
 											if (toolUseIndex !== undefined) {
 												// Store the ID for native protocol
-												;(partialToolUse as any).id = event.id
+												partialToolUse.id = event.id
 
 												// Update the existing tool use with new partial data
 												this.assistantMessageContent[toolUseIndex] = partialToolUse
@@ -3317,6 +3651,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							}
 						}
 
+						if (this.executionBlocked) break
 						if (this.abort) {
 							console.log(`aborting stream, this.abandoned = ${this.abandoned}`)
 
@@ -3385,6 +3720,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							messageIndex: number = apiReqIndex,
 							status: "completed" | "cancelled" = "completed",
 						) => {
+							// Usage bookkeeping is a snapshot save, not new execution.
+							// A prepared handoff may still flush under its captured token.
+							if (this.abort || this.abandoned || this.executionBlocked || !this.executionToken) return
 							if (
 								tokens.input > 0 ||
 								tokens.output > 0 ||
@@ -3451,6 +3789,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 							// Use the same iterator that the main loop was using
 							while (!item.done) {
+								if (!(await this.guardExecution())) break
 								// Check for timeout
 								if (performance.now() - startTime > timeoutMs) {
 									console.warn(
@@ -3534,6 +3873,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						console.error("Background usage collection failed:", error)
 					})
 				} catch (error) {
+					if (!(await this.guardExecution())) return true
 					// Abandoned happens when extension is no longer waiting for the
 					// Cline instance to finish aborting (error is thrown here when
 					// any function in the for loop throws due to this.abort).
@@ -3594,6 +3934,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					this.currentRequestAbortController = undefined
 				}
 
+				if (!(await this.guardExecution())) return true
 				// Need to call here in case the stream was aborted.
 				if (this.abort || this.abandoned) {
 					throw new Error(
@@ -3628,7 +3969,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 						if (finalToolUse) {
 							// Store the tool call ID
-							;(finalToolUse as any).id = event.id
+							finalToolUse.id = event.id
 
 							// Get the index and replace partial with final
 							if (toolUseIndex !== undefined) {
@@ -3652,7 +3993,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							if (existingToolUse && existingToolUse.type === "tool_use") {
 								existingToolUse.partial = false
 								// Ensure it has the ID for native protocol
-								;(existingToolUse as any).id = event.id
+								existingToolUse.id = event.id
 							}
 
 							// Clean up tracking
@@ -3882,7 +4223,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					// 	this.userMessageContentReady = true
 					// }
 
-					await pWaitFor(() => this.userMessageContentReady || this.abort || this.abandoned)
+					// A prepared handoff may still be flushing snapshots. Do not perform
+					// execution admission while the tool owns that preparation interval.
+					await pWaitFor(
+						() => this.userMessageContentReady || this.abort || this.abandoned || this.executionBlocked,
+					)
+					if (!(await this.guardExecution())) return true
 
 					if (this.abort || this.abandoned) {
 						throw new Error(
@@ -4061,7 +4407,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	private async getSystemPrompt(): Promise<string> {
+		await this.requireExecution()
 		const { mcpEnabled } = (await this.providerRef.deref()?.getState()) ?? {}
+		await this.requireExecution()
 		let mcpHub: McpHub | undefined
 		if (mcpEnabled ?? true) {
 			const provider = this.providerRef.deref()
@@ -4072,6 +4420,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			// Wait for MCP hub initialization through McpServerManager
 			mcpHub = await McpServerManager.getInstance(provider.context, provider)
+			await this.requireExecution()
 
 			if (!mcpHub) {
 				throw new Error("Failed to get MCP hub from server manager")
@@ -4081,6 +4430,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			await pWaitFor(() => !mcpHub!.isConnecting, { timeout: 10_000 }).catch(() => {
 				console.error("MCP servers failed to connect in time")
 			})
+			await this.requireExecution()
 		}
 
 		const rooIgnoreInstructions = this.rooIgnoreController?.getInstructions()
@@ -4093,6 +4443,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const mode = await this.getTaskMode()
 		const apiConfiguration = this.apiConfiguration
 
+		await this.requireExecution()
 		return await (async () => {
 			const provider = this.providerRef.deref()
 
@@ -4145,17 +4496,21 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * than aborting the task.
 	 */
 	private async safeEnsureModelFetched(): Promise<void> {
+		await this.requireExecution()
 		try {
-			await this.api.ensureModelFetched?.()
+			const work = this.api.ensureModelFetched?.()
+			if (work) await this.trackExecutionWork(work)
 		} catch (error) {
 			console.error(
 				`[Task#${this.taskId}] Failed to fetch model metadata:`,
 				error instanceof Error ? error.message : error,
 			)
 		}
+		await this.requireExecution()
 	}
 
 	private async handleContextWindowExceededError(): Promise<void> {
+		await this.requireExecution()
 		const state = await this.providerRef.deref()?.getState()
 		const { profileThresholds = {} } = state ?? {}
 		// Use task-local values, not provider state, to prevent cross-task configuration leaks.
@@ -4228,24 +4583,29 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		try {
 			// Generate environment details to include in the condensed summary
 			const environmentDetails = await getEnvironmentDetails(this, true)
+			const systemPrompt = await this.getSystemPrompt()
+			await this.requireExecution()
 
 			// Force aggressive truncation by keeping only 75% of the conversation history
-			const truncateResult = await manageContext({
-				messages: this.apiConversationHistory,
-				totalTokens: contextTokens || 0,
-				maxTokens,
-				contextWindow,
-				apiHandler: this.api,
-				autoCondenseContext: true,
-				autoCondenseContextPercent: FORCED_CONTEXT_REDUCTION_PERCENT,
-				systemPrompt: await this.getSystemPrompt(),
-				taskId: this.taskId,
-				profileThresholds,
-				currentProfileId,
-				metadata,
-				environmentDetails,
-				useAvailableInputForContextPercent,
-			})
+			const truncateResult = await this.trackExecutionWork(
+				manageContext({
+					messages: this.apiConversationHistory,
+					totalTokens: contextTokens || 0,
+					maxTokens,
+					contextWindow,
+					apiHandler: this.api,
+					autoCondenseContext: true,
+					autoCondenseContextPercent: FORCED_CONTEXT_REDUCTION_PERCENT,
+					systemPrompt,
+					taskId: this.taskId,
+					profileThresholds,
+					currentProfileId,
+					metadata,
+					environmentDetails,
+					useAvailableInputForContextPercent,
+				}),
+			)
+			await this.requireExecution()
 
 			if (truncateResult.messages !== this.apiConversationHistory) {
 				await this.overwriteApiConversationHistory(truncateResult.messages)
@@ -4300,6 +4660,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * the `api_req_rate_limit_wait` say type (not an error).
 	 */
 	private async maybeWaitForProviderRateLimit(retryAttempt: number): Promise<void> {
+		await this.requireExecution()
 		const rateLimitSeconds = this.apiConfiguration?.rateLimitSeconds ?? 0
 
 		const lastRequestTime = this.rateLimitClock.getLastRequestTime()
@@ -4320,6 +4681,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				const delayMessage = JSON.stringify({ seconds: i })
 				await this.say("api_req_rate_limit_wait", delayMessage, undefined, true)
 				await delay(1000)
+				await this.requireExecution()
 			}
 			// Finalize the partial message so the UI doesn't keep rendering an in-progress spinner.
 			await this.say("api_req_rate_limit_wait", undefined, undefined, false)
@@ -4330,7 +4692,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		retryAttempt: number = 0,
 		options: { skipProviderRateLimit?: boolean } = {},
 	): ApiStream {
+		if (!(await this.guardExecution())) return
 		const state = await this.providerRef.deref()?.getState()
+		await this.requireExecution()
 
 		const {
 			autoApprovalEnabled,
@@ -4360,6 +4724,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this.rateLimitClock.recordRequest()
 
 		const systemPrompt = await this.getSystemPrompt()
+		await this.requireExecution()
 		const { contextTokens } = this.getTokenUsage()
 
 		if (contextTokens) {
@@ -4465,26 +4830,30 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					: undefined
 
 			try {
-				const truncateResult = await manageContext({
-					messages: this.apiConversationHistory,
-					totalTokens: contextTokens,
-					maxTokens,
-					contextWindow,
-					apiHandler: this.api,
-					autoCondenseContext,
-					autoCondenseContextPercent,
-					systemPrompt,
-					taskId: this.taskId,
-					customCondensingPrompt,
-					profileThresholds,
-					currentProfileId,
-					metadata: contextMgmtMetadata,
-					environmentDetails: contextMgmtEnvironmentDetails,
-					filesReadByRoo: contextMgmtFilesReadByRoo,
-					cwd: this.cwd,
-					rooIgnoreController: this.rooIgnoreController,
-					useAvailableInputForContextPercent,
-				})
+				await this.requireExecution()
+				const truncateResult = await this.trackExecutionWork(
+					manageContext({
+						messages: this.apiConversationHistory,
+						totalTokens: contextTokens,
+						maxTokens,
+						contextWindow,
+						apiHandler: this.api,
+						autoCondenseContext,
+						autoCondenseContextPercent,
+						systemPrompt,
+						taskId: this.taskId,
+						customCondensingPrompt,
+						profileThresholds,
+						currentProfileId,
+						metadata: contextMgmtMetadata,
+						environmentDetails: contextMgmtEnvironmentDetails,
+						filesReadByRoo: contextMgmtFilesReadByRoo,
+						cwd: this.cwd,
+						rooIgnoreController: this.rooIgnoreController,
+						useAvailableInputForContextPercent,
+					}),
+				)
+				await this.requireExecution()
 				if (truncateResult.messages !== this.apiConversationHistory) {
 					await this.overwriteApiConversationHistory(truncateResult.messages)
 				}
@@ -4559,6 +4928,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			this.combineMessages(this.clineMessages.slice(1)),
 			async (type, data) => this.ask(type, data),
 		)
+		await this.requireExecution()
 
 		if (!approvalResult.shouldProceed) {
 			// User did not approve, task should be aborted
@@ -4604,10 +4974,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		const shouldIncludeTools = allTools.length > 0
+		await this.requireExecution()
 
 		// Create an AbortController to allow cancelling the request mid-stream
-		this.currentRequestAbortController = new AbortController()
-		const abortSignal = this.currentRequestAbortController.signal
+		const requestController = new AbortController()
+		this.currentRequestAbortController = requestController
+		const abortSignal = requestController.signal
 
 		const metadata: ApiHandlerCreateMessageMetadata = {
 			mode: mode,
@@ -4636,6 +5008,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			metadata,
 		)
 		const iterator = stream[Symbol.asyncIterator]()
+		this.requestStreams.add(stream)
+		this.requestControllers.set(stream, requestController)
 
 		// Set up abort handling - when the signal is aborted, clean up the controller reference
 		abortSignal.addEventListener(
@@ -4648,102 +5022,119 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		)
 
 		try {
-			// Awaiting first chunk to see if it will throw an error.
-			this.isWaitingForFirstChunk = true
+			try {
+				// Awaiting first chunk to see if it will throw an error.
+				this.isWaitingForFirstChunk = true
 
-			// Race between the first chunk and the abort signal
-			const firstChunkPromise = iterator.next()
-			const abortPromise = new Promise<never>((_, reject) => {
-				if (abortSignal.aborted) {
-					reject(new Error("Request cancelled by user"))
+				// Race between the first chunk and the abort signal
+				await this.requireExecution()
+				const firstChunkPromise = this.trackExecutionWork(iterator.next())
+				const firstChunk = await this.waitForRequestChunk(firstChunkPromise, abortSignal)
+				await this.requireExecution()
+				if (firstChunk.done) return
+				yield firstChunk.value
+				this.isWaitingForFirstChunk = false
+			} catch (error) {
+				this.isWaitingForFirstChunk = false
+				if (!(await this.guardExecution())) return
+				await this.closeRequestStream(stream)
+				const isContextWindowExceededError = checkContextWindowExceededError(error)
+
+				if (!isContextWindowExceededError) {
+					this.currentRequestAbortController = undefined
+				}
+
+				// If it's a context window error and we haven't exceeded max retries for this error type
+				if (isContextWindowExceededError && retryAttempt < MAX_CONTEXT_WINDOW_RETRIES) {
+					console.warn(
+						`[Task#${this.taskId}] Context window exceeded for model ${this.api.getModel().id}. ` +
+							`Retry attempt ${retryAttempt + 1}/${MAX_CONTEXT_WINDOW_RETRIES}. ` +
+							`Attempting automatic truncation...`,
+					)
+					await this.handleContextWindowExceededError()
+					// Retry the request after handling the context window error
+					yield* this.attemptApiRequest(retryAttempt + 1)
+					return
+				}
+
+				// note that this api_req_failed ask is unique in that we only present this option if the api hasn't streamed any content yet (ie it fails on the first chunk due), as it would allow them to hit a retry button. However if the api failed mid-stream, it could be in any arbitrary state where some tools may have executed, so that error is handled differently and requires cancelling the task entirely.
+				if (autoApprovalEnabled) {
+					// Apply shared exponential backoff and countdown UX
+					await this.backoffAndAnnounce(retryAttempt, error)
+
+					// CRITICAL: Check if task was aborted during the backoff countdown
+					// This prevents infinite loops when users cancel during auto-retry
+					// Without this check, the recursive call below would continue even after abort
+					if (this.abort) {
+						throw new Error(
+							`[Task#attemptApiRequest] task ${this.taskId}.${this.instanceId} aborted during retry`,
+						)
+					}
+
+					// Delegate generator output from the recursive call with
+					// incremented retry count.
+					yield* this.attemptApiRequest(retryAttempt + 1)
+
+					return
 				} else {
-					abortSignal.addEventListener(
-						"abort",
-						() => {
-							reject(new Error("Request cancelled by user"))
-						},
-						{ once: true },
+					const { response } = await this.ask(
+						"api_req_failed",
+						error.message ?? JSON.stringify(serializeError(error), null, 2),
 					)
-				}
-			})
 
-			const firstChunk = await Promise.race([firstChunkPromise, abortPromise])
-			yield firstChunk.value
+					if (response !== "yesButtonClicked") {
+						// This will never happen since if noButtonClicked, we will
+						// clear current task, aborting this instance.
+						throw new Error("API request failed")
+					}
+
+					await this.say("api_req_retried")
+
+					// Delegate generator output from the recursive call.
+					yield* this.attemptApiRequest()
+					return
+				}
+			}
+
+			// No error, so we can continue to yield all remaining chunks.
+			// (Needs to be placed outside of try/catch since it we want caller to
+			// handle errors not with api_req_failed as that is reserved for first
+			// chunk failures only.)
+			// This delegates to another generator or iterable object. In this case,
+			// it's saying "yield all remaining values from this iterator". This
+			// effectively passes along all subsequent chunks from the original
+			// stream.
+			while (await this.guardExecution()) {
+				const chunk = await this.waitForRequestChunk(this.trackExecutionWork(iterator.next()), abortSignal)
+				if (!(await this.guardExecution()) || chunk.done) return
+				yield chunk.value
+			}
+		} finally {
 			this.isWaitingForFirstChunk = false
-		} catch (error) {
-			this.isWaitingForFirstChunk = false
-			const isContextWindowExceededError = checkContextWindowExceededError(error)
-
-			if (!isContextWindowExceededError) {
-				this.currentRequestAbortController = undefined
-			}
-
-			// If it's a context window error and we haven't exceeded max retries for this error type
-			if (isContextWindowExceededError && retryAttempt < MAX_CONTEXT_WINDOW_RETRIES) {
-				console.warn(
-					`[Task#${this.taskId}] Context window exceeded for model ${this.api.getModel().id}. ` +
-						`Retry attempt ${retryAttempt + 1}/${MAX_CONTEXT_WINDOW_RETRIES}. ` +
-						`Attempting automatic truncation...`,
-				)
-				await this.handleContextWindowExceededError()
-				// Retry the request after handling the context window error
-				yield* this.attemptApiRequest(retryAttempt + 1)
-				return
-			}
-
-			// note that this api_req_failed ask is unique in that we only present this option if the api hasn't streamed any content yet (ie it fails on the first chunk due), as it would allow them to hit a retry button. However if the api failed mid-stream, it could be in any arbitrary state where some tools may have executed, so that error is handled differently and requires cancelling the task entirely.
-			if (autoApprovalEnabled) {
-				// Apply shared exponential backoff and countdown UX
-				await this.backoffAndAnnounce(retryAttempt, error)
-
-				// CRITICAL: Check if task was aborted during the backoff countdown
-				// This prevents infinite loops when users cancel during auto-retry
-				// Without this check, the recursive call below would continue even after abort
-				if (this.abort) {
-					throw new Error(
-						`[Task#attemptApiRequest] task ${this.taskId}.${this.instanceId} aborted during retry`,
-					)
-				}
-
-				// Delegate generator output from the recursive call with
-				// incremented retry count.
-				yield* this.attemptApiRequest(retryAttempt + 1)
-
-				return
-			} else {
-				const { response } = await this.ask(
-					"api_req_failed",
-					error.message ?? JSON.stringify(serializeError(error), null, 2),
-				)
-
-				if (response !== "yesButtonClicked") {
-					// This will never happen since if noButtonClicked, we will
-					// clear current task, aborting this instance.
-					throw new Error("API request failed")
-				}
-
-				await this.say("api_req_retried")
-
-				// Delegate generator output from the recursive call.
-				yield* this.attemptApiRequest()
-				return
-			}
+			// Do not await a hung transport here: retain tracked cleanup ownership
+			// until the actual iterator and any outstanding next() have settled.
+			void this.closeRequestStream(stream)
 		}
+	}
 
-		// No error, so we can continue to yield all remaining chunks.
-		// (Needs to be placed outside of try/catch since it we want caller to
-		// handle errors not with api_req_failed as that is reserved for first
-		// chunk failures only.)
-		// This delegates to another generator or iterable object. In this case,
-		// it's saying "yield all remaining values from this iterator". This
-		// effectively passes along all subsequent chunks from the original
-		// stream.
-		yield* iterator
+	private async waitForRequestChunk<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+		let onAbort: () => void = () => {}
+		const cancelled = new Promise<never>((_, reject) => {
+			onAbort = () => reject(new ExecutionAuthorityError("not_active"))
+			if (signal.aborted) onAbort()
+			else signal.addEventListener("abort", onAbort, { once: true })
+		})
+		try {
+			return await Promise.race([work, cancelled])
+		} finally {
+			signal.removeEventListener("abort", onAbort)
+		}
 	}
 
 	// Shared exponential backoff for retries (first-chunk and mid-stream)
 	private async backoffAndAnnounce(retryAttempt: number, error: any): Promise<void> {
 		try {
+			await this.requireExecution()
 			const state = await this.providerRef.deref()?.getState()
 			const baseDelay = state?.requestDelaySeconds || 5
 
@@ -4795,6 +5186,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			// Show countdown timer with exponential backoff
 			for (let i = finalDelay; i > 0; i--) {
+				await this.requireExecution()
 				// Check abort flag during countdown to allow early exit
 				if (this.abort) {
 					throw new Error(`[Task#${this.taskId}] Aborted during retry countdown`)
@@ -4819,7 +5211,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	// Checkpoints
 
 	public async checkpointSave(force: boolean = false, suppressMessage: boolean = false) {
-		return checkpointSave(this, force, suppressMessage)
+		await this.requireExecution()
+		const result = await this.trackExecutionWork(checkpointSave(this, force, suppressMessage))
+		await this.requireExecution()
+		return result
 	}
 
 	private buildCleanConversationHistory(

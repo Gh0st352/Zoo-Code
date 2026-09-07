@@ -351,6 +351,9 @@ export class UseMcpToolTool extends BaseTool<"use_mcp_tool"> {
 			toolName,
 		})
 
+		// Request/status publication can yield after approval; revalidate before
+		// issuing an external MCP effect, not only when consuming its result.
+		await task.requireExecution()
 		const toolResult = await task.providerRef.deref()?.getMcpHub()?.callTool(serverName, toolName, parsedArguments)
 
 		let toolResultPretty = "(No response)"

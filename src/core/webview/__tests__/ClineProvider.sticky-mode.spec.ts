@@ -4,9 +4,10 @@ import * as vscode from "vscode"
 import { TelemetryService } from "@roo-code/telemetry"
 import { ClineProvider } from "../ClineProvider"
 import { ContextProxy } from "../../config/ContextProxy"
-import { Task } from "../../task/Task"
+import { Task, type TaskOptions } from "../../task/Task"
 import type { HistoryItem, ProviderName } from "@roo-code/types"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
+import { claimWebviewHistory, installWebviewHistoryFiles } from "../../../__tests__/helpers/webview-fixtures"
 
 vi.mock("vscode", () => ({
 	ExtensionContext: vi.fn(),
@@ -61,9 +62,14 @@ vi.mock("vscode", () => ({
 let taskIdCounter = 0
 
 vi.mock("../../task/Task", () => ({
-	Task: vi.fn().mockImplementation(function (options) {
+	Task: vi.fn().mockImplementation(function (options: TaskOptions) {
 		return {
-			taskId: options.taskId || `test-task-id-${++taskIdCounter}`,
+			taskId: options.historyItem?.id ?? options.taskId ?? `test-task-id-${++taskIdCounter}`,
+			instanceId: options.executionToken?.owner.runtimeId,
+			executionToken: options.executionToken,
+			hydrateForRecovery: vi.fn().mockResolvedValue(undefined),
+			dispose: vi.fn().mockResolvedValue(undefined),
+			awaitExecutionCleanup: vi.fn().mockResolvedValue(true),
 			saveClineMessages: vi.fn(),
 			clineMessages: [],
 			apiConversationHistory: [],
@@ -85,6 +91,7 @@ vi.mock("../../task/Task", () => ({
 vi.mock("../../prompts/sections/custom-instructions")
 
 vi.mock("../../../utils/safeWriteJson")
+vi.mock("proper-lockfile", () => ({ lock: vi.fn(async () => async () => {}) }))
 
 vi.mock("../../../api", () => ({
 	buildApiHandler: vi.fn().mockReturnValue({
@@ -168,6 +175,7 @@ vi.mock("p-wait-for", () => ({
 }))
 
 vi.mock("fs/promises", () => ({
+	realpath: vi.fn(async (value: string) => value),
 	mkdir: vi.fn().mockResolvedValue(undefined),
 	writeFile: vi.fn().mockResolvedValue(undefined),
 	readFile: vi.fn().mockResolvedValue(""),
@@ -214,6 +222,7 @@ describe("ClineProvider - Sticky Mode", () => {
 
 	beforeEach(async () => {
 		vi.clearAllMocks()
+		installWebviewHistoryFiles()
 
 		if (!TelemetryService.hasInstance()) {
 			TelemetryService.createInstance([])
@@ -476,7 +485,7 @@ describe("ClineProvider - Sticky Mode", () => {
 			const updateGlobalStateSpy = vi.spyOn(provider as any, "updateGlobalState").mockResolvedValue(undefined)
 
 			// Initialize task with history item
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			// Verify mode was restored via updateGlobalState
 			expect(updateGlobalStateSpy).toHaveBeenCalledWith("mode", "architect")
@@ -518,7 +527,7 @@ describe("ClineProvider - Sticky Mode", () => {
 			const handleModeSwitchSpy = vi.spyOn(provider, "handleModeSwitch").mockResolvedValue()
 
 			// Initialize task with history item
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			// Verify mode was not changed (should use current mode)
 			expect(handleModeSwitchSpy).not.toHaveBeenCalled()
@@ -687,7 +696,7 @@ describe("ClineProvider - Sticky Mode", () => {
 			expect(mockContext.globalState.update).toHaveBeenCalledWith("mode", "architect")
 		})
 
-		it("should handle null/undefined mode gracefully", async () => {
+		it("rejects null mode in authoritative history and accepts an absent mode", async () => {
 			await provider.resolveWebviewView(mockWebviewView)
 
 			// Create a history item with null mode
@@ -716,8 +725,14 @@ describe("ClineProvider - Sticky Mode", () => {
 			// Mock handleModeSwitch to track calls
 			const handleModeSwitchSpy = vi.spyOn(provider, "handleModeSwitch").mockResolvedValue()
 
-			// Initialize task with history item - should not throw
-			await expect(provider.createTaskWithHistoryItem(historyItem)).resolves.not.toThrow()
+			const files = installWebviewHistoryFiles()
+			files.seedHistory(mockContext.globalStorageUri.fsPath, historyItem)
+			await expect(provider.createTaskWithHistoryItem(historyItem)).rejects.toMatchObject({ kind: "invalid" })
+			expect(provider.getCurrentTask()).toBeUndefined()
+			const validHistory = { ...historyItem, id: "absent-mode", mode: undefined }
+			await expect(
+				provider.createTaskWithHistoryItem(validHistory, await claimWebviewHistory(provider, validHistory)),
+			).resolves.toBeDefined()
 
 			// Verify mode switch was not called with null
 			expect(handleModeSwitchSpy).not.toHaveBeenCalledWith(null)
@@ -758,7 +773,7 @@ describe("ClineProvider - Sticky Mode", () => {
 			}
 
 			// Restore the task from history
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			// Verify that the mode was restored
 			const state = await provider.getState()
@@ -803,7 +818,9 @@ describe("ClineProvider - Sticky Mode", () => {
 			const handleModeSwitchSpy = vi.spyOn(provider, "handleModeSwitch").mockResolvedValue()
 
 			// Initialize task with history item - should not throw
-			await expect(provider.createTaskWithHistoryItem(historyItem)).resolves.not.toThrow()
+			await expect(
+				provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem)),
+			).resolves.not.toThrow()
 
 			// Verify mode switch was not called with deleted mode
 			expect(handleModeSwitchSpy).not.toHaveBeenCalledWith("deleted-mode")
@@ -1210,7 +1227,10 @@ describe("ClineProvider - Sticky Mode", () => {
 			vi.clearAllMocks()
 
 			// Start initialization
-			const initPromise = provider.createTaskWithHistoryItem(historyItem)
+			const initPromise = provider.createTaskWithHistoryItem(
+				historyItem,
+				await claimWebviewHistory(provider, historyItem),
+			)
 
 			// Try to switch mode during initialization
 			await provider.handleModeSwitch("code")

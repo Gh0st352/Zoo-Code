@@ -1,88 +1,110 @@
-import type { HistoryItem, PendingTaskAction } from "@roo-code/types"
+import * as fs from "fs/promises"
+import * as os from "os"
+import * as path from "path"
+import type { PendingTaskAction } from "@roo-code/types"
 
 import { ClineProvider } from "../ClineProvider"
+import { TaskHistoryStore } from "../../task-persistence/TaskHistoryStore"
+import { createCompletionTask } from "../../../__tests__/helpers/completion-fixtures"
 
 const pendingAction: PendingTaskAction = {
 	kind: "create_subtask",
 	actionId: "action-1",
 	approvalText: "{}",
-	mode: "ask",
-	message: "Child",
+	mode: "code",
+	message: "Child task",
 	todos: [],
 }
 
-function makeProvider(historyItem: HistoryItem) {
-	let current = historyItem
-	const atomicReadAndUpdate = vi.fn(async (_taskId: string, updater: (item: HistoryItem) => HistoryItem) => {
-		current = updater(current)
-		return [current]
-	})
-	const provider = {
-		taskHistoryStore: { atomicReadAndUpdate },
-		recentTasksCache: ["cached"],
-	} as unknown as ClineProvider
-	return { provider, atomicReadAndUpdate, current: () => current }
-}
-
-const historyItem = {
-	id: "task-1",
-	number: 1,
-	ts: 1,
-	task: "Task",
-	tokensIn: 0,
-	tokensOut: 0,
-	totalCost: 0,
-} satisfies HistoryItem
-
 describe("ClineProvider pending task actions", () => {
+	let directory: string
+	let store: TaskHistoryStore
+	let provider: ClineProvider
+	let task: ReturnType<typeof createCompletionTask>
+
+	beforeEach(async () => {
+		directory = await fs.mkdtemp(path.join(os.tmpdir(), "zoo-pending-action-"))
+		store = new TaskHistoryStore(directory)
+		await store.initialize()
+		const claim = await store.claimNewTask(
+			{ id: "task-1", number: 1, ts: 1, task: "Task", tokensIn: 0, tokensOut: 0, totalCost: 0 },
+			store.ownerForRuntime("runtime-1"),
+		)
+		if (claim.kind !== "applied") throw new Error(claim.reason)
+		const token = Object.freeze({ ...claim.token, owner: Object.freeze({ ...claim.token.owner }) })
+		provider = Object.assign(Object.create(ClineProvider.prototype) as ClineProvider, {
+			taskHistoryStore: store,
+			ownedExecutions: new Map(),
+			delegationEpoch: 0,
+			recentTasksCache: [],
+			getCurrentTask: () => task,
+		})
+		task = createCompletionTask(provider, {
+			taskId: token.taskId,
+			instanceId: token.owner.runtimeId,
+			executionToken: token,
+			executionGeneration: token.generation,
+			guardExecution: async () => {
+				if (task.abort || task.executionBlocked || task.executionToken !== token) return false
+				const allowed = (await store.guardExecution(token)).kind === "allowed"
+				if (!allowed) task.executionBlocked = true
+				return allowed
+			},
+		})
+		provider["rememberExecution"](token, task)
+	})
+
+	afterEach(async () => {
+		store.dispose()
+		vi.restoreAllMocks()
+		await fs.rm(directory, { recursive: true, force: true })
+	})
+
 	it("sets a pending action atomically and invalidates the recent-task cache", async () => {
-		const { provider, atomicReadAndUpdate, current } = makeProvider(historyItem)
-
-		await ClineProvider.prototype.setPendingTaskAction.call(provider, "task-1", pendingAction)
-
-		expect(atomicReadAndUpdate).toHaveBeenCalledWith("task-1", expect.any(Function))
-		expect(current().pendingAction).toEqual(pendingAction)
-		expect((provider as unknown as { recentTasksCache?: string[] }).recentTasksCache).toBeUndefined()
+		const command = vi.spyOn(store, "lifecycleCommand")
+		await expect(provider.setPendingTaskAction(task.taskId, pendingAction)).rejects.toMatchObject({
+			reason: "owner_mismatch",
+		})
+		expect(command).not.toHaveBeenCalled()
+		await provider.setPendingTaskAction(task.taskId, pendingAction, task)
+		expect(command).toHaveBeenCalledExactlyOnceWith(
+			task.taskId,
+			expect.any(Function),
+			[],
+			false,
+			task.executionToken,
+			expect.any(Function),
+		)
+		expect((await store.readAuthoritative(task.taskId)).pendingAction).toEqual(pendingAction)
+		expect(provider["recentTasksCache"]).toBeUndefined()
 	})
 
 	it("clears only the matching action", async () => {
-		const matching = makeProvider({ ...historyItem, pendingAction })
-
-		await expect(
-			ClineProvider.prototype.clearPendingTaskAction.call(matching.provider, "task-1", "action-1"),
-		).resolves.toBe(true)
-		expect(matching.current().pendingAction).toBeUndefined()
-
-		const stale = makeProvider({ ...historyItem, pendingAction })
-		await expect(
-			ClineProvider.prototype.clearPendingTaskAction.call(stale.provider, "task-1", "stale-action"),
-		).resolves.toBe(false)
-		expect(stale.current().pendingAction).toEqual(pendingAction)
+		await provider.setPendingTaskAction(task.taskId, pendingAction, task)
+		await expect(provider.clearPendingTaskAction(task.taskId, "stale-action", task)).resolves.toBe(false)
+		expect((await store.readAuthoritative(task.taskId)).pendingAction).toEqual(pendingAction)
+		await expect(provider.clearPendingTaskAction(task.taskId, pendingAction.actionId, task)).resolves.toBe(true)
+		expect((await store.readAuthoritative(task.taskId)).pendingAction).toBeUndefined()
 	})
 
 	it("returns false when the task was deleted before clear", async () => {
-		const provider = {
-			taskHistoryStore: {
-				atomicReadAndUpdate: vi
-					.fn()
-					.mockRejectedValue(
-						new Error("[TaskHistoryStore] atomicReadAndUpdate: task task-1 not found in cache"),
-					),
-			},
-		} as unknown as ClineProvider
-
-		await expect(ClineProvider.prototype.clearPendingTaskAction.call(provider, "task-1", "action-1")).resolves.toBe(
-			false,
-		)
+		await provider.setPendingTaskAction(task.taskId, pendingAction, task)
+		// This task double has no external work; attest its cleanup before deletion.
+		expect(await store.settleTaskExecution(task.executionToken!, true)).toMatchObject({ kind: "applied" })
+		await store.delete(task.taskId)
+		const command = vi.spyOn(store, "lifecycleCommand")
+		await expect(provider.clearPendingTaskAction(task.taskId, pendingAction.actionId, task)).resolves.toBe(false)
+		expect(command).not.toHaveBeenCalled()
+		expect(task.executionBlocked).toBe(true)
 	})
 
 	it("propagates unrelated store failures", async () => {
-		const provider = {
-			taskHistoryStore: { atomicReadAndUpdate: vi.fn().mockRejectedValue(new Error("disk unavailable")) },
-		} as unknown as ClineProvider
-
-		await expect(
-			ClineProvider.prototype.clearPendingTaskAction.call(provider, "task-1", "action-1"),
-		).rejects.toThrow("disk unavailable")
+		await provider.setPendingTaskAction(task.taskId, pendingAction, task)
+		const before = await store.readAuthoritative(task.taskId)
+		vi.spyOn(store, "lifecycleCommand").mockRejectedValueOnce(new Error("disk unavailable"))
+		await expect(provider.clearPendingTaskAction(task.taskId, pendingAction.actionId, task)).rejects.toThrow(
+			"disk unavailable",
+		)
+		expect(await store.readAuthoritative(task.taskId)).toEqual(before)
 	})
 })

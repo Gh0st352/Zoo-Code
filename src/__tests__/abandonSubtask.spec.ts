@@ -1,327 +1,169 @@
-// npx vitest run __tests__/abandonSubtask.spec.ts
+import type { ExecutionCommandResult, HistoryItem } from "@roo-code/types"
 
-import { describe, it, expect, vi, beforeEach } from "vitest"
-import type { HistoryItem } from "@roo-code/types"
+import { Task } from "../core/task/Task"
+import { executionClaim, executionToken } from "../core/task-persistence/taskLifecycle"
+import { safeWriteJson } from "../utils/safeWriteJson"
+import { claimTaskOptions, createTaskProvider, installTaskHistoryFiles } from "./helpers/task-fixtures"
 
-import { ClineProvider } from "../core/webview/ClineProvider"
-import { makeProviderStub } from "./helpers/provider-stub"
+vi.mock("fs/promises", async (importOriginal) => ({
+	...(await importOriginal<typeof import("fs/promises")>()),
+	realpath: vi.fn(async (value: string) => value),
+	readdir: vi.fn().mockResolvedValue([]),
+	mkdir: vi.fn().mockResolvedValue(undefined),
+	readFile: vi.fn(),
+	unlink: vi.fn(),
+}))
+vi.mock("../utils/safeWriteJson", () => ({ LOCK_STALE_MS: 31_000, safeWriteJson: vi.fn() }))
+vi.mock("proper-lockfile", () => ({ lock: vi.fn(async () => async () => {}) }))
 
-/**
- * Minimal taskHistoryStore stub whose atomicUpdatePair calls both updaters
- * against an in-memory item map and resolves, simulating the happy-path atomic write.
- */
-function makeTaskHistoryStoreStub(childItem: Record<string, any>, parentItem: Record<string, any>) {
-	const itemMap = new Map<string, Partial<HistoryItem>>([
-		[childItem.id!, childItem],
-		[parentItem.id!, parentItem],
-	])
-
-	const atomicUpdatePair = vi.fn(
-		async (
-			firstId: string,
-			secondId: string,
-			firstUpdater: (h: HistoryItem) => HistoryItem,
-			secondUpdater: (h: HistoryItem) => HistoryItem,
-		) => {
-			itemMap.set(firstId, firstUpdater(itemMap.get(firstId) as HistoryItem))
-			itemMap.set(secondId, secondUpdater(itemMap.get(secondId) as HistoryItem))
-			return []
-		},
-	)
-
-	return {
-		atomicUpdatePair,
-		get: vi.fn((id: string) => itemMap.get(id)),
-	}
+function applied(result: ExecutionCommandResult) {
+	if (result.kind !== "applied") throw new Error(result.reason)
+	return result
 }
 
 describe("ClineProvider.abandonSubtask()", () => {
-	beforeEach(() => {
-		vi.clearAllMocks()
+	const storage = "/test/abandonment"
+	let provider: ReturnType<typeof createTaskProvider>
+	let files: ReturnType<typeof installTaskHistoryFiles>
+	let parent: HistoryItem
+	let child: HistoryItem
+	let interruptedChild: HistoryItem
+
+	beforeEach(async () => {
+		files = installTaskHistoryFiles()
+		provider = createTaskProvider(storage)
+		const parentOptions = await claimTaskOptions({
+			provider,
+			apiConfiguration: {},
+			taskId: "parent-1",
+			task: "Parent",
+		})
+		// Only the parent's identity is needed to prepare the real store handoff.
+		const parentTask = Object.assign(Object.create(Task.prototype) as Task, {
+			taskId: "parent-1",
+			executionToken: parentOptions.executionToken,
+		})
+		const childOptions = await claimTaskOptions({
+			provider,
+			apiConfiguration: {},
+			taskId: "child-1",
+			task: "Child",
+			parentTask,
+		})
+		parent = await provider.taskHistoryStore.readAuthoritative("parent-1")
+		const interrupted = applied(await provider.taskHistoryStore.interruptTask(childOptions.executionToken!))
+		interruptedChild = interrupted.history
+		child = applied(await provider.taskHistoryStore.settleTaskExecution(interrupted.token, true)).history
+		provider["rememberExecution"](executionToken(child))
+		vi.mocked(safeWriteJson).mockClear()
 	})
 
-	it("severs the link: parent → active (awaitingChildId/delegatedToId cleared), child loses parentTaskId/rootTaskId", async () => {
-		const childHistoryItem = {
-			id: "child-1",
-			status: "interrupted",
-			parentTaskId: "parent-1",
-			rootTaskId: "parent-1",
-			ts: Date.now(),
-			task: "Child task",
-			tokensIn: 0,
-			tokensOut: 0,
-			totalCost: 0,
-		}
-		const parentHistoryItem = {
-			id: "parent-1",
-			status: "delegated",
-			awaitingChildId: "child-1",
-			delegatedToId: "child-1",
-			childIds: ["child-1"],
-			ts: Date.now(),
-			task: "Parent task",
-			tokensIn: 0,
-			tokensOut: 0,
-			totalCost: 0,
-		}
-
-		const getTaskWithId = vi.fn().mockImplementation(async (id: string) => {
-			if (id === "child-1") return { historyItem: childHistoryItem }
-			if (id === "parent-1") return { historyItem: parentHistoryItem }
-			throw new Error("Task not found")
-		})
-
-		const taskHistoryStore = makeTaskHistoryStoreStub(childHistoryItem, parentHistoryItem)
-
-		const provider = makeProviderStub({
-			getTaskWithId,
-			getCurrentTask: vi.fn(() => undefined),
-			taskHistoryStore,
-			isViewLaunched: true,
-			postMessageToWebview: vi.fn().mockResolvedValue(undefined),
-		} as any)
-
-		const result = await (ClineProvider.prototype as any).abandonSubtask.call(provider, "child-1")
-
-		expect(result).toBe(true)
-		expect(taskHistoryStore.atomicUpdatePair).toHaveBeenCalledTimes(1)
-		const [firstId, secondId] = taskHistoryStore.atomicUpdatePair.mock.calls[0]
-		expect(firstId).toBe("child-1")
-		expect(secondId).toBe("parent-1")
-
-		const updatedChild = taskHistoryStore.get("child-1")
-		expect(updatedChild).toEqual(
-			expect.objectContaining({
-				id: "child-1",
-				status: "interrupted",
-				parentTaskId: undefined,
-				rootTaskId: undefined,
-			}),
-		)
-
-		const updatedParent = taskHistoryStore.get("parent-1")
-		expect(updatedParent).toEqual(
-			expect.objectContaining({
-				id: "parent-1",
-				status: "active",
-				awaitingChildId: undefined,
-				delegatedToId: undefined,
-			}),
-		)
-
-		// Guarded against a stale in-flight completion reattaching the child.
-		expect((provider as any).cancelledDelegationChildIds.has("child-1")).toBe(true)
-
-		// Both updated items broadcast to the webview with the actual severed-link field values,
-		// not just matching IDs — a stale/pre-abandon payload would still match an id-only assertion.
-		expect(provider.postMessageToWebview).toHaveBeenCalledWith({
-			type: "taskHistoryItemUpdated",
-			taskHistoryItem: expect.objectContaining({
-				id: "child-1",
-				status: "interrupted",
-				parentTaskId: undefined,
-				rootTaskId: undefined,
-			}),
-		})
-		expect(provider.postMessageToWebview).toHaveBeenCalledWith({
-			type: "taskHistoryItemUpdated",
-			taskHistoryItem: expect.objectContaining({
-				id: "parent-1",
-				status: "active",
-				awaitingChildId: undefined,
-				delegatedToId: undefined,
-			}),
-		})
+	afterEach(() => {
+		provider.taskHistoryStore.dispose()
+		files.restore()
+		vi.restoreAllMocks()
 	})
 
-	it("closes the live child instance before severing the link, so a later save cannot reattach it", async () => {
-		// An interrupted child is commonly still the live/open task (cancelTask rehydrates it
-		// onto the stack). If abandon doesn't close it first, Task#saveClineMessages() would
-		// rebuild parentTaskId/rootTaskId from the live task's readonly fields on its next save
-		// and silently reattach the child. removeClineFromStack() must run before atomicUpdatePair.
-		const childHistoryItem = {
-			id: "child-1",
-			status: "interrupted",
-			parentTaskId: "parent-1",
-			rootTaskId: "parent-1",
-			ts: Date.now(),
-			task: "Child task",
-			tokensIn: 0,
-			tokensOut: 0,
-			totalCost: 0,
-		}
-		const parentHistoryItem = {
-			id: "parent-1",
-			status: "delegated",
-			awaitingChildId: "child-1",
-			delegatedToId: "child-1",
-			childIds: ["child-1"],
-			ts: Date.now(),
-			task: "Parent task",
-			tokensIn: 0,
-			tokensOut: 0,
-			totalCost: 0,
-		}
-
-		const getTaskWithId = vi.fn().mockImplementation(async (id: string) => {
-			if (id === "child-1") return { historyItem: childHistoryItem }
-			if (id === "parent-1") return { historyItem: parentHistoryItem }
-			throw new Error("Task not found")
-		})
-
-		const taskHistoryStore = makeTaskHistoryStoreStub(childHistoryItem, parentHistoryItem)
-		const removeClineFromStack = vi.fn().mockResolvedValue(undefined)
-
-		const provider = makeProviderStub({
-			getTaskWithId,
-			getCurrentTask: vi.fn(() => ({ taskId: "child-1" })),
-			removeClineFromStack,
-			taskHistoryStore,
-			isViewLaunched: false,
-		} as any)
-
-		const result = await (ClineProvider.prototype as any).abandonSubtask.call(provider, "child-1")
-
-		expect(result).toBe(true)
-		expect(removeClineFromStack).toHaveBeenCalledWith()
-		// The live child must be closed before the persisted link is severed.
-		const closeCallOrder = removeClineFromStack.mock.invocationCallOrder[0]
-		const atomicCallOrder = taskHistoryStore.atomicUpdatePair.mock.invocationCallOrder[0]
-		expect(closeCallOrder).toBeLessThan(atomicCallOrder)
+	it("severs both links, broadcasts durable records, and leaves the parent nonexecuting", async () => {
+		const store = provider.taskHistoryStore
+		const staleChild = executionToken(child)
+		expect(await provider.abandonSubtask(child.id)).toBe(true)
+		const updatedParent = await store.readAuthoritative(parent.id)
+		const updatedChild = await store.readAuthoritative(child.id)
+		expect(updatedParent).toMatchObject({ status: "active", childIds: [child.id] })
+		expect(updatedParent.awaitingChildId).toBeUndefined()
+		expect(updatedParent.delegatedToId).toBeUndefined()
+		expect(updatedChild.status).toBe("interrupted")
+		expect(updatedChild.parentTaskId).toBeUndefined()
+		expect(updatedChild.rootTaskId).toBeUndefined()
+		expect(updatedChild.lineageProvenance).toEqual({ parentTaskId: parent.id, rootTaskId: parent.id })
+		expect(executionClaim(updatedParent).phase).toBe("suspended")
+		expect(await store.guardExecution(executionToken(updatedParent))).toMatchObject({ kind: "refused" })
+		// A stale completion or snapshot cannot reattach the detached child.
+		expect(await store.completeStandaloneTask(staleChild, "late")).toMatchObject({ kind: "refused" })
+		await expect(store.saveExecutionSnapshot(staleChild, { metadata: child }, true)).rejects.toThrow()
+		expect(await store.readAuthoritative(child.id)).toEqual(updatedChild)
+		expect(provider.postMessageToWebview.mock.calls).toEqual([
+			[{ type: "taskHistoryItemUpdated", taskHistoryItem: updatedParent }],
+			[{ type: "taskHistoryItemUpdated", taskHistoryItem: updatedChild }],
+		])
+		const writes = vi.mocked(safeWriteJson).mock.calls.map((call) => call[0].replaceAll("\\", "/"))
+		expect(writes).toEqual([
+			expect.stringContaining("/parent-1/history_item.json"),
+			expect.stringContaining("/child-1/history_item.json"),
+		])
 	})
 
-	it("does not attempt to close the live instance when the child is not the current task", async () => {
-		const childHistoryItem = { id: "child-1", status: "interrupted", parentTaskId: "parent-1" }
-		const parentHistoryItem = {
-			id: "parent-1",
-			status: "delegated",
-			awaitingChildId: "child-1",
-			delegatedToId: "child-1",
-		}
-
-		const getTaskWithId = vi.fn().mockImplementation(async (id: string) => {
-			if (id === "child-1") return { historyItem: childHistoryItem }
-			if (id === "parent-1") return { historyItem: parentHistoryItem }
-			throw new Error("Task not found")
-		})
-
-		const taskHistoryStore = makeTaskHistoryStoreStub(childHistoryItem, parentHistoryItem)
-		const removeClineFromStack = vi.fn().mockResolvedValue(undefined)
-
-		const provider = makeProviderStub({
-			getTaskWithId,
-			getCurrentTask: vi.fn(() => ({ taskId: "some-other-task" })),
-			removeClineFromStack,
-			taskHistoryStore,
-			isViewLaunched: false,
-		} as any)
-
-		const result = await (ClineProvider.prototype as any).abandonSubtask.call(provider, "child-1")
-
-		expect(result).toBe(true)
-		expect(removeClineFromStack).not.toHaveBeenCalled()
+	it("refuses before cleanup settles instead of closing a live child or severing its link", async () => {
+		const store = provider.taskHistoryStore
+		const original = child
+		child = interruptedChild
+		files.seedHistory(storage, child)
+		const evict = vi.spyOn(provider, "evictCurrentTask").mockResolvedValue(undefined)
+		expect(await provider.abandonSubtask(child.id)).toBe(false)
+		expect(evict).not.toHaveBeenCalled()
+		expect(safeWriteJson).not.toHaveBeenCalled()
+		expect(await store.readAuthoritative(child.id)).toEqual(child)
+		files.seedHistory(storage, original)
+		expect(await provider.abandonSubtask(child.id)).toBe(true)
 	})
 
-	it("returns false and does not modify state when the child is not interrupted (e.g. still active)", async () => {
-		const childHistoryItem = { id: "child-1", status: "active", parentTaskId: "parent-1" }
-		const parentHistoryItem = {
-			id: "parent-1",
-			status: "delegated",
-			awaitingChildId: "child-1",
-			delegatedToId: "child-1",
-		}
-
-		const getTaskWithId = vi.fn().mockImplementation(async (id: string) => {
-			if (id === "child-1") return { historyItem: childHistoryItem }
-			if (id === "parent-1") return { historyItem: parentHistoryItem }
-			throw new Error("Task not found")
-		})
-
-		const taskHistoryStore = makeTaskHistoryStoreStub(childHistoryItem, parentHistoryItem)
-		const provider = makeProviderStub({ getTaskWithId, taskHistoryStore } as any)
-
-		const result = await (ClineProvider.prototype as any).abandonSubtask.call(provider, "child-1")
-
-		expect(result).toBe(false)
-		expect(taskHistoryStore.atomicUpdatePair).not.toHaveBeenCalled()
+	it("does not evict an unrelated current task when abandoning a settled child", async () => {
+		const evict = vi.spyOn(provider, "evictCurrentTask").mockResolvedValue(undefined)
+		const current = Object.assign(Object.create(Task.prototype) as Task, { taskId: "unrelated" })
+		vi.spyOn(provider, "getCurrentTask").mockReturnValue(current)
+		expect(await provider.abandonSubtask(child.id)).toBe(true)
+		expect(evict).not.toHaveBeenCalled()
 	})
 
-	it("returns false when the child completes between the initial check and lock acquisition (TOCTOU)", async () => {
-		// The initial status check reads the child as interrupted, but by the time the
-		// per-parent lock is acquired, a concurrent resume-and-complete has already
-		// transitioned it. The in-lock re-check must catch this and bail out.
-		const childHistoryItem = { id: "child-1", status: "interrupted", parentTaskId: "parent-1" }
-		const parentHistoryItem = {
-			id: "parent-1",
-			status: "delegated",
-			awaitingChildId: "child-1",
-			delegatedToId: "child-1",
-		}
-
-		const getTaskWithId = vi.fn().mockImplementation(async (id: string) => {
-			if (id === "child-1") return { historyItem: childHistoryItem }
-			if (id === "parent-1") return { historyItem: parentHistoryItem }
-			throw new Error("Task not found")
-		})
-
-		const taskHistoryStore: any = makeTaskHistoryStoreStub(childHistoryItem, parentHistoryItem)
-		// Simulate the concurrent completion landing right before the in-lock re-check runs.
-		taskHistoryStore.get = vi.fn((id: string) =>
-			id === "child-1" ? { ...childHistoryItem, status: "completed" as const } : parentHistoryItem,
-		)
-
-		const provider = makeProviderStub({ getTaskWithId, taskHistoryStore } as any)
-
-		const result = await (ClineProvider.prototype as any).abandonSubtask.call(provider, "child-1")
-
-		expect(result).toBe(false)
-		expect(taskHistoryStore.atomicUpdatePair).not.toHaveBeenCalled()
+	it("returns false without writes when the child is still active", async () => {
+		files.seedHistory(storage, { ...child, status: "active" })
+		expect(await provider.abandonSubtask(child.id)).toBe(false)
+		expect(safeWriteJson).not.toHaveBeenCalled()
 	})
 
-	it("returns false and does not modify state when the child has no parentTaskId", async () => {
-		const getTaskWithId = vi.fn().mockResolvedValue({ historyItem: { id: "standalone-1", status: "active" } })
-		const provider = makeProviderStub({ getTaskWithId } as any)
-
-		const result = await (ClineProvider.prototype as any).abandonSubtask.call(provider, "standalone-1")
-
-		expect(result).toBe(false)
+	it("rechecks fresh child state under the store lock after the provider precheck", async () => {
+		const store = provider.taskHistoryStore
+		const abandon = store.abandonTaskDelegation.bind(store)
+		vi.spyOn(store, "abandonTaskDelegation").mockImplementationOnce(async (...args) => {
+			files.seedHistory(storage, { ...child, status: "completed" })
+			return abandon(...args)
+		})
+		expect(await provider.abandonSubtask(child.id)).toBe(false)
+		expect(safeWriteJson).not.toHaveBeenCalled()
+		expect(await store.readAuthoritative(parent.id)).toEqual(parent)
 	})
 
-	it("returns false and does not touch history when parent is no longer delegated to this child", async () => {
-		const childHistoryItem = { id: "child-1", status: "interrupted", parentTaskId: "parent-1" }
-		const parentHistoryItem = { id: "parent-1", status: "active", awaitingChildId: undefined }
-
-		const getTaskWithId = vi.fn().mockImplementation(async (id: string) => {
-			if (id === "child-1") return { historyItem: childHistoryItem }
-			if (id === "parent-1") return { historyItem: parentHistoryItem }
-			throw new Error("Task not found")
-		})
-
-		const taskHistoryStore = makeTaskHistoryStoreStub(childHistoryItem, parentHistoryItem)
-		const provider = makeProviderStub({ getTaskWithId, taskHistoryStore } as any)
-
-		const result = await (ClineProvider.prototype as any).abandonSubtask.call(provider, "child-1")
-
-		expect(result).toBe(false)
-		expect(taskHistoryStore.atomicUpdatePair).not.toHaveBeenCalled()
+	it("returns false when the child has no parent", async () => {
+		files.seedHistory(storage, { ...child, parentTaskId: undefined, rootTaskId: undefined })
+		expect(await provider.abandonSubtask(child.id)).toBe(false)
+		expect(safeWriteJson).not.toHaveBeenCalled()
 	})
 
-	it("returns false when awaitingChildId points at a different child", async () => {
-		const childHistoryItem = { id: "child-1", status: "interrupted", parentTaskId: "parent-1" }
-		const parentHistoryItem = { id: "parent-1", status: "delegated", awaitingChildId: "child-OTHER" }
-
-		const getTaskWithId = vi.fn().mockImplementation(async (id: string) => {
-			if (id === "child-1") return { historyItem: childHistoryItem }
-			if (id === "parent-1") return { historyItem: parentHistoryItem }
-			throw new Error("Task not found")
+	it("returns false when the parent is no longer delegated to the child", async () => {
+		files.seedHistory(storage, {
+			...parent,
+			status: "active",
+			awaitingChildId: undefined,
+			delegatedToId: undefined,
 		})
+		expect(await provider.abandonSubtask(child.id)).toBe(false)
+		expect(safeWriteJson).not.toHaveBeenCalled()
+	})
 
-		const taskHistoryStore = makeTaskHistoryStoreStub(childHistoryItem, parentHistoryItem)
-		const provider = makeProviderStub({ getTaskWithId, taskHistoryStore } as any)
+	it("returns false when the parent's current handoff points at another child", async () => {
+		files.seedHistory(storage, { ...parent, awaitingChildId: "other-child", delegatedToId: "other-child" })
+		expect(await provider.abandonSubtask(child.id)).toBe(false)
+		expect(safeWriteJson).not.toHaveBeenCalled()
+	})
 
-		const result = await (ClineProvider.prototype as any).abandonSubtask.call(provider, "child-1")
-
-		expect(result).toBe(false)
-		expect(taskHistoryStore.atomicUpdatePair).not.toHaveBeenCalled()
+	it.each(["unknown owner", "pending cleanup", "failed snapshot"])("refuses a parent with %s", async (reason) => {
+		const retained = provider["ownedExecutions"].get(parent.id)!
+		if (reason === "unknown owner") provider["ownedExecutions"].delete(parent.id)
+		if (reason === "pending cleanup") retained.cleanupSettled = false
+		if (reason === "failed snapshot") retained.snapshotFailed = true
+		expect(await provider.abandonSubtask(child.id)).toBe(false)
+		expect(safeWriteJson).not.toHaveBeenCalled()
+		expect(provider.postMessageToWebview).not.toHaveBeenCalled()
 	})
 })

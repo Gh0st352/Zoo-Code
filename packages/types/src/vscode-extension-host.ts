@@ -6,6 +6,13 @@ import type { HistoryItem } from "./history.js"
 import type { ModeConfig, PromptComponent } from "./mode.js"
 import type { Experiments } from "./experiment.js"
 import type { ClineMessage, QueuedMessage } from "./message.js"
+import type {
+	ChatInput,
+	ChatInputResult,
+	TaskRecoveryDecision,
+	TaskRecoveryPrompt,
+	TaskRecoveryResponse,
+} from "./task.js"
 import type { MarketplaceItem, MarketplaceInstalledMetadata, InstallMarketplaceItemOptions } from "./marketplace.js"
 import type { TodoItem } from "./todo.js"
 import type { CloudUserInfo, CloudOrganizationMembership, OrganizationAllowList, ShareVisibility } from "./cloud.js"
@@ -33,6 +40,9 @@ export interface ExtensionMessage {
 		| "state"
 		| "taskHistoryUpdated"
 		| "taskHistoryItemUpdated"
+		| "taskRecovery"
+		| "taskRecoveryResult"
+		| "chatInputResult"
 		| "selectedImages"
 		| "theme"
 		| "workspaceUpdated"
@@ -136,6 +146,9 @@ export interface ExtensionMessage {
 	 * The webview is responsible for merging.
 	 */
 	state?: Partial<ExtensionState>
+	taskRecovery?: TaskRecoveryPrompt | null
+	taskRecoveryResult?: TaskRecoveryResponse
+	chatInputResult?: ChatInputResult
 	images?: string[]
 	filePaths?: string[]
 	openedTabs?: Array<{
@@ -350,7 +363,9 @@ export type ExtensionState = Pick<
 	 * change task focus; null authoritatively means no task is focused.
 	 */
 	currentTaskId?: string | null
+	currentTaskInstanceId?: string | null
 	currentTaskItem?: HistoryItem
+	taskRecovery?: TaskRecoveryPrompt | null
 	currentTaskTodos?: TodoItem[] // Initial todos for the current task
 	apiConfiguration: ProviderSettings
 	uriScheme?: string
@@ -472,7 +487,13 @@ export interface UpdateTodoListPayload {
 
 export type EditQueuedMessagePayload = Pick<QueuedMessage, "id" | "text" | "images">
 
-export interface WebviewMessage {
+export type WebviewMessage = WebviewMessageBase &
+	(
+		| { type: "previewTaskRecovery"; taskId: string }
+		| { type: Exclude<WebviewMessageBase["type"], "previewTaskRecovery"> }
+	)
+
+interface WebviewMessageBase {
 	type:
 		| "updateTodoList"
 		| "deleteMultipleTasksWithIds"
@@ -488,6 +509,9 @@ export interface WebviewMessage {
 		| "webviewDidLaunch"
 		| "newTask"
 		| "askResponse"
+		| "previewTaskRecovery"
+		| "recoverTask"
+		| "submitChatMessage"
 		| "terminalOperation"
 		| "clearTask"
 		| "didShowAnnouncement"
@@ -662,7 +686,10 @@ export interface WebviewMessage {
 		| "themeFixtureProbeResponse"
 		| "requestClineMessagesResync"
 	text?: string
+	/** Required for previewTaskRecovery; never inferred from the currently focused task. */
 	taskId?: string
+	taskRecoveryDecision?: TaskRecoveryDecision
+	chatInput?: ChatInput
 	expectedSeq?: number
 	receivedSeq?: number
 	editedMessageContent?: string

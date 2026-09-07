@@ -1,6 +1,8 @@
 // npx vitest core/tools/__tests__/newTaskTool.spec.ts
 
 import type { AskApproval, HandleError, NativeToolArgs, ToolUse } from "../../../shared/tools"
+import type { TodoItem } from "@roo-code/types"
+import type { Task } from "../../task/Task"
 
 // Mock vscode module
 vi.mock("vscode", () => ({
@@ -71,12 +73,12 @@ const mockEmit = vi.fn()
 const mockRecordToolError = vi.fn()
 const mockSayAndCreateMissingParamError = vi.fn()
 const mockStartSubtask = vi
-	.fn<(message: string, todoItems: any[], mode: string) => Promise<MockClineInstance>>()
+	.fn<(message: string, todoItems: TodoItem[], mode: string) => Promise<MockClineInstance>>()
 	.mockResolvedValue({ taskId: "mock-subtask-id" })
 
 // Adapter to satisfy legacy expectations while exercising new delegation path
 const mockDelegateParentAndOpenChild = vi.fn(
-	async (args: { parentTaskId: string; message: string; initialTodos: any[]; mode: string }) => {
+	async (args: { parentTaskId: string; message: string; initialTodos: TodoItem[]; mode: string }) => {
 		// Call legacy spy so existing expectations still pass
 		await mockStartSubtask(args.message, args.initialTodos, args.mode)
 		return { taskId: "child-1" }
@@ -87,6 +89,7 @@ const mockCheckpointSave = vi.fn()
 // Mock the Cline instance and its methods/properties
 const mockCline = {
 	ask: vi.fn(),
+	guardExecution: vi.fn<Task["guardExecution"]>().mockResolvedValue(true),
 	sayAndCreateMissingParamError: mockSayAndCreateMissingParamError,
 	emit: mockEmit,
 	recordToolError: mockRecordToolError,
@@ -94,6 +97,10 @@ const mockCline = {
 	isPaused: false,
 	pausedModeSlug: "ask",
 	taskId: "mock-parent-task-id",
+	setPendingTaskAction: vi.fn(),
+	getPendingTaskAction: vi.fn(),
+	hydrateForRecovery: vi.fn().mockResolvedValue(undefined),
+	executionBlocked: false,
 	enableCheckpoints: false,
 	checkpointSave: mockCheckpointSave,
 	startSubtask: mockStartSubtask,
@@ -101,6 +108,9 @@ const mockCline = {
 		deref: vi.fn(() => ({
 			getState: vi.fn(() => ({ customModes: [], mode: "ask" })),
 			handleModeSwitch: vi.fn(),
+			setPendingTaskAction: vi.fn().mockResolvedValue(undefined),
+			validateTaskDelegation: vi.fn().mockResolvedValue(true),
+			denyTaskDelegation: vi.fn().mockResolvedValue(undefined),
 			delegateParentAndOpenChild: mockDelegateParentAndOpenChild,
 		})),
 	},
@@ -123,6 +133,11 @@ const withNativeArgs = (block: ToolUse<"new_task">): ToolUse<"new_task"> => ({
 	} as unknown as NativeToolArgs["new_task"],
 })
 
+function toolTask(value: Pick<Task, "taskId" | "guardExecution" | "setPendingTaskAction">): Task {
+	// Tool-boundary doubles omit Task's unrelated editor and API machinery.
+	return value as unknown as Task
+}
+
 describe("newTaskTool", () => {
 	beforeEach(() => {
 		// Reset mocks before each test
@@ -136,6 +151,8 @@ describe("newTaskTool", () => {
 		}) // Default valid mode
 		mockCline.consecutiveMistakeCount = 0
 		mockCline.isPaused = false
+		mockCline.executionBlocked = false
+		mockCline.guardExecution.mockResolvedValue(true)
 		// Default: VSCode setting is disabled
 		const mockGet = vi.fn().mockReturnValue(false)
 		vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
@@ -155,7 +172,7 @@ describe("newTaskTool", () => {
 			partial: false,
 		}
 
-		await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+		await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 			askApproval: mockAskApproval,
 			handleError: mockHandleError,
 			pushToolResult: mockPushToolResult,
@@ -190,7 +207,7 @@ describe("newTaskTool", () => {
 			partial: false,
 		}
 
-		await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+		await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 			askApproval: mockAskApproval,
 			handleError: mockHandleError,
 			pushToolResult: mockPushToolResult,
@@ -215,7 +232,7 @@ describe("newTaskTool", () => {
 			partial: false,
 		}
 
-		await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+		await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 			askApproval: mockAskApproval,
 			handleError: mockHandleError,
 			pushToolResult: mockPushToolResult,
@@ -240,7 +257,7 @@ describe("newTaskTool", () => {
 			partial: false,
 		}
 
-		await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+		await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 			askApproval: mockAskApproval,
 			handleError: mockHandleError,
 			pushToolResult: mockPushToolResult,
@@ -265,7 +282,7 @@ describe("newTaskTool", () => {
 			partial: false,
 		}
 
-		await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+		await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 			askApproval: mockAskApproval,
 			handleError: mockHandleError,
 			pushToolResult: mockPushToolResult,
@@ -295,7 +312,7 @@ describe("newTaskTool", () => {
 			partial: false,
 		}
 
-		await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+		await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 			askApproval: mockAskApproval,
 			handleError: mockHandleError,
 			pushToolResult: mockPushToolResult,
@@ -326,7 +343,7 @@ describe("newTaskTool", () => {
 			partial: false,
 		}
 
-		await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+		await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 			askApproval: mockAskApproval,
 			handleError: mockHandleError,
 			pushToolResult: mockPushToolResult,
@@ -349,7 +366,7 @@ describe("newTaskTool", () => {
 			partial: false,
 		}
 
-		await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+		await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 			askApproval: mockAskApproval,
 			handleError: mockHandleError,
 			pushToolResult: mockPushToolResult,
@@ -372,7 +389,7 @@ describe("newTaskTool", () => {
 			partial: false,
 		}
 
-		await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+		await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 			askApproval: mockAskApproval,
 			handleError: mockHandleError,
 			pushToolResult: mockPushToolResult,
@@ -408,7 +425,7 @@ describe("newTaskTool", () => {
 				partial: false,
 			}
 
-			await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+			await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 				askApproval: mockAskApproval,
 				handleError: mockHandleError,
 				pushToolResult: mockPushToolResult,
@@ -444,7 +461,7 @@ describe("newTaskTool", () => {
 				partial: false,
 			}
 
-			await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+			await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 				askApproval: mockAskApproval,
 				handleError: mockHandleError,
 				pushToolResult: mockPushToolResult,
@@ -480,7 +497,7 @@ describe("newTaskTool", () => {
 				partial: false,
 			}
 
-			await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+			await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 				askApproval: mockAskApproval,
 				handleError: mockHandleError,
 				pushToolResult: mockPushToolResult,
@@ -522,7 +539,7 @@ describe("newTaskTool", () => {
 				partial: false,
 			}
 
-			await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+			await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 				askApproval: mockAskApproval,
 				handleError: mockHandleError,
 				pushToolResult: mockPushToolResult,
@@ -556,7 +573,7 @@ describe("newTaskTool", () => {
 				partial: false,
 			}
 
-			await newTaskTool.handle(mockCline as any, withNativeArgs(block), {
+			await newTaskTool.handle(toolTask(mockCline), withNativeArgs(block), {
 				askApproval: mockAskApproval,
 				handleError: mockHandleError,
 				pushToolResult: mockPushToolResult,
@@ -568,7 +585,31 @@ describe("newTaskTool", () => {
 		})
 	})
 
-	// Add more tests for error handling (invalid mode, approval denied) if needed
+	it.each(["before admission", "after approval"])("refuses delegation when authority is lost %s", async (stage) => {
+		if (stage === "before admission") mockCline.guardExecution.mockResolvedValue(false)
+		else
+			mockAskApproval.mockImplementationOnce(async () => {
+				mockCline.guardExecution.mockResolvedValue(false)
+				return true
+			})
+		await newTaskTool.handle(
+			toolTask(mockCline),
+			withNativeArgs({
+				type: "tool_use",
+				name: "new_task",
+				params: { mode: "code", message: "Child" },
+				partial: false,
+			}),
+			{ askApproval: mockAskApproval, handleError: mockHandleError, pushToolResult: mockPushToolResult },
+		)
+		expect(mockDelegateParentAndOpenChild).not.toHaveBeenCalled()
+		expect(mockStartSubtask).not.toHaveBeenCalled()
+		expect(mockPushToolResult).not.toHaveBeenCalled()
+		if (stage === "before admission") {
+			expect(mockAskApproval).not.toHaveBeenCalled()
+			expect(mockCline.setPendingTaskAction).not.toHaveBeenCalled()
+		} else expect(mockAskApproval).toHaveBeenCalledOnce()
+	})
 })
 
 describe("newTaskTool delegation flow", () => {
@@ -580,15 +621,17 @@ describe("newTaskTool delegation flow", () => {
 				experiments: {},
 			}),
 			setPendingTaskAction: vi.fn().mockResolvedValue(undefined),
+			validateTaskDelegation: vi.fn().mockResolvedValue(true),
 			delegateParentAndOpenChild: vi.fn().mockResolvedValue({ taskId: "child-1" }),
 			handleModeSwitch: vi.fn(),
-		} as any
+		}
 
 		// Use a fresh local cline instance to avoid cross-test interference
 		const localStartSubtask = vi.fn()
 		const localEmit = vi.fn()
 		const localCline = {
 			ask: vi.fn(),
+			guardExecution: vi.fn<Task["guardExecution"]>().mockResolvedValue(true),
 			sayAndCreateMissingParamError: mockSayAndCreateMissingParamError,
 			emit: localEmit,
 			recordToolError: mockRecordToolError,
@@ -617,23 +660,28 @@ describe("newTaskTool delegation flow", () => {
 		}
 
 		// Act
-		await newTaskTool.handle(localCline as any, withNativeArgs(block), {
+		await newTaskTool.handle(toolTask(localCline), withNativeArgs(block), {
 			askApproval: mockAskApproval,
 			handleError: mockHandleError,
 			pushToolResult: mockPushToolResult,
 			toolCallId: "call-new-task",
 		})
 
-		expect(providerSpy.setPendingTaskAction).toHaveBeenCalledWith("mock-parent-task-id", {
-			kind: "create_subtask",
-			actionId: "call-new-task",
-			approvalText: expect.stringContaining('"tool":"newTask"'),
-			mode: "code",
-			message: "Do something",
-			todos: [],
-		})
+		expect(providerSpy.setPendingTaskAction).toHaveBeenCalledWith(
+			"mock-parent-task-id",
+			{
+				kind: "create_subtask",
+				actionId: "call-new-task",
+				approvalText: expect.stringContaining('"tool":"newTask"'),
+				mode: "code",
+				message: "Do something",
+				todos: [],
+			},
+			localCline,
+		)
 		// Assert: provider method called with correct params
 		expect(providerSpy.delegateParentAndOpenChild).toHaveBeenCalledWith({
+			origin: localCline,
 			parentTaskId: "mock-parent-task-id",
 			message: "Do something",
 			initialTodos: [],
@@ -645,9 +693,7 @@ describe("newTaskTool delegation flow", () => {
 		expect(localStartSubtask).not.toHaveBeenCalled()
 
 		// Assert: no pause/unpause events emitted in delegation path
-		const pauseEvents = (localEmit as any).mock.calls.filter(
-			(c: any[]) => c[0] === "taskPaused" || c[0] === "taskUnpaused",
-		)
+		const pauseEvents = localEmit.mock.calls.filter((c) => c[0] === "taskPaused" || c[0] === "taskUnpaused")
 		expect(pauseEvents.length).toBe(0)
 
 		// Assert: tool result reflects delegation

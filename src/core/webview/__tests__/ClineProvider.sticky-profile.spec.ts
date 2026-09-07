@@ -6,6 +6,8 @@ import { ClineProvider } from "../ClineProvider"
 import { ContextProxy } from "../../config/ContextProxy"
 import type { HistoryItem } from "@roo-code/types"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
+import type { TaskOptions } from "../../task/Task"
+import { claimWebviewHistory, installWebviewHistoryFiles } from "../../../__tests__/helpers/webview-fixtures"
 
 vi.mock("vscode", () => ({
 	ExtensionContext: vi.fn(),
@@ -60,9 +62,14 @@ vi.mock("vscode", () => ({
 let taskIdCounter = 0
 
 vi.mock("../../task/Task", () => ({
-	Task: vi.fn().mockImplementation(function (options) {
+	Task: vi.fn().mockImplementation(function (options: TaskOptions) {
 		return {
-			taskId: options.taskId || `test-task-id-${++taskIdCounter}`,
+			taskId: options.historyItem?.id ?? options.taskId ?? `test-task-id-${++taskIdCounter}`,
+			instanceId: options.executionToken?.owner.runtimeId,
+			executionToken: options.executionToken,
+			hydrateForRecovery: vi.fn().mockResolvedValue(undefined),
+			dispose: vi.fn().mockResolvedValue(undefined),
+			awaitExecutionCleanup: vi.fn().mockResolvedValue(true),
 			saveClineMessages: vi.fn(),
 			clineMessages: [],
 			apiConversationHistory: [],
@@ -87,6 +94,7 @@ vi.mock("../../task/Task", () => ({
 vi.mock("../../prompts/sections/custom-instructions")
 
 vi.mock("../../../utils/safeWriteJson")
+vi.mock("proper-lockfile", () => ({ lock: vi.fn(async () => async () => {}) }))
 
 vi.mock("../../../api", () => ({
 	buildApiHandler: vi.fn().mockReturnValue({
@@ -169,6 +177,7 @@ vi.mock("p-wait-for", () => ({
 }))
 
 vi.mock("fs/promises", () => ({
+	realpath: vi.fn(async (value: string) => value),
 	mkdir: vi.fn().mockResolvedValue(undefined),
 	writeFile: vi.fn().mockResolvedValue(undefined),
 	readFile: vi.fn().mockResolvedValue(""),
@@ -216,6 +225,7 @@ describe("ClineProvider - Sticky Provider Profile", () => {
 
 	beforeEach(async () => {
 		vi.clearAllMocks()
+		installWebviewHistoryFiles()
 		taskIdCounter = 0
 		originalRooCliRuntimeEnv = process.env.ROO_CLI_RUNTIME
 		delete process.env.ROO_CLI_RUNTIME
@@ -518,7 +528,7 @@ describe("ClineProvider - Sticky Provider Profile", () => {
 			])
 
 			// Initialize task with history item
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			// Verify provider profile was restored via activateProviderProfile (restore-only: don't persist mode config)
 			expect(activateProviderProfileSpy).toHaveBeenCalledWith(
@@ -552,7 +562,7 @@ describe("ClineProvider - Sticky Provider Profile", () => {
 				{ name: "default", id: "default-id" },
 			])
 
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			expect(activateProviderProfileSpy).not.toHaveBeenCalled()
 		})
@@ -577,18 +587,17 @@ describe("ClineProvider - Sticky Provider Profile", () => {
 			const activateProviderProfileSpy = vi
 				.spyOn(provider, "activateProviderProfile")
 				.mockResolvedValue(undefined)
-			const logSpy = vi.spyOn(provider, "log")
+			const currentProfile = (await provider.getState()).currentApiConfigName
 
 			vi.spyOn(provider.providerSettingsManager, "listConfig").mockResolvedValue([
 				{ name: "saved-profile", id: "saved-profile-id", apiProvider: providerIdentifiers.anthropic },
 			])
 
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			expect(activateProviderProfileSpy).not.toHaveBeenCalledWith({ name: "saved-profile" }, expect.anything())
-			expect(logSpy).toHaveBeenCalledWith(
-				expect.stringContaining("Skipping restore of provider profile 'saved-profile'"),
-			)
+			expect((await provider.getState()).currentApiConfigName).toBe(currentProfile)
+			expect(provider.getCurrentTask()?.taskId).toBe(historyItem.id)
 		})
 
 		it("should skip restoring mode-based provider config from history in CLI runtime", async () => {
@@ -617,7 +626,7 @@ describe("ClineProvider - Sticky Provider Profile", () => {
 				{ name: "mode-profile", id: "mode-config-id", apiProvider: providerIdentifiers.anthropic },
 			])
 
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			expect(activateProviderProfileSpy).not.toHaveBeenCalled()
 		})
@@ -645,7 +654,7 @@ describe("ClineProvider - Sticky Provider Profile", () => {
 				.mockResolvedValue(undefined)
 
 			// Initialize task with history item
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			// Verify activateProviderProfile was NOT called for apiConfigName restoration
 			// (it might be called for mode-based config, but not for direct apiConfigName)
@@ -689,7 +698,7 @@ describe("ClineProvider - Sticky Provider Profile", () => {
 			])
 
 			// Initialize task with history item
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			// Verify task's apiConfigName was activated LAST (overriding mode-based config)
 			expect(activateCalls[activateCalls.length - 1]).toBe("task-specific-profile")
@@ -715,16 +724,18 @@ describe("ClineProvider - Sticky Provider Profile", () => {
 			// Mock providerSettingsManager.listConfig to return empty (profile doesn't exist)
 			vi.spyOn(provider.providerSettingsManager, "listConfig").mockResolvedValue([])
 
-			// Mock log to verify warning is logged
-			const logSpy = vi.spyOn(provider, "log")
+			const activateSpy = vi.spyOn(provider, "activateProviderProfile")
+			const currentProfile = (await provider.getState()).currentApiConfigName
 
 			// Initialize task with history item - should not throw
-			await expect(provider.createTaskWithHistoryItem(historyItem)).resolves.not.toThrow()
+			await expect(
+				provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem)),
+			).resolves.not.toThrow()
 
-			// Verify a warning was logged
-			expect(logSpy).toHaveBeenCalledWith(
-				expect.stringContaining("Provider profile 'deleted-profile' from history no longer exists"),
-			)
+			// Missing profiles are not activated and do not replace the current configuration.
+			expect(activateSpy).not.toHaveBeenCalled()
+			expect((await provider.getState()).currentApiConfigName).toBe(currentProfile)
+			expect(provider.getCurrentTask()?.taskId).toBe(historyItem.id)
 		})
 	})
 
@@ -947,7 +958,7 @@ describe("ClineProvider - Sticky Provider Profile", () => {
 			expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to persist provider profile switch"))
 		})
 
-		it("should handle null/undefined apiConfigName gracefully", async () => {
+		it("rejects null apiConfigName in authoritative history and accepts an absent profile", async () => {
 			await provider.resolveWebviewView(mockWebviewView)
 
 			// Create a history item with null apiConfigName
@@ -969,8 +980,14 @@ describe("ClineProvider - Sticky Provider Profile", () => {
 				.spyOn(provider, "activateProviderProfile")
 				.mockResolvedValue(undefined)
 
-			// Initialize task with history item - should not throw
-			await expect(provider.createTaskWithHistoryItem(historyItem)).resolves.not.toThrow()
+			const files = installWebviewHistoryFiles()
+			files.seedHistory(mockContext.globalStorageUri.fsPath, historyItem)
+			await expect(provider.createTaskWithHistoryItem(historyItem)).rejects.toMatchObject({ kind: "invalid" })
+			expect(provider.getCurrentTask()).toBeUndefined()
+			const validHistory = { ...historyItem, id: "absent-profile", apiConfigName: undefined }
+			await expect(
+				provider.createTaskWithHistoryItem(validHistory, await claimWebviewHistory(provider, validHistory)),
+			).resolves.toBeDefined()
 
 			// Verify activateProviderProfile was not called with null
 			expect(activateProviderProfileSpy).not.toHaveBeenCalledWith({ name: null })
@@ -978,7 +995,7 @@ describe("ClineProvider - Sticky Provider Profile", () => {
 	})
 
 	describe("Profile restoration with activateProfile failure", () => {
-		it("should continue task restoration even if activateProviderProfile fails", async () => {
+		it("contains authorized restoration when activateProviderProfile fails but permits inspection", async () => {
 			await provider.resolveWebviewView(mockWebviewView)
 
 			// Create a history item with saved provider profile
@@ -1003,16 +1020,20 @@ describe("ClineProvider - Sticky Provider Profile", () => {
 			// Mock activateProviderProfile to throw error
 			vi.spyOn(provider, "activateProviderProfile").mockRejectedValue(new Error("Activation failed"))
 
-			// Mock log to verify error is logged
-			const logSpy = vi.spyOn(provider, "log")
-
-			// Initialize task with history item - should not throw even though activation fails
-			await expect(provider.createTaskWithHistoryItem(historyItem)).resolves.not.toThrow()
-
-			// Verify error was logged
-			expect(logSpy).toHaveBeenCalledWith(
-				expect.stringContaining("Failed to restore API configuration 'failing-profile' for task"),
-			)
+			const prepare = vi.spyOn(provider, "performPreparationTasks")
+			const options = await claimWebviewHistory(provider, historyItem)
+			await expect(provider.createTaskWithHistoryItem(historyItem, options)).rejects.toThrow("Activation failed")
+			expect(provider.getCurrentTask()).toBeUndefined()
+			expect(prepare).not.toHaveBeenCalled()
+			expect(provider["ownedExecutions"].get(historyItem.id)?.cleanupSettled).toBe(true)
+			expect(await provider.taskHistoryStore.readAuthoritative(historyItem.id)).toMatchObject({
+				status: "interrupted",
+				execution: { phase: "settled", cleanupPending: false },
+			})
+			const inspected = await provider.createTaskWithHistoryItem(historyItem)
+			expect(inspected.executionToken).toBeUndefined()
+			expect(inspected.hydrateForRecovery).toHaveBeenCalledOnce()
+			expect(prepare).not.toHaveBeenCalled()
 		})
 	})
 })

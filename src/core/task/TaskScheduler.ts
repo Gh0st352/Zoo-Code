@@ -10,6 +10,7 @@ import { type Task } from "./Task"
  */
 export class TaskScheduler {
 	private readonly sem: TaskSemaphore
+	private readonly scheduled = new Map<string, Promise<void>>()
 
 	constructor(maxConcurrency = 1) {
 		this.sem = new TaskSemaphore(maxConcurrency)
@@ -29,13 +30,29 @@ export class TaskScheduler {
 	 * user cancelled it before it started), the permit is released immediately
 	 * without calling `run()`.
 	 */
-	async schedule(task: Task, run: () => Promise<void>): Promise<void> {
+	schedule(task: Task, run: () => Promise<void>): Promise<void> {
+		const token = task.executionToken
+		if (!token) return this.admit(task, run)
+		const key = JSON.stringify([
+			token.taskId,
+			token.generation,
+			token.owner.hostSessionId,
+			token.owner.providerId,
+			token.owner.runtimeId,
+		])
+		const existing = this.scheduled.get(key)
+		if (existing) return existing
+		const scheduled = this.admit(task, run)
+		this.scheduled.set(key, scheduled)
+		return scheduled
+	}
+
+	private async admit(task: Task, run: () => Promise<void>): Promise<void> {
+		if (!(await task.guardExecution())) return
 		const release = await this.sem.acquire()
-		if (task.abort || task.abandoned) {
-			release()
-			return
-		}
 		try {
+			// Authority can change while queued. Never fall back for unclaimed mocks.
+			if (!(await task.guardExecution())) return
 			await run()
 		} finally {
 			release()

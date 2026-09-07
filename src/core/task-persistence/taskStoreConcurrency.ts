@@ -20,12 +20,61 @@ export function computeHistoryDelta(cached: HistoryItem, incoming: Partial<Histo
 	) as Partial<HistoryItem>
 }
 
+export function mergeTaskMessageMetadata(current: HistoryItem, item: HistoryItem): HistoryItem {
+	const {
+		status: _status,
+		parentTaskId: _parent,
+		rootTaskId: _root,
+		awaitingChildId: _awaiting,
+		delegatedToId: _delegated,
+		childIds: _children,
+		pendingAction: _pending,
+		delegation: _action,
+		lifecycleRevision: _revision,
+		executionGeneration: _generation,
+		delegationOrigin: _origin,
+		execution: _execution,
+		delegatedCompletion: _completion,
+		lineageProvenance: _provenance,
+		completedByChildId: _completedBy,
+		completionResultSummary: _summary,
+		...metadata
+	} = item
+	return { ...current, ...metadata }
+}
+
 export function mergeHistoryDelta(existing: unknown, incoming: HistoryItem, delta: Partial<HistoryItem>): HistoryItem {
 	if (!existing || typeof existing !== "object" || !("id" in existing)) {
-		return incoming
+		// First message-derived insert may describe a task, never grant execution authority.
+		const {
+			execution: _execution,
+			delegatedCompletion: _completion,
+			delegation: _delegation,
+			executionGeneration: _generation,
+			lifecycleRevision: _revision,
+			...metadata
+		} = incoming
+		return metadata
 	}
 	const disk = existing as HistoryItem
 	const normalizedDelta = { ...delta }
+	// Action receipts and execution authority are command-owned, never ordinary
+	// metadata deltas. Unknown future versions must survive old runtime snapshots.
+	for (const key of [
+		"delegation",
+		"executionGeneration",
+		"lifecycleRevision",
+		"delegationOrigin",
+		"execution",
+		"delegatedCompletion",
+		"lineageProvenance",
+	] as const) {
+		delete normalizedDelta[key]
+	}
+	// Claimed records require authoritative commands for ALL lifecycle/action changes.
+	if (disk.execution !== undefined || disk.delegatedCompletion !== undefined) {
+		return mergeTaskMessageMetadata(disk, { ...disk, ...normalizedDelta })
+	}
 	if ("status" in delta) {
 		const diskStatus: HistoryItemStatus = disk.status ?? "active"
 		const attemptedStatus: HistoryItemStatus = delta.status ?? "active"
@@ -38,6 +87,16 @@ export function mergeHistoryDelta(existing: unknown, incoming: HistoryItem, delt
 		normalizedDelta.status = attemptedStatus
 	}
 	const merged = { ...disk, ...normalizedDelta }
+	if (
+		disk.delegation &&
+		["status", "parentTaskId", "rootTaskId", "awaitingChildId", "delegatedToId"].some(
+			(key) =>
+				key in normalizedDelta &&
+				!deepEqual(normalizedDelta[key as keyof HistoryItem], disk[key as keyof HistoryItem]),
+		)
+	) {
+		merged.lifecycleRevision = (disk.lifecycleRevision ?? 0) + 1
+	}
 	if (normalizedDelta.childIds && disk.childIds) {
 		merged.childIds = [...new Set([...disk.childIds, ...normalizedDelta.childIds])]
 	}

@@ -53,6 +53,8 @@ import { QueuedMessages } from "./QueuedMessages"
 import { WorktreeSelector } from "./WorktreeSelector"
 import FileChangesPanel from "./FileChangesPanel"
 import { useScrollLifecycle } from "@src/hooks/useScrollLifecycle"
+import { useChatSubmission } from "./useChatSubmission"
+import { TaskRecoveryNotice } from "./TaskRecoveryNotice"
 
 export interface ChatViewProps {
 	isHidden: boolean
@@ -87,6 +89,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	const {
 		clineMessages: messages,
 		currentTaskId,
+		currentTaskInstanceId,
 		currentTaskItem,
 		currentTaskTodos,
 		taskHistory,
@@ -173,6 +176,18 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	const textAreaRef = useRef<HTMLTextAreaElement>(null)
 	const [sendingDisabled, setSendingDisabled] = useState(false)
 	const [selectedImages, setSelectedImages] = useState<string[]>([])
+	const clearSubmittedDraft = useCallback(() => {
+		setInputValue("")
+		setSelectedImages([])
+	}, [])
+	const chatSubmission = useChatSubmission({
+		taskId: currentTaskId,
+		instanceId: currentTaskInstanceId,
+		text: inputValue,
+		images: selectedImages,
+		clearDraft: clearSubmittedDraft,
+	})
+	const submitChatMessage = chatSubmission.submit
 
 	// We need to hold on to the ask because useEffect > lastMessage will always
 	// let us know when an ask comes in and handle it, but by the time
@@ -607,12 +622,10 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		return false
 	}, [modifiedMessages, clineAsk, enableButtons, primaryButtonText])
 
-	const markFollowUpAsAnswered = useCallback(() => {
-		const lastFollowUpMessage = messagesRef.current.findLast((msg: ClineMessage) => msg.ask === "followup")
-		if (lastFollowUpMessage) {
-			setCurrentFollowUpTs(lastFollowUpMessage.ts)
-		}
-	}, [])
+	useEffect(() => {
+		const answered = messages.findLast((message) => message.ask === "followup" && message.isAnswered)
+		if (answered) setCurrentFollowUpTs(answered.ts)
+	}, [messages])
 
 	const handleChatReset = useCallback(() => {
 		// Clear any pending auto-approval timeout
@@ -640,7 +653,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	 * @param images - Array of image data URLs to send with the message
 	 */
 	const handleSendMessage = useCallback(
-		(text: string, images: string[]) => {
+		(text: string, images: string[], forceQueue = false) => {
 			text = text.trim()
 
 			if (text || images.length > 0) {
@@ -651,73 +664,33 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 					return
 				}
 
-				// Queue message if:
-				// - Task is busy (sendingDisabled)
-				// - API request in progress (isStreaming)
-				// - Queue has items (preserve message order during drain)
-				// - Command is running (command_output) - user's message should be queued for AI, not sent to terminal
-				if (
+				const content = { requestId: crypto.randomUUID(), text, images }
+				const taskId = currentTaskIdRef.current
+				const ask = messagesRef.current.findLast((message) => message.type === "ask")
+				const queue =
+					forceQueue ||
 					sendingDisabled ||
 					isStreaming ||
 					messageQueue.length > 0 ||
+					!ask ||
+					ask.partial ||
+					ask.isAnswered ||
 					clineAskRef.current === "command_output"
-				) {
-					try {
-						console.log("queueMessage", text, images)
-						vscode.postMessage({ type: "queueMessage", text, images })
-						setInputValue("")
-						setSelectedImages([])
-					} catch (error) {
-						console.error(
-							`Failed to queue message: ${error instanceof Error ? error.message : String(error)}`,
-						)
-					}
-
-					return
-				}
-
-				// Mark that user has responded - this prevents any pending auto-approvals.
-				userRespondedRef.current = true
-
-				if (messagesRef.current.length === 0) {
-					vscode.postMessage({ type: "newTask", text, images })
-				} else if (clineAskRef.current) {
-					if (clineAskRef.current === "followup") {
-						markFollowUpAsAnswered()
-					}
-
-					// Use clineAskRef.current
-					switch (
-						clineAskRef.current // Use clineAskRef.current
-					) {
-						case "followup":
-						case "tool":
-						case "command": // User can provide feedback to a tool or command use.
-						case "use_mcp_server":
-						case "completion_result": // If this happens then the user has feedback for the completion result.
-						case "resume_task":
-						case "resume_completed_task":
-						case "mistake_limit_reached":
-							vscode.postMessage({
-								type: "askResponse",
-								askResponse: "messageResponse",
-								text,
-								images,
-							})
-							break
-						// There is no other case that a textfield should be enabled.
-					}
-				} else {
-					// This is a new message in an ongoing task.
-					vscode.postMessage({ type: "askResponse", askResponse: "messageResponse", text, images })
-				}
-
-				handleChatReset()
+				const submitted = submitChatMessage(
+					!taskId
+						? { ...content, kind: "new", scope: null }
+						: {
+								...content,
+								...(queue ? { kind: "queue" as const } : { kind: "response" as const, askTs: ask.ts }),
+								scope: { taskId, instanceId: currentTaskInstanceId ?? "" },
+							},
+				)
+				if (submitted) userRespondedRef.current = true
 			}
 		},
 		[
-			handleChatReset,
-			markFollowUpAsAnswered,
+			submitChatMessage,
+			currentTaskInstanceId,
 			sendingDisabled,
 			isStreaming,
 			messageQueue.length,
@@ -753,17 +726,8 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 	// Handle enqueue button click from textarea
 	const handleEnqueueCurrentMessage = useCallback(() => {
-		const text = inputValue.trim()
-		if (text || selectedImages.length > 0) {
-			vscode.postMessage({
-				type: "queueMessage",
-				text,
-				images: selectedImages,
-			})
-			setInputValue("")
-			setSelectedImages([])
-		}
-	}, [inputValue, selectedImages])
+		handleSendMessage(inputValue, selectedImages, true)
+	}, [handleSendMessage, inputValue, selectedImages])
 
 	// Resets the approval button UI to its hidden/disabled state. Shared by the
 	// manual click handlers and by the backend-driven clearApprovalButtons
@@ -1436,11 +1400,6 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 				userRespondedRef.current = true
 			}
 
-			// Mark the current follow-up question as answered when a suggestion is clicked
-			if (clineAsk === "followup" && !event?.shiftKey) {
-				markFollowUpAsAnswered()
-			}
-
 			// Check if we need to switch modes
 			const suggestionMode = getSuggestionMode(suggestion.mode)
 			if (suggestionMode) {
@@ -1466,7 +1425,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 				setInputValue(preservedInput)
 			}
 		},
-		[handleSendMessage, setInputValue, switchToMode, alwaysAllowModeSwitch, clineAsk, markFollowUpAsAnswered],
+		[handleSendMessage, setInputValue, switchToMode, alwaysAllowModeSwitch],
 	)
 
 	const handleBatchFileResponse = useCallback((response: { [key: string]: boolean }) => {
@@ -1618,9 +1577,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			// Special case: during command_output, queue the message instead of
 			// triggering the primary button action (which would lose the message)
 			if (clineAskRef.current === "command_output" && hasInput) {
-				vscode.postMessage({ type: "queueMessage", text: inputValue.trim(), images: selectedImages })
-				setInputValue("")
-				setSelectedImages([])
+				handleEnqueueCurrentMessage()
 				return
 			}
 
@@ -1859,6 +1816,17 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 						actionText={t("chat:retiredProvider.openSettings")}
 						onAction={() => vscode.postMessage({ type: "switchTab", tab: "settings" })}
 					/>
+				</div>
+			)}
+			<TaskRecoveryNotice />
+			{chatSubmission.status && (
+				<div role="status" className="px-4 py-2 text-vscode-descriptionForeground">
+					{t(`chat:sendStatus.${chatSubmission.status}`)}
+					{chatSubmission.status === "unknown" && (
+						<Button variant="secondary" onClick={chatSubmission.retryReceipt}>
+							{t("chat:retry.title")}
+						</Button>
+					)}
 				</div>
 			)}
 			<ChatTextArea

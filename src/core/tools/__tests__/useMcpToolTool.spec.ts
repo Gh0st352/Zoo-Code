@@ -68,6 +68,7 @@ describe("useMcpToolTool", () => {
 		mockTask = {
 			consecutiveMistakeCount: 0,
 			recordToolError: vi.fn(),
+			requireExecution: vi.fn<Task["requireExecution"]>().mockResolvedValue(undefined),
 			sayAndCreateMissingParamError: vi.fn(),
 			say: vi.fn(),
 			ask: vi.fn(),

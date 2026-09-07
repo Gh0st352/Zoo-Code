@@ -12,7 +12,7 @@ import {
 } from "@/utils/test-utils"
 
 import { vscode } from "@src/utils/vscode"
-import type { SuggestionItem } from "@roo-code/types"
+import type { SuggestionItem, WebviewMessage } from "@roo-code/types"
 
 import ChatView, { ChatViewProps } from "../ChatView"
 
@@ -351,8 +351,27 @@ vi.mock("@vscode/webview-ui-toolkit/react", () => ({
 const vscodePostMessageMock = mockVscodePostMessage(vi.mocked(vscode.postMessage))
 
 const mockPostMessage = (state: Record<string, unknown>) => {
-	hydrateExtensionState(makeExtensionState(state))
+	hydrateExtensionState(
+		makeExtensionState({
+			...(Array.isArray(state.clineMessages) && state.clineMessages.length > 0
+				? { currentTaskId: "test-task", currentTaskInstanceId: "test-runtime" }
+				: {}),
+			...state,
+		}),
+	)
 }
+
+const expectedChatInput = (kind: "queue" | "response", text: string) => ({
+	type: "submitChatMessage",
+	chatInput: {
+		kind,
+		text,
+		images: [],
+		requestId: expect.any(String),
+		scope: { taskId: "test-task", instanceId: "test-runtime" },
+		...(kind === "response" ? { askTs: expect.any(Number) } : {}),
+	},
+})
 
 const dispatchExtensionMessage = async (data: Record<string, unknown>) => {
 	await act(async () => {
@@ -410,6 +429,138 @@ const defaultProps: ChatViewProps = {
 const renderChatView = (props: Partial<ChatViewProps> = {}) => {
 	return renderWithExtensionState(<ChatView {...defaultProps} {...props} />)
 }
+
+describe("ChatView - acknowledged sends", () => {
+	beforeEach(() => vi.clearAllMocks())
+	const sentInput = () => {
+		const message = vi
+			.mocked(vscode.postMessage)
+			.mock.calls.map(([message]) => message as WebviewMessage)
+			.findLast((message) => message.type === "submitChatMessage")
+		if (!message?.chatInput) throw new Error("No chat input submitted")
+		return message.chatInput
+	}
+
+	it("preserves a fresh draft until the host accepts and submits Enter only once", () => {
+		const view = renderChatView()
+		const input = view.getByRole("textbox")
+		fireEvent.change(input, { target: { value: "Keep this draft" } })
+		vi.mocked(vscode.postMessage).mockClear()
+		fireEvent.keyDown(input, { key: "Enter" })
+		fireEvent.keyDown(input, { key: "Enter" })
+		expect(input).toHaveValue("Keep this draft")
+		expect(vscode.postMessage).toHaveBeenCalledTimes(1)
+		expect(vscode.postMessage).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "submitChatMessage", chatInput: expect.objectContaining({ kind: "new" }) }),
+		)
+	})
+
+	it("does not mistake an empty, still-hydrating active transcript for a new task", async () => {
+		const view = renderChatView()
+		await dispatchExtensionMessage({
+			type: "state",
+			state: { currentTaskId: "loading-task", currentTaskInstanceId: "runtime-1" },
+		})
+		const input = view.getByRole("textbox")
+		fireEvent.change(input, { target: { value: "Follow up" } })
+		vi.mocked(vscode.postMessage).mockClear()
+		fireEvent.keyDown(input, { key: "Enter" })
+		expect(vscode.postMessage).toHaveBeenCalledWith(
+			expect.objectContaining({
+				type: "submitChatMessage",
+				chatInput: expect.objectContaining({
+					kind: "queue",
+					scope: { taskId: "loading-task", instanceId: "runtime-1" },
+				}),
+			}),
+		)
+		expect(input).toHaveValue("Follow up")
+	})
+
+	it("keeps rejected text and images, ignores foreign receipts, and clears only accepted unchanged drafts", async () => {
+		const view = renderChatView()
+		const input = view.getByRole("textbox")
+		fireEvent.change(input, { target: { value: "Keep me" } })
+		await dispatchExtensionMessage({ type: "selectedImages", images: ["data:image/png;base64,test"] })
+		fireEvent.keyDown(input, { key: "Enter" })
+		const first = sentInput()
+		await dispatchExtensionMessage({
+			type: "chatInputResult",
+			chatInputResult: { requestId: "other", kind: "accepted", taskId: "new" },
+		})
+		expect(input).toHaveValue("Keep me")
+		await dispatchExtensionMessage({
+			type: "chatInputResult",
+			chatInputResult: { requestId: first.requestId, kind: "refused", reason: "input_failed" },
+		})
+		expect(input).toHaveValue("Keep me")
+		expect(view.getByText("chat:sendStatus.refused")).toBeInTheDocument()
+		fireEvent.keyDown(input, { key: "Enter" })
+		const second = sentInput()
+		expect(second.images).toEqual(first.images)
+		fireEvent.change(input, { target: { value: "Newer edit" } })
+		await dispatchExtensionMessage({
+			type: "chatInputResult",
+			chatInputResult: { requestId: second.requestId, kind: "accepted", taskId: "new" },
+		})
+		expect(input).toHaveValue("Newer edit")
+		fireEvent.keyDown(input, { key: "Enter" })
+		await dispatchExtensionMessage({
+			type: "chatInputResult",
+			chatInputResult: { requestId: sentInput().requestId, kind: "accepted", taskId: "new" },
+		})
+		expect(input).toHaveValue("")
+	})
+
+	it("exposes only server recovery choices and never turns a refused send into recovery", async () => {
+		const view = renderChatView()
+		await dispatchExtensionMessage({
+			type: "state",
+			state: { currentTaskId: "paused", currentTaskInstanceId: "observer" },
+		})
+		await dispatchExtensionMessage({
+			type: "taskRecovery",
+			taskRecovery: { taskId: "paused", promptId: "prompt", choices: ["resume_independent"] },
+		})
+		const input = view.getByRole("textbox")
+		fireEvent.change(input, { target: { value: "My draft" } })
+		vi.mocked(vscode.postMessage).mockClear()
+		fireEvent.keyDown(input, { key: "Enter" })
+		expect(vscode.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "recoverTask" }))
+		await dispatchExtensionMessage({
+			type: "chatInputResult",
+			chatInputResult: { requestId: sentInput().requestId, kind: "refused", reason: "execution_refused" },
+		})
+		expect(input).toHaveValue("My draft")
+		expect(view.queryByText("chat:recovery.resume_linked")).not.toBeInTheDocument()
+		const resume = view.getByText("chat:recovery.resume_independent")
+		fireEvent.click(resume)
+		fireEvent.click(resume)
+		const requests = vi
+			.mocked(vscode.postMessage)
+			.mock.calls.map(([message]) => message as WebviewMessage)
+			.filter((message) => message.type === "recoverTask")
+		expect(requests).toHaveLength(1)
+		expect(requests[0].taskRecoveryDecision).toEqual({
+			taskId: "paused",
+			promptId: "prompt",
+			choice: "resume_independent",
+			intent: "explicit_user_resume",
+		})
+		expect(input).toHaveValue("My draft")
+		await dispatchExtensionMessage({
+			type: "state",
+			state: { currentTaskId: "other", currentTaskInstanceId: "other-runtime" },
+		})
+		await dispatchExtensionMessage({
+			type: "taskRecoveryResult",
+			requestId: requests[0].requestId,
+			taskRecoveryResult: { kind: "applied", taskId: "paused", promptId: "prompt" },
+		})
+		expect(view.queryByText("chat:recovery.applied")).not.toBeInTheDocument()
+		expect(input).toHaveValue("My draft")
+	})
+})
 
 describe("ChatView - Tool Batching Tests", () => {
 	beforeEach(() => vi.clearAllMocks())
@@ -1097,11 +1248,9 @@ describe("ChatView - Message Queueing Tests", () => {
 
 		// Verify that the message was queued, not sent as askResponse
 		await waitFor(() => {
-			expect(vscode.postMessage).toHaveBeenCalledWith({
-				type: "queueMessage",
-				text: "follow-up question during spinner",
-				images: [],
-			})
+			expect(vscode.postMessage).toHaveBeenCalledWith(
+				expectedChatInput("queue", "follow-up question during spinner"),
+			)
 		})
 
 		// Verify it was NOT sent as a direct askResponse (which would get lost)
@@ -1113,7 +1262,7 @@ describe("ChatView - Message Queueing Tests", () => {
 		)
 	})
 
-	it("sends messages normally when API request is complete (cost present)", async () => {
+	it("queues input after streaming until a real ask is available instead of writing an unconsumed response slot", async () => {
 		const { getByTestId } = renderChatView()
 
 		// Hydrate state with completed API request (cost present)
@@ -1165,14 +1314,9 @@ describe("ChatView - Message Queueing Tests", () => {
 			fireEvent.keyDown(input, { key: "Enter", code: "Enter" })
 		})
 
-		// Verify that the message was sent as askResponse, not queued
+		// A completed stream is not evidence of a waiting ask. Queue until the task consumes it.
 		await waitFor(() => {
-			expect(vscode.postMessage).toHaveBeenCalledWith({
-				type: "askResponse",
-				askResponse: "messageResponse",
-				text: "follow-up after completion",
-				images: [],
-			})
+			expect(vscode.postMessage).toHaveBeenCalledWith(expectedChatInput("queue", "follow-up after completion"))
 		})
 
 		// Verify it was NOT queued
@@ -1227,11 +1371,7 @@ describe("ChatView - Message Queueing Tests", () => {
 
 		// Verify that the new message was queued (not sent directly) to preserve order
 		await waitFor(() => {
-			expect(vscode.postMessage).toHaveBeenCalledWith({
-				type: "queueMessage",
-				text: "message during queue drain",
-				images: [],
-			})
+			expect(vscode.postMessage).toHaveBeenCalledWith(expectedChatInput("queue", "message during queue drain"))
 		})
 
 		// Verify it was NOT sent as askResponse (which would break ordering)
@@ -1290,11 +1430,9 @@ describe("ChatView - Message Queueing Tests", () => {
 
 		// Verify that the message was queued (not lost via terminalOperation)
 		await waitFor(() => {
-			expect(vscode.postMessage).toHaveBeenCalledWith({
-				type: "queueMessage",
-				text: "message during command execution",
-				images: [],
-			})
+			expect(vscode.postMessage).toHaveBeenCalledWith(
+				expectedChatInput("queue", "message during command execution"),
+			)
 		})
 
 		// Verify it was NOT sent as terminalOperation (which would lose the message)
@@ -1409,12 +1547,7 @@ describe("ChatView - Follow-up Suggestions", () => {
 		await waitFor(() => {
 			expect(vscode.postMessage).toHaveBeenCalledWith({ type: "mode", text: "code" })
 		})
-		expect(vscode.postMessage).toHaveBeenCalledWith({
-			type: "askResponse",
-			askResponse: "messageResponse",
-			text: "Use code mode",
-			images: [],
-		})
+		expect(vscode.postMessage).toHaveBeenCalledWith(expectedChatInput("response", "Use code mode"))
 	})
 
 	it("does not switch modes for an unknown malformed object mode suggestion", async () => {
@@ -1449,12 +1582,7 @@ describe("ChatView - Follow-up Suggestions", () => {
 		fireEvent.click(suggestion)
 
 		await waitFor(() => {
-			expect(vscode.postMessage).toHaveBeenCalledWith({
-				type: "askResponse",
-				askResponse: "messageResponse",
-				text: "Use invalid mode",
-				images: [],
-			})
+			expect(vscode.postMessage).toHaveBeenCalledWith(expectedChatInput("response", "Use invalid mode"))
 		})
 		expect(vscode.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "mode" }))
 	})

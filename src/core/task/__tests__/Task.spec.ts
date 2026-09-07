@@ -29,6 +29,8 @@ import { processUserContentMentions } from "../../mentions/processUserContentMen
 import { MultiSearchReplaceDiffStrategy } from "../../diff/strategies/multi-search-replace"
 import type { ApiMessage } from "../../task-persistence"
 import { asyncStreamFrom } from "../../../test-utils/stream"
+import { claimTaskOptions, createClaimedTask, installTaskHistoryFiles } from "../../../__tests__/helpers/task-fixtures"
+import { TaskHistoryStore } from "../../task-persistence/TaskHistoryStore"
 
 type TaskTestAccess = {
 	getSystemPrompt: () => Promise<string>
@@ -89,6 +91,7 @@ vi.mock("execa", () => ({
 vi.mock("fs/promises", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("fs/promises")>()
 	const mockFunctions = {
+		realpath: vi.fn(async (value: string) => value),
 		mkdir: vi.fn().mockResolvedValue(undefined),
 		writeFile: vi.fn().mockResolvedValue(undefined),
 		readFile: vi.fn().mockImplementation((filePath) => {
@@ -129,6 +132,12 @@ vi.mock("fs/promises", async (importOriginal) => {
 vi.mock("p-wait-for", () => ({
 	default: vi.fn().mockImplementation(async () => Promise.resolve()),
 }))
+
+vi.mock("../../../utils/safeWriteJson", () => ({
+	LOCK_STALE_MS: 31_000,
+	safeWriteJson: vi.fn().mockResolvedValue(undefined),
+}))
+vi.mock("proper-lockfile", () => ({ lock: vi.fn(async () => async () => {}) }))
 
 vi.mock("vscode", () => {
 	const mockDisposable = { dispose: vi.fn() }
@@ -256,6 +265,7 @@ vi.mock("../../prompts/system", async (importOriginal) => {
 
 // Mock storagePathManager to prevent dynamic import issues.
 vi.mock("../../../utils/storage", () => ({
+	getStorageBasePath: vi.fn(async (base: string) => base),
 	getTaskDirectoryPath: vi
 		.fn()
 		.mockImplementation((globalStoragePath, taskId) => Promise.resolve(`${globalStoragePath}/tasks/${taskId}`)),
@@ -278,6 +288,15 @@ const mockMessages = [
 		text: "historical task",
 	},
 ]
+
+let historyFiles: ReturnType<typeof installTaskHistoryFiles>
+beforeEach(() => {
+	historyFiles = installTaskHistoryFiles()
+})
+afterEach(() => {
+	historyFiles.restore()
+	vi.useRealTimers()
+})
 
 describe("Cline", () => {
 	let mockProvider: ClineProvider
@@ -405,6 +424,11 @@ describe("Cline", () => {
 		}))
 	})
 
+	afterEach(async () => {
+		await mockProvider.taskHistoryStore.initialized
+		mockProvider.taskHistoryStore.dispose()
+	})
+
 	describe("empty-response retries", () => {
 		function stream(chunks: ApiStreamChunk[]): AsyncGenerator<ApiStreamChunk> {
 			return (async function* () {
@@ -413,7 +437,7 @@ describe("Cline", () => {
 		}
 
 		async function createTaskWithManualRetries() {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -475,13 +499,13 @@ describe("Cline", () => {
 
 	describe("native tool-call request isolation", () => {
 		it("keeps overlapping Task parser state scoped to each request", async () => {
-			const firstTask = new Task({
+			const firstTask = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "first task",
 				startTask: false,
 			})
-			const secondTask = new Task({
+			const secondTask = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "second task",
@@ -565,7 +589,7 @@ describe("Cline", () => {
 			// If the scope were shared across retries, the old partial state for
 			// "call_stale" would still be in the WeakMap when the retry runs,
 			// and could corrupt finalization of "call_fresh".
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "retry scope test",
@@ -613,7 +637,7 @@ describe("Cline", () => {
 		})
 
 		it("finalizes MCP tool call using the request-scoped parser state", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "mcp tool test",
@@ -654,7 +678,7 @@ describe("Cline", () => {
 
 	describe("constructor", () => {
 		it("should always have diff strategy defined", async () => {
-			const cline = new Task({
+			const cline = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -747,7 +771,7 @@ describe("Cline", () => {
 				mcpEnabled: false,
 			} as unknown as ProviderState)
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: taskApiConfiguration,
 				task: "test task",
@@ -775,7 +799,7 @@ describe("Cline", () => {
 				mode: "architect",
 				mcpEnabled: false,
 			} as unknown as ProviderState)
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -801,7 +825,7 @@ describe("Cline", () => {
 				autoApprovalEnabled: true,
 				requestDelaySeconds: 0,
 			} as unknown as ProviderState)
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -833,7 +857,7 @@ describe("Cline", () => {
 
 	describe("sayAndCreateMissingParamError", () => {
 		it("surfaces a localized error notice and returns the missing-parameter tool error for both relPath branches", async () => {
-			const cline = new Task({
+			const cline = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -870,7 +894,7 @@ describe("Cline", () => {
 	describe("getEnvironmentDetails", () => {
 		describe("API conversation handling", () => {
 			it("should strip non-protocol fields from API conversation history before sending to the API", async () => {
-				const cline = new Task({
+				const cline = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "test task",
@@ -938,7 +962,7 @@ describe("Cline", () => {
 					},
 				]
 
-				const withImages = new Task({
+				const withImages = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: {
 						...mockApiConfig,
@@ -961,7 +985,7 @@ describe("Cline", () => {
 					} as ModelInfo,
 				})
 
-				const withoutImages = new Task({
+				const withoutImages = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: {
 						...mockApiConfig,
@@ -1043,7 +1067,7 @@ describe("Cline", () => {
 			})
 
 			it("should handle API retry with countdown", async () => {
-				const cline = new Task({
+				const cline = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "test task",
@@ -1136,7 +1160,7 @@ describe("Cline", () => {
 					...mockApiConfig,
 					rateLimitSeconds: 10,
 				}
-				const cline = new Task({
+				const cline = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: rateLimitConfig,
 					task: "test task",
@@ -1222,7 +1246,7 @@ describe("Cline", () => {
 			})
 
 			it("should not apply retry delay twice", async () => {
-				const cline = new Task({
+				const cline = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "test task",
@@ -1314,11 +1338,13 @@ describe("Cline", () => {
 
 			describe("processUserContentMentions", () => {
 				it("should process mentions in user_message tags", async () => {
-					const [cline, task] = Task.create({
-						provider: mockProvider,
-						apiConfiguration: mockApiConfig,
-						task: "test task",
-					})
+					const [cline, task] = Task.create(
+						await claimTaskOptions({
+							provider: mockProvider,
+							apiConfiguration: mockApiConfig,
+							task: "test task",
+						}),
+					)
 
 					const userContent = [
 						{
@@ -1429,6 +1455,11 @@ describe("Cline", () => {
 					updateTaskHistory: vi.fn().mockResolvedValue(undefined),
 					// Task receives a full ClineProvider at runtime; this focused unit test only exercises these methods.
 				} as unknown as MockedClineProvider
+				Object.setPrototypeOf(mockProvider, ClineProvider.prototype)
+				Object.assign(mockProvider, {
+					taskHistoryStore: new TaskHistoryStore(mockProvider.context.globalStorageUri.fsPath),
+				})
+				mockProvider["ownedExecutions"] = new Map()
 
 				// Get the mocked delay function
 				mockDelay = delay as ReturnType<typeof vi.fn>
@@ -1443,7 +1474,7 @@ describe("Cline", () => {
 				const sharedClock = createRateLimitClock()
 
 				// Create parent task
-				const parent = new Task({
+				const parent = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "parent task",
@@ -1479,7 +1510,7 @@ describe("Cline", () => {
 				expect(mockDelay).not.toHaveBeenCalled()
 
 				// Create a subtask immediately after, sharing the same clock
-				const child = new Task({
+				const child = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "child task",
@@ -1536,7 +1567,7 @@ describe("Cline", () => {
 				const sharedClock = createRateLimitClock()
 
 				// Create parent task
-				const parent = new Task({
+				const parent = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "parent task",
@@ -1574,7 +1605,7 @@ describe("Cline", () => {
 				performance.now = vi.fn(() => mockTime)
 
 				// Create a subtask after time has passed
-				const child = new Task({
+				const child = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "child task",
@@ -1602,7 +1633,7 @@ describe("Cline", () => {
 				const sharedClock = createRateLimitClock()
 
 				// Create parent task
-				const parent = new Task({
+				const parent = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "parent task",
@@ -1635,7 +1666,7 @@ describe("Cline", () => {
 				await parentIterator.next()
 
 				// Create first subtask
-				const child1 = new Task({
+				const child1 = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "child task 1",
@@ -1659,13 +1690,43 @@ describe("Cline", () => {
 				// Clear the mock to count new delays
 				mockDelay.mockClear()
 
-				// Create second subtask immediately after
-				const child2 = new Task({
+				// Settle the first child and explicitly recover its delegated parent before
+				// replacing the child. Shared rate limiting must survive the runtime change.
+				const store = mockProvider.taskHistoryStore
+				await child1.abortTask()
+				expect(
+					(await store.settleTaskExecution(child1.executionToken!, await child1.awaitExecutionCleanup()))
+						.kind,
+				).toBe("applied")
+				await parent.abortTask()
+				expect(
+					(await store.settleTaskExecution(parent.executionToken!, await parent.awaitExecutionCleanup()))
+						.kind,
+				).toBe("applied")
+				const preview = await store.previewRecovery(parent.taskId)
+				expect(preview.choices).toEqual(["retain_delegation"])
+				const recovered = await store.recoverTask({
+					scope: preview.scope,
+					choice: "retain_delegation",
+					intent: "explicit_user_resume",
+					owner: store.ownerForRuntime("resumed-parent"),
+				})
+				if (recovered.kind !== "applied") throw new Error(recovered.reason)
+				const resumedParent = new Task({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					historyItem: recovered.history,
+					executionToken: recovered.token,
+					startTask: false,
+					rateLimitClock: sharedClock,
+				})
+				// Create second subtask immediately after authorized recovery.
+				const child2 = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "child task 2",
-					parentTask: parent,
-					rootTask: parent,
+					parentTask: resumedParent,
+					rootTask: resumedParent,
 					startTask: false,
 					rateLimitClock: sharedClock,
 				})
@@ -1692,7 +1753,7 @@ describe("Cline", () => {
 				const sharedClock = createRateLimitClock()
 
 				// Create parent task
-				const parent = new Task({
+				const parent = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "parent task",
@@ -1725,7 +1786,7 @@ describe("Cline", () => {
 				await parentIterator.next()
 
 				// Create a subtask
-				const child = new Task({
+				const child = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "child task",
@@ -1750,7 +1811,7 @@ describe("Cline", () => {
 				const clock = createRateLimitClock()
 
 				// Create task
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "test task",
@@ -1853,7 +1914,7 @@ describe("Cline", () => {
 					apiProvider: providerIdentifiers.anthropic,
 					apiModelId: "gpt-4",
 				}
-				const anthropicTask = new Task({
+				const anthropicTask = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: anthropicConfig,
 					task: "test task",
@@ -1867,7 +1928,7 @@ describe("Cline", () => {
 					apiProvider: providerIdentifiers.openrouter,
 					openRouterModelId: "anthropic/claude-3-opus",
 				}
-				const openrouterClaudeTask = new Task({
+				const openrouterClaudeTask = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: openrouterClaudeConfig,
 					task: "test task",
@@ -1880,7 +1941,7 @@ describe("Cline", () => {
 					apiProvider: providerIdentifiers.openrouter,
 					openRouterModelId: "openai/gpt-4",
 				}
-				const openrouterGptTask = new Task({
+				const openrouterGptTask = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: openrouterGptConfig,
 					task: "test task",
@@ -1902,7 +1963,7 @@ describe("Cline", () => {
 						apiProvider: providerIdentifiers.openai,
 						openAiModelId: modelId,
 					}
-					const task = new Task({
+					const task = await createClaimedTask({
 						provider: mockProvider,
 						apiConfiguration: config,
 						task: "test task",
@@ -1918,7 +1979,7 @@ describe("Cline", () => {
 				const undefinedProviderConfig = {
 					apiModelId: "claude-3-opus",
 				}
-				const undefinedProviderTask = new Task({
+				const undefinedProviderTask = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: undefinedProviderConfig,
 					task: "test task",
@@ -1930,7 +1991,7 @@ describe("Cline", () => {
 				const noModelConfig = {
 					apiProvider: providerIdentifiers.openai,
 				}
-				const noModelTask = new Task({
+				const noModelTask = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: noModelConfig,
 					task: "test task",
@@ -1942,7 +2003,7 @@ describe("Cline", () => {
 
 		describe("submitUserMessage", () => {
 			it("should call handleWebviewAskResponse directly", async () => {
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "initial task",
@@ -1977,7 +2038,7 @@ describe("Cline", () => {
 					mcpEnabled: false,
 				} as unknown as ProviderState)
 				vi.spyOn(mockProvider, "setMode").mockResolvedValue(undefined)
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "initial task",
@@ -2006,7 +2067,7 @@ describe("Cline", () => {
 					...mockApiConfig,
 					apiModelId: "selected-model",
 				}
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "initial task",
@@ -2026,7 +2087,7 @@ describe("Cline", () => {
 			})
 
 			it("should handle empty messages gracefully", async () => {
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "initial task",
@@ -2048,7 +2109,7 @@ describe("Cline", () => {
 			})
 
 			it("should call handleWebviewAskResponse for both new and existing task states", async () => {
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "initial task",
@@ -2082,7 +2143,7 @@ describe("Cline", () => {
 			})
 
 			it("should handle undefined provider gracefully", async () => {
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "initial task",
@@ -2105,7 +2166,10 @@ describe("Cline", () => {
 				// Should log error but not throw
 				await task.submitUserMessage("test message")
 
-				expect(consoleErrorSpy).toHaveBeenCalledWith("[Task#submitUserMessage] Provider reference lost")
+				expect(consoleErrorSpy).toHaveBeenCalledWith(
+					"[Task#submitUserMessage] Failed to submit user message:",
+					expect.objectContaining({ reason: "owner_unknown" }),
+				)
 				expect(handleResponseSpy).not.toHaveBeenCalled()
 
 				// Restore console.error
@@ -2120,7 +2184,7 @@ describe("Cline", () => {
 		})
 
 		it("waits for persistence before posting a bumped snapshot after overwriting the transcript", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2156,7 +2220,7 @@ describe("Cline", () => {
 		})
 
 		it.each([true, false])("awaits the overwrite snapshot when persist is %s", async (persist) => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2188,7 +2252,7 @@ describe("Cline", () => {
 
 		it.each([true, false])("cancels stale partial updates before an overwrite with persist %s", async (persist) => {
 			vi.useFakeTimers()
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2234,7 +2298,7 @@ describe("Cline", () => {
 		})
 
 		it("propagates an overwrite snapshot failure after persistence", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2253,7 +2317,7 @@ describe("Cline", () => {
 		})
 
 		it("still overwrites the transcript when the provider reference is unavailable", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2273,7 +2337,7 @@ describe("Cline", () => {
 		})
 
 		it("posts a complete new message through the incremental transport", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2296,7 +2360,7 @@ describe("Cline", () => {
 		})
 
 		it("creates a message without a transport error when the provider reference is unavailable", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2324,7 +2388,7 @@ describe("Cline", () => {
 		})
 
 		it("waits for an incremental append before emitting the message", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2359,7 +2423,7 @@ describe("Cline", () => {
 		})
 
 		it("continues the message lifecycle when an incremental append fails", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2394,7 +2458,7 @@ describe("Cline", () => {
 		})
 
 		it("posts an already answered ask through the incremental transport", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2415,7 +2479,7 @@ describe("Cline", () => {
 
 		it("serializes a new partial message before its debounced following update", async () => {
 			vi.useFakeTimers()
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2460,7 +2524,7 @@ describe("Cline", () => {
 
 		it("debounces partial updates and posts the latest revision on the trailing edge", async () => {
 			vi.useFakeTimers()
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2498,7 +2562,7 @@ describe("Cline", () => {
 
 		it("drops a debounced partial update when the provider reference expires", async () => {
 			vi.useFakeTimers()
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2522,7 +2586,7 @@ describe("Cline", () => {
 		})
 
 		it("emits a complete update when the provider reference is unavailable", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2543,7 +2607,7 @@ describe("Cline", () => {
 
 		it("cancels a pending partial update when the task is disposed", async () => {
 			vi.useFakeTimers()
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2566,7 +2630,7 @@ describe("Cline", () => {
 		it("emits the partial revision captured before a debounced post runs while provider fan-in is active", async () => {
 			vi.useFakeTimers()
 			vi.spyOn(mockProvider, "isClineMessagesPartialCoalescingActive").mockReturnValue(true)
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2601,7 +2665,7 @@ describe("Cline", () => {
 			"cancels a pending partial update and posts completion immediately when partial is %s",
 			async (_case, complete) => {
 				vi.useFakeTimers()
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "test task",
@@ -2629,7 +2693,7 @@ describe("Cline", () => {
 
 		it("handles a rejected debounced partial update", async () => {
 			vi.useFakeTimers()
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2661,7 +2725,7 @@ describe("Cline", () => {
 
 	describe("abortTask", () => {
 		it("should set abort flag and emit TaskAborted event", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2686,7 +2750,7 @@ describe("Cline", () => {
 		})
 
 		it("should be equivalent to clicking Cancel button functionality", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2705,7 +2769,7 @@ describe("Cline", () => {
 		})
 
 		it("does not wait for ancillary disposal cleanup before abort resolves", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2727,7 +2791,7 @@ describe("Cline", () => {
 		})
 
 		it("memoizes concurrent aborts while preserving abandoned state", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2748,7 +2812,7 @@ describe("Cline", () => {
 		})
 
 		it("flushes pending state before TaskAborted and disposal while queue state is intact", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2779,7 +2843,7 @@ describe("Cline", () => {
 		})
 
 		it("continues abort cleanup when flushing pending state fails", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2811,7 +2875,7 @@ describe("Cline", () => {
 		})
 
 		it("should work with TaskLike interface", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2835,7 +2899,7 @@ describe("Cline", () => {
 		})
 
 		it("should handle errors during disposal gracefully", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2865,7 +2929,7 @@ describe("Cline", () => {
 		})
 
 		it("should handle asynchronous disposal errors gracefully", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -2887,7 +2951,7 @@ describe("Cline", () => {
 		})
 		describe("Stream Failure Retry", () => {
 			it("should not abort task on stream failure, only on user cancellation", async () => {
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "test task",
@@ -3007,116 +3071,161 @@ describe("Cline", () => {
 				expect(cancelSpy).toHaveBeenCalled()
 			})
 			describe("abortSignal", () => {
-				it("finalizes partial transcript messages and the API request before persisting cancellation", async () => {
-					const task = new Task({
-						provider: mockProvider,
-						apiConfiguration: mockApiConfig,
-						task: "test task",
-						startTask: false,
-					})
-					const taskAccess = getTaskTestAccess(task)
-					const saveSpy = vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
-					vi.spyOn(taskAccess, "safeEnsureModelFetched").mockResolvedValue(undefined)
-					vi.spyOn(task.diffViewProvider, "reset").mockResolvedValue(undefined)
-					vi.spyOn(task, "abortTask").mockResolvedValue(undefined)
-					vi.spyOn(task.api, "getModel").mockReturnValue({
-						id: mockApiConfig.apiModelId!,
-						info: {
-							supportsImages: false,
-							supportsPromptCache: true,
-							contextWindow: 200000,
-							maxTokens: 4096,
-							inputPrice: 0.3,
-							outputPrice: 1.5,
-						} as ModelInfo,
-					})
-					const postedUpdates: import("@roo-code/types").ClineMessage[] = []
-					const updateSpy = vi
-						.mocked(mockProvider.postClineMessageUpdated)
-						.mockImplementation(async (_taskId, message) => {
-							postedUpdates.push(structuredClone(message))
+				it.each(["cancellation", "stream failure"] as const)(
+					"preserves partial transcript persistence ordering during %s",
+					async (stop) => {
+						vi.spyOn(mockProvider, "getState").mockResolvedValue({
+							...(await mockProvider.getState()),
+							autoApprovalEnabled: true,
 						})
-					const partialMessage: import("@roo-code/types").ClineMessage = {
-						ts: 2,
-						type: "say",
-						say: "text",
-						text: "partial response",
-						partial: true,
-					}
-					vi.spyOn(task, "attemptApiRequest").mockImplementation(() =>
-						(async function* (): AsyncGenerator<ApiStreamChunk> {
-							await taskAccess.addToClineMessages(partialMessage)
-							task.abort = true
-							yield { type: "usage", inputTokens: 0, outputTokens: 0 }
-						})(),
-					)
+						const task = await createClaimedTask({
+							provider: mockProvider,
+							apiConfiguration: mockApiConfig,
+							task: "test task",
+							startTask: false,
+						})
+						const taskAccess = getTaskTestAccess(task)
+						const saveSpy = vi.spyOn(taskAccess, "saveClineMessages")
+						task["backoffAndAnnounce"] = vi.fn(async () => {
+							task.executionBlocked = true // End at retry backoff, after the authorized failure snapshot.
+						})
+						vi.spyOn(taskAccess, "safeEnsureModelFetched").mockResolvedValue(undefined)
+						vi.spyOn(task.diffViewProvider, "reset").mockResolvedValue(undefined)
+						vi.spyOn(task.api, "getModel").mockReturnValue({
+							id: mockApiConfig.apiModelId!,
+							info: {
+								supportsImages: false,
+								supportsPromptCache: true,
+								contextWindow: 200000,
+								maxTokens: 4096,
+								inputPrice: 0.3,
+								outputPrice: 1.5,
+							} as ModelInfo,
+						})
+						const postedUpdates: import("@roo-code/types").ClineMessage[] = []
+						const updateSpy = vi
+							.mocked(mockProvider.postClineMessageUpdated)
+							.mockImplementation(async (_taskId, message) => {
+								postedUpdates.push(structuredClone(message))
+							})
+						const partialMessage: import("@roo-code/types").ClineMessage = {
+							ts: 2,
+							type: "say",
+							say: "text",
+							text: "partial response",
+							partial: true,
+						}
+						vi.spyOn(task, "attemptApiRequest").mockImplementationOnce(() =>
+							(async function* (): AsyncGenerator<ApiStreamChunk> {
+								await taskAccess.addToClineMessages(partialMessage)
+								if (stop === "stream failure") throw new Error("provider stream failed")
+								task.abort = true
+								yield { type: "usage", inputTokens: 0, outputTokens: 0 }
+							})(),
+						)
 
-					await expect(
-						task.recursivelyMakeClineRequests([{ type: "text", text: "cancel this request" }]),
-					).resolves.toBe(true)
+						await expect(
+							task.recursivelyMakeClineRequests([{ type: "text", text: "cancel this request" }]),
+						).resolves.toBe(true)
 
-					expect(partialMessage.partial).toBe(false)
-					expect(postedUpdates).toContainEqual(
-						expect.objectContaining({ ts: partialMessage.ts, partial: false }),
-					)
-					expect(postedUpdates).toContainEqual(
-						expect.objectContaining({
-							say: "api_req_started",
-							text: expect.stringContaining('"cancelReason":"user_cancelled"'),
-						}),
-					)
-					expect(task.didFinishAbortingStream).toBe(true)
-					expect(Math.max(...updateSpy.mock.invocationCallOrder)).toBeLessThan(
-						Math.max(...saveSpy.mock.invocationCallOrder),
-					)
-				})
+						if (stop === "cancellation") {
+							expect(partialMessage.partial).toBe(true)
+							expect(postedUpdates).not.toContainEqual(expect.objectContaining({ ts: partialMessage.ts }))
+							expect(task.didFinishAbortingStream).toBe(false)
+							const token = task.executionToken
+							const saveSnapshot = vi.spyOn(mockProvider.taskHistoryStore, "saveExecutionSnapshot")
+							await mockProvider["stopOwnedTask"](task)
+							expect(saveSnapshot).toHaveBeenCalledWith(
+								expect.objectContaining({ generation: token!.generation + 1 }),
+								expect.objectContaining({
+									clineMessages: expect.arrayContaining([
+										expect.objectContaining({ text: "partial response" }),
+									]),
+								}),
+								true,
+							)
+							expect(task.executionToken).toBe(token)
+							expect(task.cleanupSettled).toBe(true)
+							return
+						}
+						expect(partialMessage.partial).toBe(false)
+						expect(postedUpdates).toContainEqual(
+							expect.objectContaining({ ts: partialMessage.ts, partial: false }),
+						)
+						expect(postedUpdates).toContainEqual(
+							expect.objectContaining({
+								say: "api_req_started",
+								text: expect.stringContaining('"cancelReason":"streaming_failed"'),
+							}),
+						)
+						expect(task.didFinishAbortingStream).toBe(true)
+						expect(Math.max(...updateSpy.mock.invocationCallOrder)).toBeLessThan(
+							Math.max(...saveSpy.mock.invocationCallOrder),
+						)
+					},
+				)
 
-				it("finishes cancellation when the API request message has already been removed", async () => {
-					const task = new Task({
-						provider: mockProvider,
-						apiConfiguration: mockApiConfig,
-						task: "test task",
-						startTask: false,
-					})
-					const taskAccess = getTaskTestAccess(task)
-					const saveSpy = vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
-					vi.spyOn(taskAccess, "safeEnsureModelFetched").mockResolvedValue(undefined)
-					vi.spyOn(task.diffViewProvider, "reset").mockResolvedValue(undefined)
-					vi.spyOn(task, "abortTask").mockResolvedValue(undefined)
-					vi.spyOn(task.api, "getModel").mockReturnValue({
-						id: mockApiConfig.apiModelId!,
-						info: {
-							supportsImages: false,
-							supportsPromptCache: true,
-							contextWindow: 200000,
-							maxTokens: 4096,
-							inputPrice: 0.3,
-							outputPrice: 1.5,
-						} as ModelInfo,
-					})
-					const updateSpy = vi.mocked(mockProvider.postClineMessageUpdated)
-					vi.spyOn(task, "attemptApiRequest").mockImplementation(() =>
-						(async function* (): AsyncGenerator<ApiStreamChunk> {
-							// Simulate another transcript operation removing the request row while
-							// cancellation is racing with the active stream.
-							task.clineMessages = []
-							updateSpy.mockClear()
-							task.abort = true
-							yield { type: "usage", inputTokens: 0, outputTokens: 0 }
-						})(),
-					)
+				it.each(["cancellation", "stream failure"] as const)(
+					"handles %s when the API request message has already been removed",
+					async (stop) => {
+						vi.spyOn(mockProvider, "getState").mockResolvedValue({
+							...(await mockProvider.getState()),
+							autoApprovalEnabled: true,
+						})
+						const task = await createClaimedTask({
+							provider: mockProvider,
+							apiConfiguration: mockApiConfig,
+							task: "test task",
+							startTask: false,
+						})
+						const taskAccess = getTaskTestAccess(task)
+						const saveSpy = vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
+						task["backoffAndAnnounce"] = vi.fn(async () => {
+							task.executionBlocked = true
+						})
+						vi.spyOn(taskAccess, "safeEnsureModelFetched").mockResolvedValue(undefined)
+						vi.spyOn(task.diffViewProvider, "reset").mockResolvedValue(undefined)
+						vi.spyOn(task.api, "getModel").mockReturnValue({
+							id: mockApiConfig.apiModelId!,
+							info: {
+								supportsImages: false,
+								supportsPromptCache: true,
+								contextWindow: 200000,
+								maxTokens: 4096,
+								inputPrice: 0.3,
+								outputPrice: 1.5,
+							} as ModelInfo,
+						})
+						const updateSpy = vi.mocked(mockProvider.postClineMessageUpdated)
+						vi.spyOn(task, "attemptApiRequest").mockImplementationOnce(() =>
+							(async function* (): AsyncGenerator<ApiStreamChunk> {
+								// Simulate another transcript operation removing the request row while
+								// cancellation is racing with the active stream.
+								task.clineMessages = []
+								updateSpy.mockClear()
+								if (stop === "stream failure") throw new Error("provider stream failed")
+								task.abort = true
+								yield { type: "usage", inputTokens: 0, outputTokens: 0 }
+							})(),
+						)
 
-					await expect(
-						task.recursivelyMakeClineRequests([{ type: "text", text: "cancel without request row" }]),
-					).resolves.toBe(true)
+						await expect(
+							task.recursivelyMakeClineRequests([{ type: "text", text: "cancel without request row" }]),
+						).resolves.toBe(true)
 
-					expect(updateSpy).not.toHaveBeenCalled()
-					expect(saveSpy).toHaveBeenCalled()
-					expect(task.didFinishAbortingStream).toBe(true)
-				})
+						expect(updateSpy).not.toHaveBeenCalled()
+						expect(saveSpy).toHaveBeenCalled()
+						expect(task.didFinishAbortingStream).toBe(stop === "stream failure")
+						if (stop === "cancellation") {
+							await mockProvider["stopOwnedTask"](task)
+							expect(task.cleanupSettled).toBe(true)
+							expect(task.clineMessages).toEqual([])
+						}
+					},
+				)
 
 				it("should pass AbortController signal to condenseContext metadata when a current request exists", async () => {
-					const task = new Task({
+					const task = await createClaimedTask({
 						provider: mockProvider,
 						apiConfiguration: mockApiConfig,
 						task: "test task",
@@ -3134,7 +3243,7 @@ describe("Cline", () => {
 				})
 
 				it("should omit abortSignal from condenseContext metadata when no current request exists", async () => {
-					const task = new Task({
+					const task = await createClaimedTask({
 						provider: mockProvider,
 						apiConfiguration: mockApiConfig,
 						task: "test task",
@@ -3152,7 +3261,7 @@ describe("Cline", () => {
 				})
 
 				it("should pass AbortController signal to createMessage metadata", async () => {
-					const task = new Task({
+					const task = await createClaimedTask({
 						provider: mockProvider,
 						apiConfiguration: mockApiConfig,
 						task: "test task",
@@ -3225,7 +3334,7 @@ describe("Cline", () => {
 						...mockApiConfig,
 						apiProvider: providerIdentifiers.gemini,
 					} as ProviderSettings
-					const task = new Task({
+					const task = await createClaimedTask({
 						provider: mockProvider,
 						apiConfiguration,
 						task: "test task",
@@ -3270,7 +3379,7 @@ describe("Cline", () => {
 				})
 
 				it("should invoke abort on currentRequestAbortController during first-chunk wait", async () => {
-					const task = new Task({
+					const task = await createClaimedTask({
 						provider: mockProvider,
 						apiConfiguration: mockApiConfig,
 						task: "test task",
@@ -3290,7 +3399,7 @@ describe("Cline", () => {
 				})
 
 				it("should reject streaming consumption when aborted between chunks", async () => {
-					const task = new Task({
+					const task = await createClaimedTask({
 						provider: mockProvider,
 						apiConfiguration: mockApiConfig,
 						task: "test task",
@@ -3373,7 +3482,7 @@ describe("Cline", () => {
 				})
 
 				it("should use the same AbortController signal as currentRequestAbortController", async () => {
-					const task = new Task({
+					const task = await createClaimedTask({
 						provider: mockProvider,
 						apiConfiguration: mockApiConfig,
 						task: "test task",
@@ -3442,7 +3551,7 @@ describe("Cline", () => {
 				})
 
 				it("should omit createMessage abortSignal metadata when no current request exists before condense metadata checks", async () => {
-					const task = new Task({
+					const task = await createClaimedTask({
 						provider: mockProvider,
 						apiConfiguration: mockApiConfig,
 						task: "test task",
@@ -3507,7 +3616,7 @@ describe("Cline", () => {
 				})
 
 				it("should keep createMessage abortSignal metadata unaborted before cancellation", async () => {
-					const task = new Task({
+					const task = await createClaimedTask({
 						provider: mockProvider,
 						apiConfiguration: mockApiConfig,
 						task: "test task",
@@ -3570,7 +3679,7 @@ describe("Cline", () => {
 			})
 
 			it("should create a fresh AbortController for each sequential request", async () => {
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "test task",
@@ -3648,7 +3757,7 @@ describe("Cline", () => {
 					mode: "architect",
 					mcpEnabled: false,
 				} as unknown as ProviderState)
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					task: "test task",
@@ -3761,7 +3870,7 @@ describe("Cline", () => {
 			["publishes an API request row that remains after persistence", false, 1],
 			["does not publish a stale API request row removed during persistence", true, 0],
 		])("%s", async (_description, removeRequestDuringSave, expectedUpdateCount) => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -3820,7 +3929,7 @@ describe("Cline", () => {
 
 	describe("safeEnsureModelFetched", () => {
 		it("loads model metadata before getModel is used", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -3836,7 +3945,7 @@ describe("Cline", () => {
 		})
 
 		it("swallows fetch failures so callers can fall back to defaults", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -3857,7 +3966,7 @@ describe("Cline", () => {
 		})
 
 		it("is a no-op when the api handler does not implement ensureModelFetched", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -3868,7 +3977,7 @@ describe("Cline", () => {
 		})
 
 		it("calls safeEnsureModelFetched from attemptApiRequest when context tokens are present", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -3923,7 +4032,7 @@ describe("Cline", () => {
 		})
 
 		it("continues attemptApiRequest when model metadata fetch fails", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -3983,7 +4092,7 @@ describe("Cline", () => {
 		})
 
 		it("fetches model metadata before caching the streaming model", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4044,7 +4153,7 @@ describe("Cline", () => {
 
 	describe("startTask", () => {
 		it("posts an empty transcript snapshot before adding the first task message", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "new task",
@@ -4071,7 +4180,7 @@ describe("Cline", () => {
 
 			const startPromise = taskAccess.startTask("new task")
 
-			expect(snapshotSpy).toHaveBeenCalledWith(task.taskId, { bumpSeq: true })
+			await vi.waitFor(() => expect(snapshotSpy).toHaveBeenCalledWith(task.taskId, { bumpSeq: true }))
 			expect(mockProvider.postStateToWebviewThrottled).not.toHaveBeenCalled()
 			expect(saySpy).not.toHaveBeenCalled()
 
@@ -4083,8 +4192,8 @@ describe("Cline", () => {
 			expect(initiateTaskLoopSpy).toHaveBeenCalledOnce()
 		})
 
-		it("starts without a snapshot when the provider reference is unavailable", async () => {
-			const task = new Task({
+		it("refuses to start without provider-owned execution authority", async () => {
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "new task",
@@ -4104,14 +4213,16 @@ describe("Cline", () => {
 
 			await expect(taskAccess.startTask("new task")).resolves.toBeUndefined()
 
-			expect(saySpy).toHaveBeenCalledWith("text", "new task", undefined)
-			expect(initiateTaskLoopSpy).toHaveBeenCalledOnce()
+			expect(saySpy).not.toHaveBeenCalled()
+			expect(initiateTaskLoopSpy).not.toHaveBeenCalled()
+			expect(task.executionBlocked).toBe(true)
+			expect(task["executionRefusalReason"]).toBe("owner_unknown")
 		})
 	})
 
 	describe("start()", () => {
-		it("should be a no-op if the task was already started in the constructor", () => {
-			const task = new Task({
+		it("should be a no-op after the first explicit start", async () => {
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4121,6 +4232,7 @@ describe("Cline", () => {
 			// Manually trigger start
 			const startTaskSpy = vi.spyOn(getTaskTestAccess(task), "startTask").mockImplementation(async () => {})
 			task.start()
+			await task.run()
 
 			expect(startTaskSpy).toHaveBeenCalledTimes(1)
 
@@ -4129,19 +4241,20 @@ describe("Cline", () => {
 			expect(startTaskSpy).toHaveBeenCalledTimes(1)
 		})
 
-		it("should not call startTask if already started via constructor", () => {
+		it("should not call startTask if already started via constructor", async () => {
 			// Create a task that starts immediately (startTask defaults to true)
 			// but mock startTask to prevent actual execution
 			const startTaskSpy = vi
 				.spyOn(getTaskTestAccess(Task.prototype), "startTask")
 				.mockImplementation(async () => {})
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
 				startTask: true,
 			})
+			await task.run()
 
 			// startTask was called by the constructor
 			expect(startTaskSpy).toHaveBeenCalledTimes(1)
@@ -4181,17 +4294,17 @@ describe("Cline", () => {
 					throw boom
 				})
 
-			new Task({
+			await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
 				startTask: true,
 			})
 
-			expect(startTaskSpy).toHaveBeenCalledTimes(1)
+			await vi.waitFor(() => expect(startTaskSpy).toHaveBeenCalledTimes(1))
 			await flushMicrotasks()
 
-			expect(consoleErrorSpy).toHaveBeenCalledWith("[Task#constructor] startTask failed:", boom)
+			expect(consoleErrorSpy).toHaveBeenCalledWith("[Task#constructor] run failed:", boom)
 			startTaskSpy.mockRestore()
 		})
 
@@ -4203,7 +4316,7 @@ describe("Cline", () => {
 					throw boom
 				})
 
-			new Task({
+			await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -4220,10 +4333,10 @@ describe("Cline", () => {
 				startTask: true,
 			})
 
-			expect(resumeSpy).toHaveBeenCalledTimes(1)
+			await vi.waitFor(() => expect(resumeSpy).toHaveBeenCalledTimes(1))
 			await flushMicrotasks()
 
-			expect(consoleErrorSpy).toHaveBeenCalledWith("[Task#constructor] resumeTaskFromHistory failed:", boom)
+			expect(consoleErrorSpy).toHaveBeenCalledWith("[Task#constructor] run failed:", boom)
 			resumeSpy.mockRestore()
 		})
 
@@ -4231,7 +4344,7 @@ describe("Cline", () => {
 			const boom = new Error("postState boom")
 			mockProvider.postStateToWebviewThrottled = vi.fn().mockRejectedValue(boom)
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4252,7 +4365,7 @@ describe("Cline", () => {
 
 		it("logs (instead of crashing) when startTask rejects from start()", async () => {
 			const boom = new Error("start() boom")
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4266,7 +4379,7 @@ describe("Cline", () => {
 			task.start()
 			await flushMicrotasks()
 
-			expect(consoleErrorSpy).toHaveBeenCalledWith("[Task#start] startTask failed:", boom)
+			await vi.waitFor(() => expect(consoleErrorSpy).toHaveBeenCalledWith("[Task#start] run failed:", boom))
 		})
 
 		it("swallows the expected abort rejection from presentAssistantMessageSafe", async () => {
@@ -4275,7 +4388,7 @@ describe("Cline", () => {
 				.spyOn(assistantMessageModule, "presentAssistantMessage")
 				.mockRejectedValue(new Error("[Task#presentAssistantMessage] task t.i aborted"))
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4304,7 +4417,7 @@ describe("Cline", () => {
 			const boom = new Error("present boom")
 			const presentSpy = vi.spyOn(assistantMessageModule, "presentAssistantMessage").mockRejectedValue(boom)
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4331,7 +4444,7 @@ describe("Cline", () => {
 			const realError = new Error("genuine downstream failure")
 			const presentSpy = vi.spyOn(assistantMessageModule, "presentAssistantMessage").mockRejectedValue(realError)
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4362,7 +4475,7 @@ describe("Cline", () => {
 			const abortError = new Error("[Task#presentAssistantMessage] task t.i aborted")
 			const presentSpy = vi.spyOn(assistantMessageModule, "presentAssistantMessage").mockRejectedValue(abortError)
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4396,7 +4509,7 @@ describe("Cline", () => {
 					throw boom
 				})
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4431,7 +4544,7 @@ describe("Cline", () => {
 				})
 			const saveSpy = vi.spyOn(getTaskTestAccess(Task.prototype), "saveClineMessages").mockResolvedValue(true)
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4452,7 +4565,7 @@ describe("Cline", () => {
 			// promise the suite awaits stays bounded. The .catch on the
 			// pending ask handles the never-resolved promise.
 			void task.ask("tool", "complete", false).catch(() => {})
-			await flushMicrotasks()
+			await vi.waitFor(() => expect(updateSpy).toHaveBeenCalled())
 
 			expect(updateSpy).toHaveBeenCalled()
 			expect(consoleErrorSpy).toHaveBeenCalledWith("[Task#ask] updateClineMessage failed:", boom)
@@ -4471,7 +4584,7 @@ describe("Cline", () => {
 					throw boom
 				})
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4507,7 +4620,7 @@ describe("Cline", () => {
 				})
 			vi.spyOn(getTaskTestAccess(Task.prototype), "saveClineMessages").mockResolvedValue(false)
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4537,7 +4650,7 @@ describe("Cline", () => {
 			const boom = new Error("follow-up update boom")
 			const updateSpy = vi.spyOn(getTaskTestAccess(Task.prototype), "updateClineMessage").mockRejectedValue(boom)
 			vi.spyOn(getTaskTestAccess(Task.prototype), "saveClineMessages").mockResolvedValue(true)
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -4619,7 +4732,7 @@ describe("Queued message processing after condense", () => {
 
 	it("processes queued message after condense completes", async () => {
 		const provider = createProvider()
-		const task = new Task({
+		const task = await createClaimedTask({
 			provider,
 			apiConfiguration: apiConfig,
 			task: "initial task",
@@ -4649,13 +4762,13 @@ describe("Queued message processing after condense", () => {
 		const providerA = createProvider()
 		const providerB = createProvider()
 
-		const taskA = new Task({
+		const taskA = await createClaimedTask({
 			provider: providerA,
 			apiConfiguration: apiConfig,
 			task: "task A",
 			startTask: false,
 		})
-		const taskB = new Task({
+		const taskB = await createClaimedTask({
 			provider: providerB,
 			apiConfiguration: apiConfig,
 			task: "task B",

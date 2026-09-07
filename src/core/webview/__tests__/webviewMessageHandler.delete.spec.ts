@@ -3,6 +3,7 @@ import { webviewMessageHandler } from "../webviewMessageHandler"
 import * as vscode from "vscode"
 import { ClineProvider } from "../ClineProvider"
 import { MessageManager } from "../../message-manager"
+import type { Task } from "../../task/Task"
 
 // Mock the saveTaskMessages function
 vi.mock("../../task-persistence", async (importOriginal) => ({
@@ -59,6 +60,7 @@ describe("webviewMessageHandler delete functionality", () => {
 
 		// Create mock task
 		getCurrentTaskMock = {
+			guardExecution: vi.fn<Task["guardExecution"]>().mockResolvedValue(true),
 			clineMessages: [],
 			apiConversationHistory: [],
 			overwriteClineMessages: vi.fn(async () => {}),

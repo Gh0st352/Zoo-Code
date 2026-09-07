@@ -18,6 +18,7 @@ type Runnable = {
 	resumeTaskFromHistory: () => Promise<void>
 	startTask: (task?: string, images?: string[]) => Promise<void>
 	startIdleTelemetryCheck: () => void
+	guardExecution: Task["guardExecution"]
 }
 
 function makeRunnable(overrides: Partial<Runnable> = {}): Runnable & { run(): Promise<void> } {
@@ -29,6 +30,7 @@ function makeRunnable(overrides: Partial<Runnable> = {}): Runnable & { run(): Pr
 		resumeTaskFromHistory: vi.fn().mockResolvedValue(undefined),
 		startTask: vi.fn().mockResolvedValue(undefined),
 		startIdleTelemetryCheck: vi.fn(),
+		guardExecution: vi.fn<Task["guardExecution"]>().mockResolvedValue(true),
 		...overrides,
 	}
 	// Bind the real run() implementation from Task.prototype to our stand-in.
@@ -38,6 +40,14 @@ function makeRunnable(overrides: Partial<Runnable> = {}): Runnable & { run(): Pr
 }
 
 describe("Task#run() dispatch", () => {
+	it("does not dispatch or start telemetry when authority is refused", async () => {
+		const obj = makeRunnable({ guardExecution: vi.fn<Task["guardExecution"]>().mockResolvedValue(false) })
+		await obj.run()
+		expect(obj.startTask).not.toHaveBeenCalled()
+		expect(obj.resumeTaskFromHistory).not.toHaveBeenCalled()
+		expect(obj.startIdleTelemetryCheck).not.toHaveBeenCalled()
+	})
+
 	it("returns the existing _runPromise when already set", async () => {
 		const sentinel = Promise.resolve()
 		const obj = makeRunnable({ _runPromise: sentinel })

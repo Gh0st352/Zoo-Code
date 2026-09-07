@@ -11,6 +11,8 @@ import { Task } from "../Task"
 import { ClineProvider } from "../../webview/ClineProvider"
 import { ContextProxy } from "../../config/ContextProxy"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
+import { createClaimedTask, installTaskHistoryFiles } from "../../../__tests__/helpers/task-fixtures"
+import { safeWriteJson } from "../../../utils/safeWriteJson"
 
 // Mock delay before any imports that might use it
 vi.mock("delay", () => ({
@@ -23,6 +25,7 @@ vi.mock("execa", () => ({
 }))
 
 vi.mock("../../../utils/safeWriteJson", () => ({
+	LOCK_STALE_MS: 31_000,
 	safeWriteJson: vi.fn().mockResolvedValue(undefined),
 }))
 
@@ -38,6 +41,8 @@ vi.mock("fs/promises", async (importOriginal) => {
 
 	return {
 		...actual,
+		realpath: vi.fn(async (value: string) => value),
+		readdir: vi.fn().mockResolvedValue([]),
 		...mockFunctions,
 		default: mockFunctions,
 	}
@@ -50,6 +55,7 @@ const { mockPWaitFor } = vi.hoisted(() => {
 vi.mock("p-wait-for", () => ({
 	default: mockPWaitFor,
 }))
+vi.mock("proper-lockfile", () => ({ lock: vi.fn(async () => async () => {}) }))
 
 vi.mock("vscode", () => {
 	const mockDisposable = { dispose: vi.fn() }
@@ -143,6 +149,7 @@ vi.mock("../../condense", async (importOriginal) => {
 })
 
 vi.mock("../../../utils/storage", () => ({
+	getStorageBasePath: vi.fn(async (storage: string) => storage),
 	getTaskDirectoryPath: vi
 		.fn()
 		.mockImplementation((globalStoragePath, taskId) => Promise.resolve(`${globalStoragePath}/tasks/${taskId}`)),
@@ -156,12 +163,15 @@ vi.mock("../../../utils/fs", () => ({
 }))
 
 describe("flushPendingToolResultsToHistory", () => {
-	let mockProvider: any
+	let mockProvider: ClineProvider
+	let historyFiles: ReturnType<typeof installTaskHistoryFiles>
+	const tasks: Task[] = []
 	let mockApiConfig: ProviderSettings
 	let mockOutputChannel: any
 	let mockExtensionContext: vscode.ExtensionContext
 
 	beforeEach(() => {
+		historyFiles = installTaskHistoryFiles()
 		if (!TelemetryService.hasInstance()) {
 			TelemetryService.createInstance([])
 		}
@@ -225,13 +235,36 @@ describe("flushPendingToolResultsToHistory", () => {
 		mockProvider.updateTaskHistory = vi.fn().mockResolvedValue(undefined)
 	})
 
-	it("should not save anything when userMessageContent is empty", async () => {
-		const task = new Task({
+	afterEach(async () => {
+		for (const task of tasks.splice(0)) await task.dispose()
+		await mockProvider.taskHistoryStore.initialized
+		mockProvider.taskHistoryStore.dispose()
+		historyFiles.restore()
+	})
+
+	async function createTask() {
+		const task = await createClaimedTask({
 			provider: mockProvider,
 			apiConfiguration: mockApiConfig,
 			task: "test task",
 			startTask: false,
 		})
+		tasks.push(task)
+		return task
+	}
+
+	async function saveAssistant(task: Task, ...toolIds: string[]) {
+		await task.overwriteApiConversationHistory([
+			{
+				role: "assistant",
+				content: toolIds.map((id) => ({ type: "tool_use", id, name: "write_to_file", input: {} })),
+			},
+		])
+		task.assistantMessageSavedToHistory = true
+	}
+
+	it("should not save anything when userMessageContent is empty", async () => {
+		const task = await createTask()
 
 		// Ensure userMessageContent is empty
 		task.userMessageContent = []
@@ -245,12 +278,8 @@ describe("flushPendingToolResultsToHistory", () => {
 	})
 
 	it("should save user message when userMessageContent has pending tool results", async () => {
-		const task = new Task({
-			provider: mockProvider,
-			apiConfiguration: mockApiConfig,
-			task: "test task",
-			startTask: false,
-		})
+		const task = await createTask()
+		await saveAssistant(task, "tool-123")
 
 		// Set up pending tool result in userMessageContent
 		task.userMessageContent = [
@@ -263,11 +292,11 @@ describe("flushPendingToolResultsToHistory", () => {
 
 		await task.flushPendingToolResultsToHistory()
 
-		// Should have saved 1 user message
-		expect(task.apiConversationHistory.length).toBe(1)
+		// One user result follows the already-durable assistant tool call.
+		expect(task.apiConversationHistory.length).toBe(2)
 
 		// Check user message with tool result
-		const userMessage = task.apiConversationHistory[0]
+		const userMessage = task.apiConversationHistory[1]
 		expect(userMessage.role).toBe("user")
 		expect(Array.isArray(userMessage.content)).toBe(true)
 		expect((userMessage.content as any[])[0].type).toBe("tool_result")
@@ -275,12 +304,8 @@ describe("flushPendingToolResultsToHistory", () => {
 	})
 
 	it("should clear userMessageContent after flushing", async () => {
-		const task = new Task({
-			provider: mockProvider,
-			apiConfiguration: mockApiConfig,
-			task: "test task",
-			startTask: false,
-		})
+		const task = await createTask()
+		await saveAssistant(task, "tool-456")
 
 		// Set up pending tool result
 		task.userMessageContent = [
@@ -298,12 +323,8 @@ describe("flushPendingToolResultsToHistory", () => {
 	})
 
 	it("should handle multiple tool results in a single flush", async () => {
-		const task = new Task({
-			provider: mockProvider,
-			apiConfiguration: mockApiConfig,
-			task: "test task",
-			startTask: false,
-		})
+		const task = await createTask()
+		await saveAssistant(task, "tool-1", "tool-2")
 
 		// Set up multiple pending tool results
 		task.userMessageContent = [
@@ -322,7 +343,7 @@ describe("flushPendingToolResultsToHistory", () => {
 		await task.flushPendingToolResultsToHistory()
 
 		// Check user message has both tool results
-		const userMessage = task.apiConversationHistory[0]
+		const userMessage = task.apiConversationHistory[1]
 		expect(Array.isArray(userMessage.content)).toBe(true)
 		expect((userMessage.content as any[]).length).toBe(2)
 		expect((userMessage.content as any[])[0].tool_use_id).toBe("tool-1")
@@ -330,12 +351,8 @@ describe("flushPendingToolResultsToHistory", () => {
 	})
 
 	it("should add timestamp to saved messages", async () => {
-		const task = new Task({
-			provider: mockProvider,
-			apiConfiguration: mockApiConfig,
-			task: "test task",
-			startTask: false,
-		})
+		const task = await createTask()
+		await saveAssistant(task, "tool-ts")
 
 		const beforeTs = Date.now()
 
@@ -352,20 +369,15 @@ describe("flushPendingToolResultsToHistory", () => {
 		const afterTs = Date.now()
 
 		// Message should have timestamp
-		expect((task.apiConversationHistory[0] as any).ts).toBeGreaterThanOrEqual(beforeTs)
-		expect((task.apiConversationHistory[0] as any).ts).toBeLessThanOrEqual(afterTs)
+		expect(task.apiConversationHistory[1].ts).toBeGreaterThanOrEqual(beforeTs)
+		expect(task.apiConversationHistory[1].ts).toBeLessThanOrEqual(afterTs)
 	})
 
 	it("should skip waiting for assistantMessageSavedToHistory when flag is already true", async () => {
-		const task = new Task({
-			provider: mockProvider,
-			apiConfiguration: mockApiConfig,
-			task: "test task",
-			startTask: false,
-		})
+		const task = await createTask()
 
 		// Set flag to true (assistant message already saved)
-		task.assistantMessageSavedToHistory = true
+		await saveAssistant(task, "tool-skip-wait")
 
 		// Set up pending tool result
 		task.userMessageContent = [
@@ -385,17 +397,12 @@ describe("flushPendingToolResultsToHistory", () => {
 		expect(mockPWaitFor).not.toHaveBeenCalled()
 
 		// Should still save the message
-		expect(task.apiConversationHistory.length).toBe(1)
-		expect((task.apiConversationHistory[0].content as any[])[0].tool_use_id).toBe("tool-skip-wait")
+		expect(task.apiConversationHistory.length).toBe(2)
+		expect(task.apiConversationHistory[1].content).toMatchObject([{ tool_use_id: "tool-skip-wait" }])
 	})
 
 	it("should wait for assistantMessageSavedToHistory when flag is false", async () => {
-		const task = new Task({
-			provider: mockProvider,
-			apiConfiguration: mockApiConfig,
-			task: "test task",
-			startTask: false,
-		})
+		const task = await createTask()
 
 		// Flag is false by default - assistant message not yet saved
 		expect(task.assistantMessageSavedToHistory).toBe(false)
@@ -411,23 +418,22 @@ describe("flushPendingToolResultsToHistory", () => {
 
 		// Clear mock call history
 		mockPWaitFor.mockClear()
+		mockPWaitFor.mockImplementationOnce(async () => {
+			// Simulate the assistant-history write completing while we wait.
+			await saveAssistant(task, "tool-wait")
+		})
 
 		await task.flushPendingToolResultsToHistory()
 
 		// Should have called pWaitFor since flag was false
 		expect(mockPWaitFor).toHaveBeenCalled()
 
-		// Should still save the message (mock resolves immediately)
-		expect(task.apiConversationHistory.length).toBe(1)
+		// The write completed before the wait returned; it is safe to save results.
+		expect(task.apiConversationHistory.length).toBe(2)
 	})
 
 	it("should not flush when task is aborted during wait", async () => {
-		const task = new Task({
-			provider: mockProvider,
-			apiConfiguration: mockApiConfig,
-			task: "test task",
-			startTask: false,
-		})
+		const task = await createTask()
 
 		// Flag is false - will need to wait
 		task.assistantMessageSavedToHistory = false
@@ -441,13 +447,35 @@ describe("flushPendingToolResultsToHistory", () => {
 			},
 		]
 
-		// Set abort flag - this will cause the condition in pWaitFor to return true
-		// AND will cause early return after the wait
-		task.abort = true
+		mockPWaitFor.mockImplementationOnce(async () => {
+			task.abort = true
+		})
 
 		await task.flushPendingToolResultsToHistory()
 
 		// Should not have saved anything since task was aborted
 		expect(task.apiConversationHistory.length).toBe(0)
+	})
+
+	it("refuses a result write when the wait resolves without assistant-history evidence", async () => {
+		const task = await createTask()
+		task.userMessageContent = [{ type: "tool_result", tool_use_id: "missing", content: "Keep me" }]
+		vi.mocked(safeWriteJson).mockClear()
+		expect(await task.flushPendingToolResultsToHistory()).toBe(false)
+		expect(task.apiConversationHistory).toEqual([])
+		expect(task.userMessageContent).toHaveLength(1)
+		expect(safeWriteJson).not.toHaveBeenCalled()
+	})
+
+	it("refuses stale-owner persistence and retains pending tool results", async () => {
+		const task = await createTask()
+		await saveAssistant(task, "stale")
+		task.userMessageContent = [{ type: "tool_result", tool_use_id: "stale", content: "Keep me" }]
+		expect((await mockProvider.taskHistoryStore.interruptTask(task.executionToken!)).kind).toBe("applied")
+		vi.mocked(safeWriteJson).mockClear()
+		expect(await task.flushPendingToolResultsToHistory()).toBe(false)
+		expect(task.userMessageContent).toHaveLength(1)
+		expect(task.executionBlocked).toBe(true)
+		expect(safeWriteJson).not.toHaveBeenCalled()
 	})
 })

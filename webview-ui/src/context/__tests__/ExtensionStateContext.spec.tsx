@@ -140,6 +140,35 @@ const TranscriptTestComponent = () => {
 }
 
 describe("ExtensionStateContext", () => {
+	it("maps scoped recovery messages and clears recovery/runtime identity on navigation", () => {
+		const Probe = () => {
+			const { currentTaskInstanceId, taskRecovery } = useExtensionState()
+			return <div data-testid="recovery-state">{JSON.stringify({ currentTaskInstanceId, taskRecovery })}</div>
+		}
+		render(
+			<ExtensionStateContextProvider initialState={{ currentTaskId: "first", currentTaskInstanceId: "runtime" }}>
+				<Probe />
+			</ExtensionStateContextProvider>,
+		)
+		const prompt = { taskId: "first", promptId: "prompt", choices: ["resume_independent" as const] }
+		act(() => dispatchExtensionMessage({ type: "taskRecovery", taskRecovery: prompt }))
+		expect(JSON.parse(screen.getByTestId("recovery-state").textContent!)).toEqual({
+			currentTaskInstanceId: "runtime",
+			taskRecovery: prompt,
+		})
+		act(() => dispatchExtensionMessage({ type: "state", state: { currentTaskId: "second" } }))
+		act(() => dispatchExtensionMessage({ type: "taskRecovery", taskRecovery: prompt }))
+		expect(JSON.parse(screen.getByTestId("recovery-state").textContent!)).toEqual({
+			currentTaskInstanceId: null,
+			taskRecovery: null,
+		})
+		act(() => dispatchExtensionMessage({ type: "state", state: { currentTaskId: null } }))
+		expect(JSON.parse(screen.getByTestId("recovery-state").textContent!)).toEqual({
+			currentTaskInstanceId: null,
+			taskRecovery: null,
+		})
+	})
+
 	it("initializes with empty allowedCommands array", () => {
 		render(
 			<ExtensionStateContextProvider>

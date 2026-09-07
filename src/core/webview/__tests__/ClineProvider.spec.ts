@@ -14,6 +14,7 @@ import {
 	type ExtensionMessage,
 	type ExtensionState,
 	type WebviewMessage,
+	type HistoryItem,
 	ORGANIZATION_ALLOW_ALL,
 	DEFAULT_CHECKPOINT_TIMEOUT_SECONDS,
 	DEFAULT_DIFF_FUZZY_THRESHOLD,
@@ -35,6 +36,7 @@ import { Terminal } from "../../../integrations/terminal/Terminal"
 import { MessageManager } from "../../message-manager"
 import { forceFullModelDetailsLoad, hasLoadedFullDetails } from "../../../api/providers/fetchers/lmstudio"
 import { ShadowCheckpointService } from "../../../services/checkpoints/ShadowCheckpointService"
+import { claimWebviewHistory, installWebviewHistoryFiles } from "../../../__tests__/helpers/webview-fixtures"
 
 const { mockAddCustomInstructions, mockTaskConstructor } = vi.hoisted(() => ({
 	mockAddCustomInstructions: vi.fn().mockResolvedValue("Combined instructions"),
@@ -57,6 +59,7 @@ vi.mock("p-wait-for", () => ({
 vi.mock("fs/promises", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("fs/promises")>()
 	const mocked = {
+		realpath: vi.fn(async (value: string) => value),
 		mkdir: vi.fn().mockResolvedValue(undefined),
 		writeFile: vi.fn().mockResolvedValue(undefined),
 		readFile: vi.fn().mockResolvedValue(""),
@@ -84,6 +87,7 @@ vi.mock("axios", () => ({
 }))
 
 vi.mock("../../../utils/safeWriteJson")
+vi.mock("proper-lockfile", () => ({ lock: vi.fn(async () => async () => {}) }))
 
 vi.mock("../../../utils/path", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../../../utils/path")>()
@@ -94,6 +98,7 @@ vi.mock("../../../utils/path", async (importOriginal) => {
 })
 
 vi.mock("../../../utils/storage", () => ({
+	getStorageBasePath: vi.fn(async (defaultPath: string) => defaultPath),
 	getSettingsDirectoryPath: vi.fn().mockResolvedValue("/test/settings/path"),
 	getTaskDirectoryPath: vi.fn().mockResolvedValue("/test/task/path"),
 	getGlobalStoragePath: vi.fn().mockResolvedValue("/test/storage/path"),
@@ -395,12 +400,30 @@ afterAll(() => {
 
 describe("ClineProvider", () => {
 	beforeAll(() => {
-		mockTaskConstructor.mockImplementation(function (options: any) {
-			const task: any = {
+		mockTaskConstructor.mockImplementation(function (options: TaskOptions) {
+			const task: Task = Object.assign(Object.create(Task.prototype) as Task, {
 				api: undefined,
+				apiConfiguration: options.apiConfiguration,
+				instanceId: options.executionToken?.owner.runtimeId,
+				executionToken:
+					options.executionToken &&
+					Object.freeze({
+						...options.executionToken,
+						owner: Object.freeze({ ...options.executionToken.owner }),
+					}),
+				// Direct handler units allow their runtime; history observers must remain blocked.
+				guardExecution: vi
+					.fn<Task["guardExecution"]>()
+					.mockImplementation(
+						async () =>
+							!task.abort && !task.executionBlocked && (!options.historyItem || !!task.executionToken),
+					),
+				hydrateForRecovery: vi.fn<Task["hydrateForRecovery"]>().mockResolvedValue(undefined),
+				awaitExecutionCleanup: vi.fn<Task["awaitExecutionCleanup"]>().mockResolvedValue(true),
 				abortTask: vi.fn(),
 				dispose: vi.fn().mockResolvedValue(undefined),
 				handleWebviewAskResponse: vi.fn(),
+				submitUserMessage: vi.fn<Task["submitUserMessage"]>().mockResolvedValue(undefined),
 				clineMessages: [],
 				apiConversationHistory: [],
 				overwriteClineMessages: vi.fn(),
@@ -409,9 +432,9 @@ describe("ClineProvider", () => {
 				setTaskNumber: vi.fn(),
 				setParentTask: vi.fn(),
 				setRootTask: vi.fn(),
-				taskId: options?.historyItem?.id || "test-task-id",
+				taskId: options.historyItem?.id ?? options.taskId ?? "test-task-id",
 				emit: vi.fn(),
-			}
+			})
 
 			Object.defineProperty(task, "messageManager", {
 				get: () => new MessageManager(task),
@@ -429,6 +452,12 @@ describe("ClineProvider", () => {
 	let mockWebviewView: any
 	let mockPostMessage: any
 	let updateGlobalStateSpy: any
+	let historyFiles: ReturnType<typeof installWebviewHistoryFiles> | undefined
+
+	afterEach(() => {
+		historyFiles?.restore()
+		historyFiles = undefined
+	})
 
 	beforeEach(() => {
 		vi.clearAllMocks()
@@ -554,13 +583,28 @@ describe("ClineProvider", () => {
 	})
 
 	test("loads full model details when preparing an LM Studio task", async () => {
-		await provider.performPreparationTasks({
+		historyFiles = installWebviewHistoryFiles()
+		const options = await claimWebviewHistory(provider, {
+			id: "lmstudio-task",
+			number: 1,
+			ts: 1,
+			task: "LM Studio",
+			tokensIn: 0,
+			tokensOut: 0,
+			totalCost: 0,
+		})
+		const task = new Task({
+			provider,
+			...options,
+			taskId: "lmstudio-task",
 			apiConfiguration: {
 				apiProvider: providerIdentifiers.lmstudio,
 				lmStudioBaseUrl: "http://localhost:1234",
 				lmStudioModelId: "test-model",
 			},
-		} as Task)
+		})
+		provider["rememberExecution"](options.executionToken, task)
+		await provider.performPreparationTasks(task)
 
 		expect(forceFullModelDetailsLoad).toHaveBeenCalledWith("http://localhost:1234", "test-model")
 	})
@@ -568,13 +612,28 @@ describe("ClineProvider", () => {
 	test("does not reload full model details when the LM Studio model is already loaded", async () => {
 		vi.mocked(hasLoadedFullDetails).mockReturnValue(true)
 
-		await provider.performPreparationTasks({
+		historyFiles = installWebviewHistoryFiles()
+		const options = await claimWebviewHistory(provider, {
+			id: "lmstudio-task",
+			number: 1,
+			ts: 1,
+			task: "LM Studio",
+			tokensIn: 0,
+			tokensOut: 0,
+			totalCost: 0,
+		})
+		const task = new Task({
+			provider,
+			...options,
+			taskId: "lmstudio-task",
 			apiConfiguration: {
 				apiProvider: providerIdentifiers.lmstudio,
 				lmStudioBaseUrl: "http://localhost:1234",
 				lmStudioModelId: "test-model",
 			},
-		} as Task)
+		})
+		provider["rememberExecution"](options.executionToken, task)
+		await provider.performPreparationTasks(task)
 
 		expect(forceFullModelDetailsLoad).not.toHaveBeenCalled()
 	})
@@ -632,6 +691,8 @@ describe("ClineProvider", () => {
 			Object.defineProperty(task, "taskId", { value: "aborted-task", writable: true })
 			task.abort = true
 			await provider.addClineToStack(task)
+			// Stack synchronization may finish initialization; isolate the visibility operation.
+			vi.mocked(mockOutputChannel.appendLine).mockClear()
 			Object.defineProperty(mockWebviewView, "visible", { value: false, configurable: true })
 			visibilityCallback()
 			expect(mockOutputChannel.appendLine).not.toHaveBeenCalled()
@@ -2590,14 +2651,29 @@ describe("ClineProvider", () => {
 		expect(disposeCalls).toHaveLength(1)
 	})
 
-	test("dispose drains every task in abort-then-cleanup order", async () => {
+	async function ownedShutdownTask(taskId: string) {
+		const options = await claimWebviewHistory(provider, {
+			id: taskId,
+			number: 1,
+			ts: 1,
+			task: "Shutdown",
+			tokensIn: 0,
+			tokensOut: 0,
+			totalCost: 0,
+		})
+		const task = new Task({ ...defaultTaskOptions, ...options, taskId })
+		provider["rememberExecution"](options.executionToken, task)
+		return task
+	}
+
+	test("dispose starts all shutdowns and preserves each task's abort-then-cleanup order", async () => {
+		historyFiles = installWebviewHistoryFiles()
 		let resolveCurrentAbort!: () => void
 		let resolveCurrentCleanup!: () => void
 		let resolveRemainingAbort!: () => void
 		let resolveRemainingCleanup!: () => void
-		const currentTask = {
+		const currentTask = Object.assign(await ownedShutdownTask("current-task"), {
 			taskId: "current-task",
-			instanceId: "current-instance",
 			emit: vi.fn(),
 			abortTask: vi.fn().mockReturnValue(
 				new Promise<void>((resolve) => {
@@ -2609,10 +2685,9 @@ describe("ClineProvider", () => {
 					resolveCurrentCleanup = resolve
 				}),
 			),
-		}
-		const remainingTask = {
+		})
+		const remainingTask = Object.assign(await ownedShutdownTask("remaining-task"), {
 			taskId: "remaining-task",
-			instanceId: "remaining-instance",
 			emit: vi.fn(),
 			abortTask: vi.fn().mockReturnValue(
 				new Promise<void>((resolve) => {
@@ -2624,10 +2699,10 @@ describe("ClineProvider", () => {
 					resolveRemainingCleanup = resolve
 				}),
 			),
-		}
+		})
 		Object.assign(provider, { taskRegistry: new TaskRegistry() })
-		provider["taskRegistry"].push(remainingTask as unknown as Task)
-		provider["taskRegistry"].push(currentTask as unknown as Task)
+		provider["taskRegistry"].push(remainingTask)
+		provider["taskRegistry"].push(currentTask)
 		let shutdownComplete = false
 
 		const shutdown = provider.dispose()
@@ -2638,11 +2713,18 @@ describe("ClineProvider", () => {
 			.catch(() => {})
 		await vi.waitFor(() => expect(currentTask.abortTask).toHaveBeenCalledOnce())
 		expect(currentTask.dispose).not.toHaveBeenCalled()
-		expect(remainingTask.abortTask).not.toHaveBeenCalled()
+		expect(remainingTask.abortTask).toHaveBeenCalledOnce()
+		expect(remainingTask.dispose).not.toHaveBeenCalled()
+		for (const task of [currentTask, remainingTask]) {
+			expect(await provider.taskHistoryStore.readAuthoritative(task.taskId)).toMatchObject({
+				execution: { phase: "suspended", cleanupPending: true },
+			})
+			expect(task.executionToken?.generation).toBe(1)
+		}
 
 		resolveCurrentAbort()
 		await vi.waitFor(() => expect(currentTask.dispose).toHaveBeenCalledOnce())
-		expect(remainingTask.abortTask).not.toHaveBeenCalled()
+		expect(remainingTask.dispose).not.toHaveBeenCalled()
 
 		resolveCurrentCleanup()
 		await vi.waitFor(() => expect(remainingTask.abortTask).toHaveBeenCalledOnce())
@@ -2655,64 +2737,84 @@ describe("ClineProvider", () => {
 		resolveRemainingCleanup()
 		await shutdown
 		expect(shutdownComplete).toBe(true)
+		for (const task of [currentTask, remainingTask]) {
+			expect(await provider.taskHistoryStore.readAuthoritative(task.taskId)).toMatchObject({
+				execution: { phase: "settled", cleanupPending: false },
+			})
+		}
 	})
 
 	test("dispose continues draining tasks after cleanup rejects", async () => {
+		historyFiles = installWebviewHistoryFiles()
 		const cleanupError = new Error("cleanup failed")
 		const logSpy = vi.spyOn(provider, "log")
-		const remainingTask = {
+		const remainingTask = Object.assign(await ownedShutdownTask("remaining-task"), {
 			taskId: "remaining-task",
-			instanceId: "remaining-instance",
 			emit: vi.fn(),
 			abortTask: vi.fn().mockResolvedValue(undefined),
 			dispose: vi.fn().mockResolvedValue(undefined),
-		}
-		const currentTask = {
+		})
+		const currentTask = Object.assign(await ownedShutdownTask("current-task"), {
 			taskId: "current-task",
-			instanceId: "current-instance",
 			emit: vi.fn(),
 			abortTask: vi.fn().mockResolvedValue(undefined),
 			dispose: vi.fn().mockRejectedValue(cleanupError),
-		}
+		})
 		Object.assign(provider, { taskRegistry: new TaskRegistry() })
-		provider["taskRegistry"].push(remainingTask as unknown as Task)
-		provider["taskRegistry"].push(currentTask as unknown as Task)
+		provider["taskRegistry"].push(remainingTask)
+		provider["taskRegistry"].push(currentTask)
 
 		await expect(provider.dispose()).resolves.toBeUndefined()
 
 		expect(currentTask.dispose).toHaveBeenCalledOnce()
 		expect(remainingTask.dispose).toHaveBeenCalledOnce()
 		expect(logSpy).toHaveBeenCalledWith(
-			"[ClineProvider#dispose] Task cleanup failed for current-task.current-instance: cleanup failed",
+			"[execution] Cleanup retained for current-task.runtime-current-task: Error: cleanup failed",
 		)
+		expect(await provider.taskHistoryStore.readAuthoritative(currentTask.taskId)).toMatchObject({
+			execution: { phase: "suspended", cleanupPending: true },
+		})
+		expect(await provider.taskHistoryStore.readAuthoritative(remainingTask.taskId)).toMatchObject({
+			execution: { phase: "settled", cleanupPending: false },
+		})
 	})
 
 	test("dispose continues draining tasks after abort rejects", async () => {
+		historyFiles = installWebviewHistoryFiles()
 		const abortError = new Error("abort failed")
-		const remainingTask = {
+		const logSpy = vi.spyOn(provider, "log")
+		const remainingTask = Object.assign(await ownedShutdownTask("remaining-task"), {
 			taskId: "remaining-task",
-			instanceId: "remaining-instance",
 			emit: vi.fn(),
 			abortTask: vi.fn().mockResolvedValue(undefined),
 			dispose: vi.fn().mockResolvedValue(undefined),
-		}
-		const currentTask = {
+		})
+		const currentTask = Object.assign(await ownedShutdownTask("current-task"), {
 			taskId: "current-task",
-			instanceId: "current-instance",
 			emit: vi.fn(),
 			abortTask: vi.fn().mockRejectedValue(abortError),
 			dispose: vi.fn().mockResolvedValue(undefined),
-		}
+		})
 		Object.assign(provider, { taskRegistry: new TaskRegistry() })
-		provider["taskRegistry"].push(remainingTask as unknown as Task)
-		provider["taskRegistry"].push(currentTask as unknown as Task)
+		provider["taskRegistry"].push(remainingTask)
+		provider["taskRegistry"].push(currentTask)
 
 		await expect(provider.dispose()).resolves.toBeUndefined()
 
 		expect(currentTask.abortTask).toHaveBeenCalledOnce()
-		expect(currentTask.dispose).toHaveBeenCalledOnce()
+		expect(currentTask.dispose).not.toHaveBeenCalled()
+		expect(currentTask.awaitExecutionCleanup).not.toHaveBeenCalled()
+		expect(logSpy).toHaveBeenCalledWith(
+			"[execution] Cleanup retained for current-task.runtime-current-task: Error: abort failed",
+		)
 		expect(remainingTask.abortTask).toHaveBeenCalledOnce()
 		expect(remainingTask.dispose).toHaveBeenCalledOnce()
+		expect(await provider.taskHistoryStore.readAuthoritative(currentTask.taskId)).toMatchObject({
+			execution: { phase: "suspended", cleanupPending: true },
+		})
+		expect(await provider.taskHistoryStore.readAuthoritative(remainingTask.taskId)).toMatchObject({
+			execution: { phase: "settled", cleanupPending: false },
+		})
 	})
 
 	test("handles webviewDidLaunch message", async () => {
@@ -2968,6 +3070,26 @@ describe("ClineProvider", () => {
 		const state = await provider.getStateToPostToWebview()
 
 		expect(state.allowedReadFiles).toEqual([])
+	})
+
+	test("posts exact runtime routing identity without making it execution authority", async () => {
+		await provider.resolveWebviewView(mockWebviewView)
+		// Only the fields read by state projection are needed in this shell test.
+		const task: Task = Object.assign(Object.create(Task.prototype) as Task, {
+			taskId: "scoped",
+			instanceId: "runtime",
+			clineMessages: [],
+		})
+		const current = vi.spyOn(provider, "getCurrentTask").mockReturnValue(task)
+		expect(await provider.getStateToPostToWebview()).toMatchObject({
+			currentTaskId: "scoped",
+			currentTaskInstanceId: "runtime",
+		})
+		current.mockReturnValue(undefined)
+		expect(await provider.getStateToPostToWebview()).toMatchObject({
+			currentTaskId: null,
+			currentTaskInstanceId: null,
+		})
 	})
 
 	test("getState returns the saved allowed write files", async () => {
@@ -3881,6 +4003,10 @@ describe("ClineProvider", () => {
 	})
 
 	describe("createTaskWithHistoryItem mode validation", () => {
+		beforeEach(() => {
+			historyFiles = installWebviewHistoryFiles()
+		})
+
 		test("validates and falls back to default mode when restored mode no longer exists", async () => {
 			await provider.resolveWebviewView(mockWebviewView)
 
@@ -3915,9 +4041,6 @@ describe("ClineProvider", () => {
 				listConfig: vi.fn().mockResolvedValue([]),
 			}
 
-			// Spy on log method to verify warning was logged
-			const logSpy = vi.spyOn(provider, "log")
-
 			// Create history item with non-existent mode
 			const historyItem = {
 				id: "test-id",
@@ -3931,7 +4054,7 @@ describe("ClineProvider", () => {
 			}
 
 			// Initialize with history item
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			// Verify mode validation occurred
 			expect(mockCustomModesManager.getCustomModes).toHaveBeenCalled()
@@ -3939,12 +4062,9 @@ describe("ClineProvider", () => {
 
 			// Verify fallback to default mode
 			expect(mockContext.globalState.update).toHaveBeenCalledWith("mode", "code")
-			expect(logSpy).toHaveBeenCalledWith(
-				"Mode 'non-existent-mode' from history no longer exists. Falling back to default mode 'code'.",
-			)
-
-			// Verify history item was updated with default mode
-			expect(historyItem.mode).toBe("code")
+			// Runtime fallback does not mutate the caller's snapshot or persisted history.
+			expect(historyItem.mode).toBe("non-existent-mode")
+			expect((await provider.taskHistoryStore.readAuthoritative(historyItem.id)).mode).toBe("non-existent-mode")
 		})
 
 		test("preserves mode when it exists in custom modes", async () => {
@@ -4004,7 +4124,7 @@ describe("ClineProvider", () => {
 			}
 
 			// Initialize with history item
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			// Verify mode validation occurred
 			expect(mockCustomModesManager.getCustomModes).toHaveBeenCalled()
@@ -4056,7 +4176,7 @@ describe("ClineProvider", () => {
 			}
 
 			// Initialize with history item
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			// Verify mode was preserved
 			expect(mockContext.globalState.update).toHaveBeenCalledWith("mode", "architect")
@@ -4087,13 +4207,13 @@ describe("ClineProvider", () => {
 			}
 
 			// Initialize with history item
-			await provider.createTaskWithHistoryItem(historyItem)
+			await provider.createTaskWithHistoryItem(historyItem, await claimWebviewHistory(provider, historyItem))
 
 			// Verify no mode validation occurred (mode update not called)
 			expect(mockContext.globalState.update).not.toHaveBeenCalledWith("mode", expect.any(String))
 		})
 
-		test("continues with task restoration even if mode config loading fails", async () => {
+		test("contains authorized restoration when mode config loading fails but permits inspection", async () => {
 			await provider.resolveWebviewView(mockWebviewView)
 
 			// Mock custom modes
@@ -4123,9 +4243,6 @@ describe("ClineProvider", () => {
 				activateProfile: vi.fn().mockRejectedValue(new Error("Failed to load config")),
 			}
 
-			// Spy on log method
-			const logSpy = vi.spyOn(provider, "log")
-
 			// Create history item
 			const historyItem = {
 				id: "test-id",
@@ -4138,13 +4255,52 @@ describe("ClineProvider", () => {
 				totalCost: 0,
 			}
 
-			// Initialize with history item - should not throw
-			await expect(provider.createTaskWithHistoryItem(historyItem)).resolves.not.toThrow()
-
-			// Verify error was logged but task restoration continued
-			expect(logSpy).toHaveBeenCalledWith(
-				expect.stringContaining("Failed to restore API configuration for mode 'code'"),
+			const prepare = vi.spyOn(provider, "performPreparationTasks")
+			const options = await claimWebviewHistory(provider, historyItem)
+			await expect(provider.createTaskWithHistoryItem(historyItem, options)).rejects.toThrow(
+				"Failed to load config",
 			)
+			expect(provider.getCurrentTask()).toBeUndefined()
+			expect(prepare).not.toHaveBeenCalled()
+			expect(await provider.taskHistoryStore.readAuthoritative(historyItem.id)).toMatchObject({
+				status: "interrupted",
+				execution: { phase: "settled", cleanupPending: false },
+			})
+			const inspected = await provider.createTaskWithHistoryItem(historyItem)
+			expect(inspected.executionToken).toBeUndefined()
+			expect(inspected.hydrateForRecovery).toHaveBeenCalledOnce()
+			expect(prepare).not.toHaveBeenCalled()
+		})
+
+		it.each([undefined, "completed"] as const)("opens %s ownerless history for inspection only", async (status) => {
+			const history: HistoryItem = {
+				id: "inspection",
+				number: 1,
+				ts: 1,
+				task: "Saved",
+				tokensIn: 0,
+				tokensOut: 0,
+				totalCost: 0,
+				status,
+				mode: "architect",
+				apiConfigName: "saved-profile",
+			}
+			await provider.taskHistoryStore.upsert(history)
+			const prepare = vi.spyOn(provider, "performPreparationTasks")
+			const activate = vi.spyOn(provider, "activateProviderProfile")
+			const schedule = vi.spyOn(provider["taskScheduler"], "schedule")
+			const claim = vi.spyOn(provider.taskHistoryStore, "claimNewTask")
+			const state = await provider.getState()
+			const task = await provider.createTaskWithHistoryItem(history)
+			expect(task.executionToken).toBeUndefined()
+			expect(await task.guardExecution()).toBe(false)
+			expect(task.hydrateForRecovery).toHaveBeenCalledOnce()
+			expect(prepare).not.toHaveBeenCalled()
+			expect(activate).not.toHaveBeenCalled()
+			expect(schedule).not.toHaveBeenCalled()
+			expect(claim).not.toHaveBeenCalled()
+			expect((await provider.getState()).mode).toBe(state.mode)
+			expect(await provider.taskHistoryStore.readAuthoritative(history.id)).toEqual(history)
 		})
 	})
 
@@ -4458,15 +4614,19 @@ describe("webviewMessageHandler no-floating-promises coverage", () => {
 	})
 
 	it("covers the changed task-operation happy paths", async () => {
-		const task = {
+		const task = Object.assign(Object.create(Task.prototype) as Task, {
 			taskId: "task-1",
+			guardExecution: vi.fn<Task["guardExecution"]>().mockResolvedValue(true),
 			handleTerminalOperation: vi.fn().mockResolvedValue(undefined),
-		}
+		} satisfies Partial<Task>)
 		const provider = createProvider({ getCurrentTask: vi.fn().mockReturnValue(task) })
 
 		await webviewMessageHandler(provider, { type: "terminalOperation", terminalOperation: "continue" })
 		await webviewMessageHandler(provider, { type: "exportCurrentTask" })
 		await webviewMessageHandler(provider, { type: "showTaskWithId", text: "task-2" })
+		vi.mocked(provider.getCurrentTask).mockReturnValue(
+			Object.assign(Object.create(Task.prototype) as Task, task, { taskId: "task-2" }),
+		)
 		await webviewMessageHandler(provider, { type: "condenseTaskContextRequest", text: "task-2" })
 		await webviewMessageHandler(provider, { type: "deleteTaskWithId", text: "task-2" })
 		await webviewMessageHandler(provider, { type: "exportTaskWithId", text: "task-2" })
@@ -4552,6 +4712,7 @@ describe("webviewMessageHandler no-floating-promises coverage", () => {
 		const importModeWithRules = provider.customModesManager.importModeWithRules as ReturnType<typeof vi.fn>
 		const showOpenDialog = vi.mocked(vscode.window.showOpenDialog)
 		const selectedFile = [{ fsPath: "/test/mode.yaml" } as vscode.Uri]
+		vi.mocked(fs.readFile).mockResolvedValueOnce("slug: mode-1").mockResolvedValueOnce("invalid mode")
 
 		showOpenDialog.mockResolvedValueOnce(selectedFile)
 		importModeWithRules.mockResolvedValueOnce({ success: true, slug: "mode-1" })

@@ -1,7 +1,16 @@
 import { TaskScheduler } from "../TaskScheduler"
 import { type Task } from "../Task"
 
-const stubTask = () => ({}) as unknown as Task
+function stubTask(): Task {
+	// Only the scheduler's authority boundary is doubled; real store admission is
+	// covered in Task.execution-authority.spec.ts.
+	const task: Pick<Task, "abort" | "abandoned" | "guardExecution"> = {
+		abort: false,
+		abandoned: false,
+		guardExecution: vi.fn(async (): Promise<boolean> => !task.abort && !task.abandoned),
+	}
+	return task as Task
+}
 
 describe("TaskScheduler", () => {
 	it("runs a task immediately when a permit is available", async () => {
@@ -19,16 +28,14 @@ describe("TaskScheduler", () => {
 		let resolveFirst!: () => void
 
 		const first = scheduler.schedule(stubTask(), () => new Promise<void>((res) => (resolveFirst = res)))
-		// Give the microtask queue a chance to acquire the permit.
-		await Promise.resolve()
+		await vi.waitFor(() => expect(resolveFirst).toBeDefined())
 
 		expect(scheduler.waiting).toBe(0)
 
 		const second = scheduler.schedule(stubTask(), async () => {
 			order.push(2)
 		})
-		await Promise.resolve()
-		expect(scheduler.waiting).toBe(1)
+		await vi.waitFor(() => expect(scheduler.waiting).toBe(1))
 
 		order.push(1)
 		resolveFirst()
@@ -47,9 +54,10 @@ describe("TaskScheduler", () => {
 		const a = scheduler.schedule(stubTask(), () => new Promise<void>((res) => (resolveA = res)))
 		const b = scheduler.schedule(stubTask(), () => new Promise<void>((res) => (resolveB = res)))
 
-		// Two microtask ticks: one for sem.acquire() in each schedule() call.
-		await Promise.resolve()
-		await Promise.resolve()
+		await vi.waitFor(() => {
+			expect(resolveA).toBeDefined()
+			expect(resolveB).toBeDefined()
+		})
 
 		expect(scheduler.waiting).toBe(0)
 		expect(resolveA).toBeDefined()
@@ -82,13 +90,11 @@ describe("TaskScheduler", () => {
 		let resolveRunning!: () => void
 		const running = scheduler.schedule(stubTask(), () => new Promise<void>((res) => (resolveRunning = res)))
 
-		await Promise.resolve()
+		await vi.waitFor(() => expect(resolveRunning).toBeDefined())
 
 		const errors: unknown[] = []
 		const queued = scheduler.schedule(stubTask(), async () => {}).catch((e) => errors.push(e))
-		await Promise.resolve()
-
-		expect(scheduler.waiting).toBe(1)
+		await vi.waitFor(() => expect(scheduler.waiting).toBe(1))
 		scheduler.cancelQueued()
 		expect(scheduler.waiting).toBe(0)
 
@@ -104,15 +110,15 @@ describe("TaskScheduler", () => {
 		const scheduler = new TaskScheduler(1)
 		let resolveFirst!: () => void
 		const first = scheduler.schedule(stubTask(), () => new Promise<void>((res) => (resolveFirst = res)))
-		await Promise.resolve()
+		await vi.waitFor(() => expect(resolveFirst).toBeDefined())
 
-		const abortedTask = { abort: true, abandoned: false } as unknown as Task
+		const abortedTask = stubTask()
 		let ran = false
 		const queued = scheduler.schedule(abortedTask, async () => {
 			ran = true
 		})
-		await Promise.resolve()
-		expect(scheduler.waiting).toBe(1)
+		await vi.waitFor(() => expect(scheduler.waiting).toBe(1))
+		abortedTask.abort = true
 
 		resolveFirst()
 		await Promise.all([first, queued])
@@ -130,14 +136,15 @@ describe("TaskScheduler", () => {
 		const scheduler = new TaskScheduler(1)
 		let resolveFirst!: () => void
 		const first = scheduler.schedule(stubTask(), () => new Promise<void>((res) => (resolveFirst = res)))
-		await Promise.resolve()
+		await vi.waitFor(() => expect(resolveFirst).toBeDefined())
 
-		const abandonedTask = { abort: false, abandoned: true } as unknown as Task
+		const abandonedTask = stubTask()
 		let ran = false
 		const queued = scheduler.schedule(abandonedTask, async () => {
 			ran = true
 		})
-		await Promise.resolve()
+		await vi.waitFor(() => expect(scheduler.waiting).toBe(1))
+		abandonedTask.abandoned = true
 
 		resolveFirst()
 		await Promise.all([first, queued])
@@ -149,11 +156,10 @@ describe("TaskScheduler", () => {
 		const scheduler = new TaskScheduler()
 		let resolveFirst!: () => void
 		const first = scheduler.schedule(stubTask(), () => new Promise<void>((res) => (resolveFirst = res)))
-		await Promise.resolve()
+		await vi.waitFor(() => expect(resolveFirst).toBeDefined())
 
 		const second = scheduler.schedule(stubTask(), async () => {})
-		await Promise.resolve()
-		expect(scheduler.waiting).toBe(1)
+		await vi.waitFor(() => expect(scheduler.waiting).toBe(1))
 
 		resolveFirst()
 		await Promise.all([first, second])

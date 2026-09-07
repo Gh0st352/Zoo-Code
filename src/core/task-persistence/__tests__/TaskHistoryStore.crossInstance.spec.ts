@@ -17,6 +17,7 @@ vi.mock("../../../utils/storage", () => ({
 
 // Mock safeWriteJson to use plain fs writes but honor the merge callback.
 vi.mock("../../../utils/safeWriteJson", () => ({
+	LOCK_STALE_MS: 31_000,
 	safeWriteJson: vi
 		.fn()
 		.mockImplementation(

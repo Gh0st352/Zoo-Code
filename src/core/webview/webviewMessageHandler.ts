@@ -21,6 +21,7 @@ import {
 	ExperimentId,
 	checkoutDiffPayloadSchema,
 	checkoutRestorePayloadSchema,
+	taskRecoveryDecisionSchema,
 	getCompletionCheckpoint,
 	providerIdentifiers,
 	retiredProviderIdentifiers,
@@ -36,6 +37,7 @@ import { CloudService } from "@roo-code/cloud"
 import { TelemetryService } from "@roo-code/telemetry"
 
 import { type ApiMessage } from "../task-persistence/apiMessages"
+import type { Task } from "../task/Task"
 import { saveTaskMessages } from "../task-persistence"
 import { importRooTaskHistory } from "../task-persistence/importRooTaskHistory"
 
@@ -104,6 +106,7 @@ const ALLOWED_VSCODE_SETTINGS = new Set(["terminal.integrated.inheritEnv"])
 let telemetrySettingQueue: Promise<void> = Promise.resolve()
 
 import { MarketplaceManager, MarketplaceItemType } from "../../services/marketplace"
+import { submitChatInput } from "./chatInput"
 import { setPendingTodoList } from "../tools/UpdateTodoListTool"
 import {
 	handleListWorktrees,
@@ -130,6 +133,60 @@ export const webviewMessageHandler = async (
 
 	const getCurrentCwd = () => {
 		return provider.getCurrentTask()?.cwd || provider.cwd
+	}
+
+	// Task-local messages may not migrate to another runtime, even for the same task ID.
+	const isCurrentTask = (task: Task) =>
+		provider.getCurrentTask() === task && (message.taskId === undefined || message.taskId === task.taskId)
+
+	// Diagnose dropped input without recording its contents or execution authority.
+	// Logging must remain observational, including when the output channel is disposed.
+	const traceUserInput = (
+		stage: "received" | "refused" | "delivered" | "queued" | "created" | "failed",
+		task?: Task,
+		reason?: string,
+	) => {
+		if (message.type !== "newTask" && message.type !== "askResponse" && message.type !== "queueMessage") return
+		try {
+			const recovery = provider["recoveryPrompt"]
+			const presentation = task && recovery?.task === task ? recovery.presentation : undefined
+			provider.log(
+				`[user-input] ${JSON.stringify({
+					at: new Date().toISOString(),
+					stage,
+					reason,
+					messageType: message.type,
+					responseType: message.askResponse,
+					requestedTaskId: message.taskId,
+					taskId: task?.taskId,
+					instanceId: task?.instanceId,
+					taskStatus: task?.taskStatus,
+					hasText: typeof message.text === "string" && message.text.trim().length > 0,
+					imageCount: message.images?.length ?? 0,
+					abort: task?.abort,
+					abandoned: task?.abandoned,
+					executionBlocked: task?.executionBlocked,
+					executionRefusalReason: task?.executionBlocked ? task["executionRefusalReason"] : undefined,
+					hasExecutionToken: !!task?.executionToken,
+					queueLength: task?.messageQueueService?.messages?.length,
+					recoveryReason: presentation?.reason,
+					recoveryChoices: presentation?.choices,
+				})}`,
+			)
+		} catch {
+			// Diagnostics cannot change message admission or revive a stopped task.
+		}
+	}
+
+	const guardCurrentTask = async (task: Task) => {
+		if (!isCurrentTask(task)) {
+			traceUserInput("refused", task, "not_current_task")
+			return false
+		}
+		const allowed = await task.guardExecution()
+		if (!allowed) traceUserInput("refused", task, "execution_guard")
+		else if (!isCurrentTask(task)) traceUserInput("refused", task, "not_current_task")
+		return allowed
 	}
 
 	const isCloudServiceAvailable = () => CloudService.hasInstance()
@@ -212,15 +269,18 @@ export const webviewMessageHandler = async (
 	 * Resolves image file mentions in incoming messages.
 	 * Matches read_file behavior: respects size limits and model capabilities.
 	 */
-	const resolveIncomingImages = async (payload: { text?: string; images?: string[] }) => {
+	const resolveIncomingImages = async (
+		payload: { text?: string; images?: string[] },
+		currentTask = provider.getCurrentTask(),
+	) => {
 		const text = payload.text ?? ""
 		const images = payload.images
-		const currentTask = provider.getCurrentTask()
+		const cwd = currentTask?.cwd || provider.cwd
 		const state = await provider.getState()
 		const resolved = await resolveImageMentions({
 			text,
 			images,
-			cwd: getCurrentCwd(),
+			cwd,
 			rooIgnoreController: currentTask?.rooIgnoreController,
 			maxImageFileSize: state.maxImageFileSize,
 			maxTotalImageSize: state.maxTotalImageSize,
@@ -300,6 +360,7 @@ export const webviewMessageHandler = async (
 			console.error("[handleDeleteMessageConfirm] No current cline available")
 			return
 		}
+		if (!(await guardCurrentTask(currentCline)) || !isCurrentTask(currentCline)) return
 
 		const { messageIndex, apiConversationHistoryIndex } = findMessageIndices(messageTs, currentCline)
 		// Determine API truncation index with timestamp fallback if exact match not found
@@ -353,6 +414,7 @@ export const webviewMessageHandler = async (
 
 				// Delete this message and all subsequent messages using MessageManager
 				await currentCline.messageManager.rewindToTimestamp(targetMessage.ts!, { includeTargetMessage: false })
+				if (!(await guardCurrentTask(currentCline)) || !isCurrentTask(currentCline)) return
 
 				// Restore checkpoint associations for preserved messages
 				for (const [ts, checkpoint] of preservedCheckpoints) {
@@ -368,6 +430,7 @@ export const webviewMessageHandler = async (
 					taskId: currentCline.taskId,
 					globalStoragePath: provider.contextProxy.globalStorageUri.fsPath,
 				})
+				if (!(await guardCurrentTask(currentCline)) || !isCurrentTask(currentCline)) return
 
 				// Rewind posts before checkpoint metadata is restored. Publish the
 				// persisted transcript so checkpoint filtering and controls stay current.
@@ -420,16 +483,13 @@ export const webviewMessageHandler = async (
 	 * Handles confirmed message editing from webview dialog
 	 */
 	const handleEditMessageConfirm = async (
+		currentCline: Task,
 		messageTs: number,
 		editedContent: string,
 		restoreCheckpoint?: boolean,
 		images?: string[],
 	): Promise<void> => {
-		const currentCline = provider.getCurrentTask()
-		if (!currentCline) {
-			console.error("[handleEditMessageConfirm] No current cline available")
-			return
-		}
+		if (!(await guardCurrentTask(currentCline)) || !isCurrentTask(currentCline)) return
 
 		// Use findMessageIndices to find messages based on timestamp
 		const { messageIndex, apiConversationHistoryIndex } = findMessageIndices(messageTs, currentCline)
@@ -523,6 +583,7 @@ export const webviewMessageHandler = async (
 			const rewindTs = currentCline.clineMessages[deleteFromMessageIndex]?.ts
 			if (rewindTs) {
 				await currentCline.messageManager.rewindToTimestamp(rewindTs, { includeTargetMessage: false })
+				if (!(await guardCurrentTask(currentCline)) || !isCurrentTask(currentCline)) return
 			}
 
 			// Restore checkpoint associations for preserved messages
@@ -539,10 +600,12 @@ export const webviewMessageHandler = async (
 				taskId: currentCline.taskId,
 				globalStoragePath: provider.contextProxy.globalStorageUri.fsPath,
 			})
+			if (!(await guardCurrentTask(currentCline)) || !isCurrentTask(currentCline)) return
 
 			// Rewind posts before checkpoint metadata is restored. Publish that
 			// restored state before the edited message starts a new delta stream.
 			await currentCline.overwriteClineMessages(currentCline.clineMessages)
+			if (!(await guardCurrentTask(currentCline)) || !isCurrentTask(currentCline)) return
 			await currentCline.submitUserMessage(editedContent, images)
 		} catch (error) {
 			console.error("Error in edit message:", error)
@@ -692,22 +755,30 @@ export const webviewMessageHandler = async (
 
 			provider.isViewLaunched = true
 			break
+		case "submitChatMessage": {
+			const chatInputResult = await submitChatInput(provider, message.chatInput, resolveIncomingImages)
+			if (chatInputResult) await provider.postMessageToWebview({ type: "chatInputResult", chatInputResult })
+			break
+		}
 		case "newTask":
 			// Initializing new instance of Cline will make sure that any
 			// agentically running promises in old instance don't affect our new
 			// task. This essentially creates a fresh slate for the new task.
+			traceUserInput("received", provider.getCurrentTask())
 			try {
 				const resolved = await resolveIncomingImages({ text: message.text, images: message.images })
-				await provider.createTask(
+				const task = await provider.createTask(
 					resolved.text,
 					resolved.images,
 					undefined,
 					{ taskId: message.taskId },
 					message.taskConfiguration,
 				)
+				traceUserInput("created", task)
 				// Task created successfully - notify the UI to reset
 				await provider.postMessageToWebview({ type: "invoke", invoke: "newChat" })
 			} catch (error) {
+				traceUserInput("failed", provider.getCurrentTask(), "new_task")
 				// For all errors, reset the UI and show error
 				await provider.postMessageToWebview({ type: "invoke", invoke: "newChat" })
 				// Show error to user
@@ -720,12 +791,60 @@ export const webviewMessageHandler = async (
 			await provider.updateCustomInstructions(message.text)
 			break
 
+		case "previewTaskRecovery":
+			if (typeof message.taskId === "string" && message.taskId.length > 0) {
+				// The provider publishes the prompt and retains its authoritative scope.
+				await provider.previewTaskRecovery(message.taskId)
+			}
+			break
+
+		case "recoverTask": {
+			const decision = message.taskRecoveryDecision
+			const parsed = taskRecoveryDecisionSchema.safeParse(decision)
+			if (!parsed.success) {
+				// Refuse malformed scoped decisions without trusting any client authority fields.
+				// Unscoped input cannot safely be correlated with a task and is simply ignored.
+				if (decision && typeof decision.taskId === "string" && decision.taskId.length > 0) {
+					await provider.postMessageToWebview({
+						type: "taskRecoveryResult",
+						taskRecoveryResult: {
+							kind: "refused",
+							taskId: decision.taskId,
+							promptId: typeof decision.promptId === "string" ? decision.promptId : undefined,
+							reason: decision.intent === "explicit_user_resume" ? "stale_scope" : "wrong_intent",
+						},
+					})
+				}
+				break
+			}
+			const taskRecoveryResult = await provider.recoverTask(parsed.data).catch(() => ({
+				kind: "refused" as const,
+				taskId: parsed.data.taskId,
+				promptId: parsed.data.promptId,
+				reason: "history_io_error" as const,
+			}))
+			// Publication failure must not relabel a committed recovery as refused.
+			await provider.postMessageToWebview({
+				type: "taskRecoveryResult",
+				taskRecoveryResult,
+				requestId: message.requestId,
+			})
+			break
+		}
+
 		case "askResponse":
 			{
-				const resolved = await resolveIncomingImages({ text: message.text, images: message.images })
-				provider
-					.getCurrentTask()
-					?.handleWebviewAskResponse(message.askResponse!, resolved.text, resolved.images)
+				const task = provider.getCurrentTask()
+				traceUserInput("received", task)
+				if (!task || !message.askResponse) {
+					traceUserInput("refused", task, task ? "missing_response" : "no_current_task")
+					break
+				}
+				if (!(await guardCurrentTask(task)) || !isCurrentTask(task)) break
+				const resolved = await resolveIncomingImages({ text: message.text, images: message.images }, task)
+				if (!(await guardCurrentTask(task)) || !isCurrentTask(task)) break
+				await task.handleWebviewAskResponse(message.askResponse, resolved.text, resolved.images)
+				traceUserInput("delivered", task)
 			}
 			break
 
@@ -867,11 +986,19 @@ export const webviewMessageHandler = async (
 
 			break
 
-		case "terminalOperation":
-			if (message.terminalOperation) {
-				await provider.getCurrentTask()?.handleTerminalOperation(message.terminalOperation)
+		case "terminalOperation": {
+			const task = provider.getCurrentTask()
+			if (task && message.terminalOperation && isCurrentTask(task)) {
+				// Stopping external work must remain possible after execution is fenced.
+				if (
+					message.terminalOperation === "continue" &&
+					(!(await guardCurrentTask(task)) || !isCurrentTask(task))
+				)
+					break
+				await task.handleTerminalOperation(message.terminalOperation)
 			}
 			break
+		}
 		case "clearTask":
 			// Clear task resets the current session. Delegation flows are
 			// handled via metadata; parent resumption occurs through
@@ -911,9 +1038,12 @@ export const webviewMessageHandler = async (
 		case "showTaskWithId":
 			await provider.showTaskWithId(message.text!)
 			break
-		case "condenseTaskContextRequest":
-			await provider.condenseTaskContext(message.text!)
+		case "condenseTaskContextRequest": {
+			const task = provider.getCurrentTask()
+			if (!task || task.taskId !== message.text || !(await guardCurrentTask(task)) || !isCurrentTask(task)) break
+			await provider.condenseTaskContext(task.taskId)
 			break
+		}
 		case "deleteTaskWithId":
 			await provider.deleteTaskWithId(message.text!)
 			break
@@ -1582,19 +1712,25 @@ export const webviewMessageHandler = async (
 			break
 		case "checkpointRestore": {
 			const result = checkoutRestorePayloadSchema.safeParse(message.payload)
+			const task = provider.getCurrentTask()
 
-			if (result.success) {
+			if (result.success && task && (await guardCurrentTask(task)) && isCurrentTask(task)) {
 				await provider.cancelTask()
+				const restoredTask = provider.getCurrentTask()
+				if (!restoredTask || restoredTask.taskId !== task.taskId) break
 
 				try {
-					await pWaitFor(() => provider.getCurrentTask()?.isInitialized === true, { timeout: 3_000 })
+					await pWaitFor(() => !isCurrentTask(restoredTask) || restoredTask.isInitialized === true, {
+						timeout: 3_000,
+					})
 				} catch (error) {
 					vscode.window.showErrorMessage(t("common:errors.checkpoint_timeout"))
 					return
 				}
 
 				try {
-					await provider.getCurrentTask()?.checkpointRestore(result.data)
+					if (!(await guardCurrentTask(restoredTask)) || !isCurrentTask(restoredTask)) break
+					await restoredTask.checkpointRestore(result.data)
 				} catch (error) {
 					vscode.window.showErrorMessage(t("common:errors.checkpoint_failed"))
 				}
@@ -1621,24 +1757,23 @@ export const webviewMessageHandler = async (
 			const checkpoint = currentCline ? resolveCompletionCheckpoint(currentCline) : undefined
 
 			if (currentCline && checkpoint) {
+				if (!(await guardCurrentTask(currentCline)) || !isCurrentTask(currentCline)) break
 				const originalTaskId = currentCline.taskId
 				await provider.cancelTask()
+				const restoredTask = provider.getCurrentTask()
+				if (!restoredTask || restoredTask.taskId !== originalTaskId) break
 
 				try {
-					await pWaitFor(() => provider.getCurrentTask()?.isInitialized === true, { timeout: 3_000 })
+					await pWaitFor(() => !isCurrentTask(restoredTask) || restoredTask.isInitialized === true, {
+						timeout: 3_000,
+					})
 				} catch (error) {
 					vscode.window.showErrorMessage(t("common:errors.checkpoint_timeout"))
 					return
 				}
 
 				try {
-					const restoredTask = provider.getCurrentTask()
-
-					if (!restoredTask || restoredTask.taskId !== originalTaskId) {
-						vscode.window.showErrorMessage(t("common:errors.checkpoint_failed"))
-						return
-					}
-
+					if (!(await guardCurrentTask(restoredTask)) || !isCurrentTask(restoredTask)) break
 					await restoredTask.checkpointRestore({
 						ts: checkpoint.ts,
 						commitHash: checkpoint.commitHash,
@@ -2181,7 +2316,8 @@ export const webviewMessageHandler = async (
 		case "updateTodoList": {
 			const payload = message.payload as { todos?: any[] }
 			const todos = payload?.todos
-			if (Array.isArray(todos)) {
+			const task = provider.getCurrentTask()
+			if (Array.isArray(todos) && task && (await guardCurrentTask(task)) && isCurrentTask(task)) {
 				await setPendingTodoList(todos)
 			}
 			break
@@ -2328,8 +2464,11 @@ export const webviewMessageHandler = async (
 			break
 		case "editMessageConfirm":
 			if (message.messageTs && message.text) {
-				const resolved = await resolveIncomingImages({ text: message.text, images: message.images })
+				const task = provider.getCurrentTask()
+				if (!task || !(await guardCurrentTask(task)) || !isCurrentTask(task)) break
+				const resolved = await resolveIncomingImages({ text: message.text, images: message.images }, task)
 				await handleEditMessageConfirm(
+					task,
 					message.messageTs,
 					resolved.text,
 					message.restoreCheckpoint,
@@ -3749,18 +3888,31 @@ export const webviewMessageHandler = async (
 		 */
 
 		case "queueMessage": {
-			const resolved = await resolveIncomingImages({ text: message.text, images: message.images })
-			provider.getCurrentTask()?.messageQueueService.addMessage(resolved.text, resolved.images)
+			const task = provider.getCurrentTask()
+			traceUserInput("received", task)
+			if (!task) {
+				traceUserInput("refused", task, "no_current_task")
+				break
+			}
+			if (!(await guardCurrentTask(task)) || !isCurrentTask(task)) break
+			const resolved = await resolveIncomingImages({ text: message.text, images: message.images }, task)
+			if (!(await guardCurrentTask(task)) || !isCurrentTask(task)) break
+			task.messageQueueService.addMessage(resolved.text, resolved.images)
+			traceUserInput("queued", task)
 			break
 		}
 		case "removeQueuedMessage": {
-			provider.getCurrentTask()?.messageQueueService.removeMessage(message.text ?? "")
+			const task = provider.getCurrentTask()
+			if (!task || !(await guardCurrentTask(task)) || !isCurrentTask(task)) break
+			task.messageQueueService.removeMessage(message.text ?? "")
 			break
 		}
 		case "editQueuedMessage": {
 			if (message.payload) {
+				const task = provider.getCurrentTask()
+				if (!task || !(await guardCurrentTask(task)) || !isCurrentTask(task)) break
 				const { id, text, images } = message.payload as EditQueuedMessagePayload
-				provider.getCurrentTask()?.messageQueueService.updateMessage(id, text, images)
+				task.messageQueueService.updateMessage(id, text, images)
 			}
 
 			break

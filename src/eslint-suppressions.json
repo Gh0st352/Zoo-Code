@@ -4,11 +4,6 @@
 			"count": 4
 		}
 	},
-	"__tests__/abandonSubtask.spec.ts": {
-		"@typescript-eslint/no-explicit-any": {
-			"count": 20
-		}
-	},
 	"__tests__/api-subtask.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
 			"count": 4
@@ -24,29 +19,9 @@
 			"count": 6
 		}
 	},
-	"__tests__/history-resume-delegation.spec.ts": {
-		"@typescript-eslint/no-explicit-any": {
-			"count": 71
-		}
-	},
 	"__tests__/migrateSettings.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
 			"count": 4
-		}
-	},
-	"__tests__/nested-delegation-resume.spec.ts": {
-		"@typescript-eslint/no-explicit-any": {
-			"count": 20
-		}
-	},
-	"__tests__/new-task-delegation.spec.ts": {
-		"@typescript-eslint/no-explicit-any": {
-			"count": 9
-		}
-	},
-	"__tests__/provider-delegation.spec.ts": {
-		"@typescript-eslint/no-explicit-any": {
-			"count": 9
 		}
 	},
 	"activate/CodeActionProvider.ts": {
@@ -796,27 +771,12 @@
 	},
 	"core/task/Task.ts": {
 		"@typescript-eslint/no-explicit-any": {
-			"count": 17
-		}
-	},
-	"core/task/__tests__/Task.dispose.test.ts": {
-		"@typescript-eslint/no-explicit-any": {
-			"count": 3
-		}
-	},
-	"core/task/__tests__/Task.persistence.spec.ts": {
-		"@typescript-eslint/no-explicit-any": {
-			"count": 8
+			"count": 12
 		}
 	},
 	"core/task/__tests__/Task.sticky-profile-race.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
 			"count": 3
-		}
-	},
-	"core/task/__tests__/Task.throttle.test.ts": {
-		"@typescript-eslint/no-explicit-any": {
-			"count": 24
 		}
 	},
 	"core/task/__tests__/apiConversationHistory.spec.ts": {
@@ -836,7 +796,7 @@
 	},
 	"core/task/__tests__/flushPendingToolResultsToHistory.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
-			"count": 14
+			"count": 10
 		}
 	},
 	"core/task/__tests__/grace-retry-errors.spec.ts": {
@@ -889,11 +849,6 @@
 			"count": 1
 		}
 	},
-	"core/tools/NewTaskTool.ts": {
-		"@typescript-eslint/no-explicit-any": {
-			"count": 1
-		}
-	},
 	"core/tools/ReadFileTool.ts": {
 		"@typescript-eslint/no-explicit-any": {
 			"count": 4
@@ -927,11 +882,6 @@
 	"core/tools/__tests__/askFollowupQuestionTool.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
 			"count": 20
-		}
-	},
-	"core/tools/__tests__/attemptCompletionTool.spec.ts": {
-		"@typescript-eslint/no-explicit-any": {
-			"count": 11
 		}
 	},
 	"core/tools/__tests__/editFileTool.spec.ts": {
@@ -971,7 +921,7 @@
 	},
 	"core/tools/__tests__/newTaskTool.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
-			"count": 26
+			"count": 6
 		}
 	},
 	"core/tools/__tests__/readFileTool.spec.ts": {
@@ -1026,7 +976,7 @@
 	},
 	"core/webview/ClineProvider.ts": {
 		"@typescript-eslint/no-explicit-any": {
-			"count": 8
+			"count": 6
 		}
 	},
 	"core/webview/__tests__/ClineProvider.apiHandlerRebuild.spec.ts": {
@@ -1036,7 +986,7 @@
 	},
 	"core/webview/__tests__/ClineProvider.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
-			"count": 196
+			"count": 194
 		}
 	},
 	"core/webview/__tests__/ClineProvider.sticky-mode.spec.ts": {
@@ -1051,7 +1001,7 @@
 	},
 	"core/webview/__tests__/ClineProvider.taskHistory.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
-			"count": 12
+			"count": 8
 		}
 	},
 	"core/webview/__tests__/checkpointRestoreHandler.spec.ts": {
@@ -1121,7 +1071,7 @@
 	},
 	"core/webview/__tests__/webviewMessageHandler.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
-			"count": 35
+			"count": 34
 		}
 	},
 	"core/webview/messageEnhancer.ts": {

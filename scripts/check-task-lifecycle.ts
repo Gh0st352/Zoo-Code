@@ -1,12 +1,20 @@
 import assert from "node:assert/strict"
+import { checkExecutionProtocol } from "./check-task-execution-protocol"
 
-import type { HistoryItem } from "../packages/types/src/history"
+import type { DelegationAction, HistoryItem, PendingTaskAction } from "../packages/types/src/history"
 
 import {
 	abandonDelegatedChild,
 	completeDelegatedChild,
 	delegateTaskToChild,
 	interruptDelegatedChild,
+	assertDelegationAdmission,
+	commitDelegation,
+	delegationBlocked,
+	delegationState,
+	failDelegation,
+	reconcileDelegationResult,
+	reserveDelegation,
 } from "../src/core/task-persistence/taskLifecycle"
 
 const taskIds = ["parent", "child-a", "child-b"] as const
@@ -281,7 +289,156 @@ function runRepresentativeScenarios(): void {
 }
 
 runRepresentativeScenarios()
+
+/** Containment-only product; explicit recovery is explored separately by checkExecutionProtocol. */
+function checkDelegationActionProtocol(): void {
+	const action: PendingTaskAction = {
+		kind: "create_subtask",
+		actionId: "call",
+		approvalText: "{}",
+		mode: "code",
+		message: "child",
+		todos: [],
+	}
+	const receipt: DelegationAction = {
+		actionId: action.actionId,
+		intent: action,
+		operationId: "op",
+		childId: "child-a",
+		ownerToken: "owner-0",
+		generation: 0,
+		revision: 0,
+		phase: "prepared",
+		attempts: 1,
+		resultTs: 1,
+	}
+	type State = {
+		item: HistoryItem
+		allocated: boolean
+		scheduled: boolean
+		restored: boolean
+		reloaded: boolean
+		rejected: boolean
+	}
+	const initial: State = {
+		item: { ...task("parent"), pendingAction: action },
+		allocated: false,
+		scheduled: false,
+		restored: false,
+		reloaded: false,
+		rejected: false,
+	}
+	const queue = [{ state: initial, trace: [] as string[] }]
+	const visited = new Set<string>()
+	const reached = new Set<string>()
+	const landmarks = new Set<string>()
+	for (let index = 0; index < queue.length; index++) {
+		const { state, trace } = queue[index]
+		assert(trace.length <= 14, `Action protocol depth exceeded: ${trace.join(" -> ")}`)
+		const entry = delegationState(state.item).actions[0]
+		assert(!state.scheduled || entry?.phase === "committed", `Execution before commit: ${trace}`)
+		assert(!state.scheduled || !delegationBlocked(state.item), `Blocked execution: ${trace}`)
+		assert(!entry || entry.attempts <= 1, `Retry budget reset: ${trace}`)
+		if (delegationBlocked(state.item)) assert.throws(() => assertDelegationAdmission(state.item, action))
+		if (state.rejected && state.item.status === "interrupted") landmarks.add("interrupted-parent-refusal")
+		if (state.restored && state.reloaded && entry?.phase === "failed") landmarks.add("failed-restored-reloaded")
+		if (state.rejected && state.item.executionGeneration === 1 && state.allocated)
+			landmarks.add("owner-change-at-commit")
+		if (state.rejected && entry?.phase === "committed") landmarks.add("duplicate-after-commit")
+		if (state.reloaded && entry?.phase === "prepared") landmarks.add("prepared-reload-blocked")
+		if (state.reloaded && entry?.phase === "uncertain") landmarks.add("uncertain-reload-blocked")
+		if (entry?.phase === "failed" && entry.resultWritten) {
+			assert(delegationBlocked(state.item), "Result repair removed the recovery gate")
+			landmarks.add("failed-result-repaired-still-blocked")
+		}
+		const next = (name: string, change: Partial<State>) => {
+			reached.add(name)
+			const candidate = { ...state, ...change }
+			const key = JSON.stringify(candidate)
+			if (visited.has(key)) return
+			visited.add(key)
+			assert(visited.size <= 10000, "Action protocol state budget exceeded")
+			queue.push({ state: candidate, trace: [...trace, name] })
+		}
+		if (!state.reloaded && !state.restored && !entry) {
+			try {
+				next("reserve", { item: reserveDelegation(state.item, receipt) })
+			} catch {
+				next("refuse", { item: failDelegation(state.item, receipt, "failed", "refused"), rejected: true })
+			}
+		}
+		if (!state.scheduled && !entry && state.item.status === "active")
+			next("interrupt", { item: { ...state.item, status: "interrupted" } })
+		if (!state.scheduled && entry?.phase === "prepared" && !state.item.executionGeneration)
+			next("owner-change", { item: { ...state.item, executionGeneration: 1 } })
+		if (
+			!state.reloaded &&
+			!state.restored &&
+			entry?.phase === "prepared" &&
+			!state.allocated &&
+			!state.item.executionGeneration
+		)
+			next("allocate-paused", { allocated: true })
+		if (!state.reloaded && !state.restored && entry?.phase === "prepared" && state.allocated) {
+			try {
+				next("commit", { item: commitDelegation(state.item, receipt) })
+			} catch {
+				next("commit-refused", { rejected: true })
+			}
+			next("fail", { item: failDelegation(state.item, receipt, "failed", "refused") })
+			next("uncertain", { item: failDelegation(state.item, receipt, "uncertain", "unknown") })
+		}
+		if (entry?.phase === "committed") {
+			assert.throws(() => commitDelegation(state.item, receipt))
+			next("duplicate", { rejected: true })
+			if (!state.reloaded && !state.restored) next("schedule", { scheduled: true })
+		}
+		if (entry && entry.phase !== "committed") {
+			next("restore-blocked", { restored: true })
+			next("reload-blocked", { reloaded: true })
+			if (entry.phase === "failed" && !entry.resultWritten)
+				next("repair-result", { item: reconcileDelegationResult(state.item, entry) })
+		}
+	}
+	for (const action of [
+		"reserve",
+		"refuse",
+		"interrupt",
+		"owner-change",
+		"allocate-paused",
+		"commit",
+		"commit-refused",
+		"fail",
+		"uncertain",
+		"duplicate",
+		"schedule",
+		"restore-blocked",
+		"reload-blocked",
+		"repair-result",
+	])
+		assert(reached.has(action), `Unreachable action ${action}`)
+	for (const landmark of [
+		"interrupted-parent-refusal",
+		"failed-restored-reloaded",
+		"owner-change-at-commit",
+		"duplicate-after-commit",
+		"prepared-reload-blocked",
+		"uncertain-reload-blocked",
+		"failed-result-repaired-still-blocked",
+	])
+		assert(landmarks.has(landmark), `Unreachable landmark ${landmark}`)
+	console.log(
+		`Delegation action protocol passed: ${visited.size} states, ${reached.size} actions, ${landmarks.size} landmarks, depth <= 14; zero automatic retry edges`,
+	)
+}
+
+checkDelegationActionProtocol()
 const checkedStates = runModelCheck()
 console.log(
 	`Task lifecycle model check passed: ${checkedStates} reachable states, ${expectedActions.length}/${expectedActions.length} actions reachable, ${Object.keys(semanticLandmarks).length}/${Object.keys(semanticLandmarks).length} landmarks reached, depth <= ${MAX_DEPTH}, ${taskIds.length} task slots`,
 )
+
+void checkExecutionProtocol().catch((error: unknown) => {
+	console.error(error)
+	process.exitCode = 1
+})

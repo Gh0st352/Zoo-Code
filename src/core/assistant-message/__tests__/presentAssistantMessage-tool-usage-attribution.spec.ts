@@ -3,6 +3,7 @@
 import type { Anthropic } from "@anthropic-ai/sdk"
 import { describe, it, expect, beforeEach, vi } from "vitest"
 import { presentAssistantMessage } from "../presentAssistantMessage"
+import { withTaskExecution } from "../../../__tests__/helpers/execution-fixtures"
 import { validateToolUse } from "../../tools/validateToolUse"
 import { getModeBySlug } from "../../../shared/modes"
 import type { Task } from "../../task/Task"
@@ -82,7 +83,8 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 		vi.clearAllMocks()
 		vi.mocked(validateToolUse).mockImplementation(() => undefined)
 
-		mockTask = {
+		mockTask = withTaskExecution({
+			assistantMessageSavedToHistory: true,
 			taskId: "test-task-id",
 			instanceId: "test-instance",
 			abort: false,
@@ -115,7 +117,7 @@ describe("presentAssistantMessage - tool usage attribution", () => {
 			say: vi.fn().mockResolvedValue(undefined),
 			ask: vi.fn().mockResolvedValue({ response: "yesButtonClicked" }),
 			pushToolResultToUserContent: vi.fn(),
-		}
+		})
 
 		mockTask.pushToolResultToUserContent = vi
 			.fn()

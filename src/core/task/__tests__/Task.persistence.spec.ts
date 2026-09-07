@@ -14,10 +14,12 @@ import {
 import { TelemetryService } from "@roo-code/telemetry"
 import type { Anthropic } from "@anthropic-ai/sdk"
 
-import { Task } from "../Task"
+import { Task, type TaskOptions } from "../Task"
 import { ClineProvider } from "../../webview/ClineProvider"
 import { ContextProxy } from "../../config/ContextProxy"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
+import { claimTaskOptions, createClaimedTask, installTaskHistoryFiles } from "../../../__tests__/helpers/task-fixtures"
+import { executionClaim } from "../../task-persistence/taskLifecycle"
 
 type TaskPersistenceAccess = {
 	addToApiConversationHistory: (message: { role: "user"; content: unknown[] }) => Promise<void>
@@ -79,9 +81,11 @@ vi.mock("execa", () => ({
 }))
 
 vi.mock("fs/promises", async (importOriginal) => {
-	const actual = (await importOriginal()) as Record<string, any>
+	const actual = await importOriginal<typeof import("fs/promises")>()
 	return {
 		...actual,
+		realpath: vi.fn(async (value: string) => value),
+		readdir: vi.fn().mockResolvedValue([]),
 		mkdir: vi.fn().mockResolvedValue(undefined),
 		writeFile: vi.fn().mockResolvedValue(undefined),
 		readFile: vi.fn().mockResolvedValue("[]"),
@@ -101,6 +105,22 @@ vi.mock("p-wait-for", () => ({
 	default: mockPWaitFor,
 }))
 
+vi.mock("../../../utils/safeWriteJson", () => ({
+	LOCK_STALE_MS: 31_000,
+	safeWriteJson: vi.fn().mockResolvedValue(undefined),
+}))
+vi.mock("proper-lockfile", () => ({ lock: vi.fn(async () => async () => {}) }))
+vi.mock("../../task-persistence/apiMessages", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../task-persistence/apiMessages")>()),
+	saveApiMessages: mockSaveApiMessages,
+	readApiMessages: mockReadApiMessages,
+}))
+vi.mock("../../task-persistence/taskMessages", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../task-persistence/taskMessages")>()),
+	saveTaskMessages: mockSaveTaskMessages,
+	readTaskMessages: mockReadTaskMessages,
+}))
+
 vi.mock("../../task-persistence", async (importOriginal) => {
 	const mod = await importOriginal<typeof import("../../task-persistence")>()
 	return {
@@ -110,19 +130,6 @@ vi.mock("../../task-persistence", async (importOriginal) => {
 		readApiMessages: mockReadApiMessages,
 		readTaskMessages: mockReadTaskMessages,
 		taskMetadata: mockTaskMetadata,
-		TaskHistoryStore: vi.fn().mockImplementation(function () {
-			return {
-				initialize: vi.fn().mockResolvedValue(undefined),
-				dispose: vi.fn(),
-				get: vi.fn(),
-				getAll: vi.fn().mockReturnValue([]),
-				upsert: vi.fn().mockResolvedValue([]),
-				delete: vi.fn().mockResolvedValue(undefined),
-				deleteMany: vi.fn().mockResolvedValue(undefined),
-				reconcile: vi.fn().mockResolvedValue(undefined),
-				initialized: Promise.resolve(),
-			}
-		}),
 	}
 })
 
@@ -216,6 +223,7 @@ vi.mock("../../condense", async (importOriginal) => {
 })
 
 vi.mock("../../../utils/storage", () => ({
+	getStorageBasePath: vi.fn(async (base: string) => base),
 	getTaskDirectoryPath: vi
 		.fn()
 		.mockImplementation((globalStoragePath, taskId) => Promise.resolve(`${globalStoragePath}/tasks/${taskId}`)),
@@ -231,13 +239,23 @@ vi.mock("../../../utils/fs", () => ({
 // ─── Test suite ──────────────────────────────────────────────────────────────
 
 describe("Task persistence", () => {
-	let mockProvider: ClineProvider & Record<string, any>
+	let mockProvider: ClineProvider
 	let mockApiConfig: ProviderSettings
 	let mockOutputChannel: vscode.OutputChannel
 	let mockExtensionContext: vscode.ExtensionContext
+	let historyFiles: ReturnType<typeof installTaskHistoryFiles>
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.clearAllMocks()
+		historyFiles = installTaskHistoryFiles()
+		mockSaveApiMessages.mockReset().mockResolvedValue(undefined)
+		mockSaveTaskMessages.mockReset().mockResolvedValue(undefined)
+		mockReadApiMessages.mockReset().mockResolvedValue([])
+		mockReadTaskMessages.mockReset().mockResolvedValue([])
+		mockTaskMetadata.mockReset().mockImplementation(async ({ taskId }) => ({
+			historyItem: { id: taskId, number: 1, ts: 1, task: "test", tokensIn: 0, tokensOut: 0, totalCost: 0 },
+			tokenUsage: { totalTokensIn: 0, totalTokensOut: 0, totalCost: 0, contextTokens: 0 },
+		}))
 
 		if (!TelemetryService.hasInstance()) {
 			TelemetryService.createInstance([])
@@ -280,7 +298,9 @@ describe("Task persistence", () => {
 			mockOutputChannel,
 			"sidebar",
 			new ContextProxy(mockExtensionContext),
-		) as ClineProvider & Record<string, any>
+		)
+		await mockProvider.taskHistoryStore.initialized
+		mockProvider.taskHistoryStore.dispose() // No filesystem watcher/timer in this in-memory adapter.
 
 		mockApiConfig = {
 			apiProvider: providerIdentifiers.anthropic,
@@ -298,13 +318,89 @@ describe("Task persistence", () => {
 		mockProvider.log = vi.fn()
 	})
 
+	afterEach(async () => {
+		await mockProvider.taskHistoryStore.initialized
+		mockProvider.taskHistoryStore.dispose()
+		historyFiles.restore()
+		vi.useRealTimers()
+	})
+
+	async function replaceAfterCleanup(task: Task) {
+		await task.abortTask()
+		expect(await task.awaitExecutionCleanup()).toBe(true)
+		const transfer = await mockProvider.taskHistoryStore.transferTaskExecution(
+			task.executionToken!,
+			mockProvider.taskHistoryStore.ownerForRuntime(`replacement-${task.taskId}`),
+			true,
+		)
+		if (transfer.kind !== "applied") throw new Error(transfer.reason)
+		const replacement = new Task({
+			provider: mockProvider,
+			apiConfiguration: mockApiConfig,
+			historyItem: transfer.history,
+			executionToken: transfer.token,
+			startTask: false,
+		})
+		mockProvider["rememberExecution"](replacement.executionToken!, replacement)
+		return replacement
+	}
+
+	function createInspectionTask(options: TaskOptions) {
+		if (!options.historyItem) throw new Error("Inspection requires history")
+		historyFiles.seedHistory(mockProvider.context.globalStorageUri.fsPath, options.historyItem)
+		return new Task(options)
+	}
+
+	async function createRecoveredTask(options: TaskOptions) {
+		const claimed = await claimTaskOptions(options)
+		const store = mockProvider.taskHistoryStore
+		expect((await store.settleTaskExecution(claimed.executionToken!, true)).kind).toBe("applied")
+		const preview = await store.previewRecovery(claimed.executionToken!.taskId)
+		expect(preview.choices).toEqual(["resume_independent"])
+		const recovered = await store.recoverTask({
+			scope: preview.scope,
+			choice: "resume_independent",
+			intent: "explicit_user_resume",
+			owner: store.ownerForRuntime(`recovered-${preview.scope.taskId}`),
+		})
+		if (recovered.kind !== "applied") throw new Error(recovered.reason)
+		const task = new Task({
+			...options,
+			historyItem: recovered.history,
+			executionToken: recovered.token,
+			initialStatus: "active",
+		})
+		mockProvider["rememberExecution"](task.executionToken!, task)
+		return task
+	}
+
 	// ── saveApiConversationHistory (via retrySaveApiConversationHistory) ──
 
 	describe("saveApiConversationHistory", () => {
+		it("refuses stale claimed execution and snapshot writes without mutating the runtime token", async () => {
+			const task = await createClaimedTask({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "Owned task",
+				startTask: false,
+			})
+			const token = task.executionToken!
+			expect(Object.isFrozen(token)).toBe(true)
+			expect(Object.isFrozen(token.owner)).toBe(true)
+			expect(await task.guardExecution()).toBe(true)
+			const interrupted = await mockProvider.taskHistoryStore.interruptTask(token)
+			expect(interrupted.kind).toBe("applied")
+			expect(await task["saveApiConversationHistory"]()).toBe(false)
+			expect(await task.guardExecution()).toBe(false)
+			expect(task["executionRefusalReason"]).toBe("stale_generation")
+			expect(task.executionToken).toBe(token)
+			expect(mockSaveApiMessages).not.toHaveBeenCalled()
+		})
+
 		it("returns true on success", async () => {
 			mockSaveApiMessages.mockResolvedValueOnce([])
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -322,7 +418,7 @@ describe("Task persistence", () => {
 		})
 
 		it("uses authoritative replacement for explicit API history overwrites", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -335,7 +431,7 @@ describe("Task persistence", () => {
 		})
 
 		it("can hydrate API history without persisting it", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -350,16 +446,12 @@ describe("Task persistence", () => {
 			expect(mockSaveApiMessages).not.toHaveBeenCalled()
 		})
 
-		it("returns false on failure", async () => {
+		it("returns false and stops retries after a persistence failure fences the runtime", async () => {
 			vi.useFakeTimers()
 
-			// All 3 retry attempts must fail for retrySaveApiConversationHistory to return false
-			mockSaveApiMessages
-				.mockRejectedValueOnce(new Error("fail 1"))
-				.mockRejectedValueOnce(new Error("fail 2"))
-				.mockRejectedValueOnce(new Error("fail 3"))
+			mockSaveApiMessages.mockRejectedValue(new Error("write failed"))
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -367,21 +459,23 @@ describe("Task persistence", () => {
 			})
 
 			const promise = task.retrySaveApiConversationHistory()
-			await vi.runAllTimersAsync()
+			await vi.advanceTimersByTimeAsync(2100)
 			const result = await promise
 
 			expect(result).toBe(false)
-			expect(mockSaveApiMessages).toHaveBeenCalledTimes(3)
+			expect(mockSaveApiMessages).toHaveBeenCalledTimes(1)
+			expect(task.executionBlocked).toBe(true)
+			expect(await task.retrySaveApiConversationHistory()).toBe(false)
 
 			vi.useRealTimers()
 		})
 
-		it("succeeds on 2nd retry attempt", async () => {
+		it("retries successfully only in an explicitly transferred runtime after cleanup", async () => {
 			vi.useFakeTimers()
 
 			mockSaveApiMessages.mockRejectedValueOnce(new Error("fail 1")).mockResolvedValueOnce(undefined) // succeeds on 2nd try
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -389,11 +483,17 @@ describe("Task persistence", () => {
 			})
 
 			const promise = task.retrySaveApiConversationHistory()
-			await vi.runAllTimersAsync()
+			await vi.advanceTimersByTimeAsync(100)
 			const result = await promise
 
-			expect(result).toBe(true)
+			expect(result).toBe(false)
+			expect(task.executionBlocked).toBe(true)
+			const replacement = await replaceAfterCleanup(task)
+			const retry = replacement.retrySaveApiConversationHistory()
+			await vi.advanceTimersByTimeAsync(100)
+			expect(await retry).toBe(true)
 			expect(mockSaveApiMessages).toHaveBeenCalledTimes(2)
+			expect(replacement.executionToken?.generation).toBeGreaterThan(task.executionToken!.generation)
 
 			vi.useRealTimers()
 		})
@@ -401,7 +501,7 @@ describe("Task persistence", () => {
 		it("snapshots the array before passing to saveApiMessages", async () => {
 			mockSaveApiMessages.mockResolvedValueOnce([])
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -436,7 +536,7 @@ describe("Task persistence", () => {
 			})
 			mockProvider.postClineMessageUpdated = vi.fn().mockReturnValue(transportGate)
 			mockProvider.isClineMessagesPartialCoalescingActive = vi.fn().mockReturnValue(true)
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -468,20 +568,20 @@ describe("Task persistence", () => {
 		it("returns true on success", async () => {
 			mockSaveTaskMessages.mockResolvedValueOnce([])
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
 				startTask: false,
 			})
 
-			const result = await (task as Record<string, any>).saveClineMessages()
+			const result = await task["saveClineMessages"]()
 			expect(result).toBe(true)
 			expect(mockSaveTaskMessages).toHaveBeenCalledWith(expect.objectContaining({ merge: true }))
 		})
 
 		it("uses authoritative replacement for explicit UI history overwrites", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -494,7 +594,7 @@ describe("Task persistence", () => {
 		})
 
 		it("can hydrate UI history without persisting it", async () => {
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -512,21 +612,21 @@ describe("Task persistence", () => {
 		it("returns false on failure", async () => {
 			mockSaveTaskMessages.mockRejectedValueOnce(new Error("write error"))
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
 				startTask: false,
 			})
 
-			const result = await (task as Record<string, any>).saveClineMessages()
+			const result = await task["saveClineMessages"]()
 			expect(result).toBe(false)
 		})
 
 		it("snapshots the array before passing to saveTaskMessages", async () => {
 			mockSaveTaskMessages.mockResolvedValueOnce([])
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -540,7 +640,7 @@ describe("Task persistence", () => {
 				ts: Date.now(),
 			})
 
-			await (task as Record<string, any>).saveClineMessages()
+			await task["saveClineMessages"]()
 
 			expect(mockSaveTaskMessages).toHaveBeenCalledTimes(1)
 
@@ -571,13 +671,8 @@ describe("Task persistence", () => {
 				},
 			})
 
-			const updateTaskHistory = vi.fn().mockResolvedValue([])
-			const taskHistoryStore = {
-				get: vi.fn().mockReturnValue({ id: "task-with-advanced-status", status: "completed" }),
-			}
-			const provider = { ...mockProvider, updateTaskHistory, taskHistoryStore }
-			const task = new Task({
-				provider: provider as any,
+			const task = await createClaimedTask({
+				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				taskId: "task-with-advanced-status",
 				task: "test task",
@@ -585,15 +680,22 @@ describe("Task persistence", () => {
 				initialStatus: "interrupted",
 			})
 
-			await (task as Record<string, any>).saveClineMessages()
-
-			expect(updateTaskHistory).toHaveBeenCalledWith(
-				expect.objectContaining({
-					id: "task-with-advanced-status",
-					status: "completed",
-					tokensIn: 10,
-				}),
-			)
+			// Stale metadata cannot change lifecycle state even with the exact active token.
+			expect(await task["saveClineMessages"]()).toBe(true)
+			expect(await mockProvider.taskHistoryStore.readAuthoritative(task.taskId)).toMatchObject({
+				status: "active",
+				tokensIn: 10,
+			})
+			const completed = await mockProvider.taskHistoryStore.completeStandaloneTask(task.executionToken!, "Done")
+			expect(completed.kind).toBe("applied")
+			mockSaveTaskMessages.mockClear()
+			expect(await task["saveClineMessages"]()).toBe(false)
+			expect(mockSaveTaskMessages).not.toHaveBeenCalled()
+			expect(await mockProvider.taskHistoryStore.readAuthoritative(task.taskId)).toMatchObject({
+				status: "completed",
+				tokensIn: 10,
+			})
+			expect(mockProvider.updateTaskHistory).not.toHaveBeenCalled()
 		})
 	})
 
@@ -604,7 +706,7 @@ describe("Task persistence", () => {
 			const messagesDeferred = createDeferred<ClineMessage[]>()
 			mockReadTaskMessages.mockReturnValueOnce(messagesDeferred.promise)
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -630,7 +732,7 @@ describe("Task persistence", () => {
 			await resumePromise
 		})
 
-		it("persists a history task when messages load before abort", async () => {
+		it("persists loaded history through the provider's fenced cleanup token, not the aborted runtime", async () => {
 			const messages = [
 				{
 					ts: Date.now(),
@@ -642,7 +744,7 @@ describe("Task persistence", () => {
 			const messagesDeferred = createDeferred<typeof messages>()
 			mockReadTaskMessages.mockReturnValueOnce(messagesDeferred.promise).mockResolvedValue(messages)
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -670,26 +772,49 @@ describe("Task persistence", () => {
 			await resumePromise
 
 			const saveCallsBeforeAbort = mockSaveTaskMessages.mock.calls.length
-			expect(saveCallsBeforeAbort).toBeGreaterThan(0)
-			expect(mockProvider.updateTaskHistory).toHaveBeenCalled()
+			expect(mockSaveApiMessages).toHaveBeenCalled()
+			const runtimeToken = task.executionToken
+			const saveSnapshot = vi.spyOn(mockProvider.taskHistoryStore, "saveExecutionSnapshot")
 
-			await task.abortTask()
+			await mockProvider["stopOwnedTask"](task)
 			expect(mockSaveTaskMessages.mock.calls.length).toBeGreaterThan(saveCallsBeforeAbort)
+			expect(saveSnapshot).toHaveBeenCalledWith(
+				expect.objectContaining({ taskId: task.taskId, generation: runtimeToken!.generation + 1 }),
+				expect.objectContaining({
+					clineMessages: expect.arrayContaining([expect.objectContaining(messages[0])]),
+				}),
+				true,
+			)
+			expect(task.executionToken).toBe(runtimeToken)
+			expect(executionClaim(await mockProvider.taskHistoryStore.readAuthoritative(task.taskId)).phase).toBe(
+				"settled",
+			)
+			mockSaveTaskMessages.mockClear()
+			expect(await task["saveClineMessages"]()).toBe(false)
+			expect(mockSaveTaskMessages).not.toHaveBeenCalled()
 		})
 
-		it("persists an empty non-history task when aborted", async () => {
-			const task = new Task({
+		it("retains preclaimed empty task metadata without writing an aborted runtime snapshot", async () => {
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "New task",
 				startTask: false,
 			})
 			const saveClineMessagesSpy = vi.spyOn(getTaskPersistenceAccess(task), "saveClineMessages")
+			const before = await mockProvider.taskHistoryStore.readAuthoritative(task.taskId)
 
 			await task.abortTask()
 
 			expect(saveClineMessagesSpy).toHaveBeenCalledTimes(1)
-			expect(mockSaveTaskMessages).toHaveBeenCalledTimes(1)
+			expect(mockSaveTaskMessages).not.toHaveBeenCalled()
+			expect(await mockProvider.taskHistoryStore.readAuthoritative(task.taskId)).toEqual(before)
+			await mockProvider["stopOwnedTask"](task)
+			expect(await mockProvider.taskHistoryStore.readAuthoritative(task.taskId)).toMatchObject({
+				task: "New task",
+				status: "interrupted",
+				execution: { phase: "settled" },
+			})
 		})
 	})
 
@@ -699,7 +824,7 @@ describe("Task persistence", () => {
 		const interruptedToolResultContent = "Task was interrupted before this tool call could be completed."
 
 		it("marks synthetic tool_results from an interrupted assistant turn as errors", async () => {
-			const task = new Task({
+			const task = await createRecoveredTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -739,7 +864,7 @@ describe("Task persistence", () => {
 				},
 			])
 
-			await getTaskPersistenceAccess(task).resumeTaskFromHistory()
+			await task.resumeAfterRecovery("resume_independent")
 
 			expect(initiateTaskLoopSpy).toHaveBeenCalledTimes(1)
 			const newUserContent = initiateTaskLoopSpy.mock.calls[0][0]
@@ -757,7 +882,7 @@ describe("Task persistence", () => {
 		})
 
 		it("marks missing tool_results for an interrupted trailing user turn as errors", async () => {
-			const task = new Task({
+			const task = await createRecoveredTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -804,7 +929,7 @@ describe("Task persistence", () => {
 				},
 			])
 
-			await getTaskPersistenceAccess(task).resumeTaskFromHistory()
+			await task.resumeAfterRecovery("resume_independent")
 
 			expect(initiateTaskLoopSpy).toHaveBeenCalledTimes(1)
 			const newUserContent = initiateTaskLoopSpy.mock.calls[0][0]
@@ -848,7 +973,7 @@ describe("Task persistence", () => {
 					content: [{ type: "tool_use", id: "finish-action", name: "attempt_completion", input: {} }],
 				},
 			])
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -896,7 +1021,7 @@ describe("Task persistence", () => {
 				{ role: "user", content: [{ type: "tool_result", tool_use_id: "finish-action", content: "Denied" }] },
 			])
 			mockProvider.clearPendingTaskAction = vi.fn().mockResolvedValue(true)
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -917,7 +1042,7 @@ describe("Task persistence", () => {
 
 			await getTaskPersistenceAccess(task).resumeTaskFromHistory()
 
-			expect(mockProvider.clearPendingTaskAction).toHaveBeenCalledWith("child-1", "finish-action")
+			expect(mockProvider.clearPendingTaskAction).toHaveBeenCalledWith("child-1", "finish-action", task)
 			expect(replay).not.toHaveBeenCalled()
 			expect(task.ask).toHaveBeenCalledWith("resume_task")
 		})
@@ -932,7 +1057,7 @@ describe("Task persistence", () => {
 						content: [{ type: "tool_result", tool_use_id: "finish-action", content: "Denied" }],
 					},
 				])
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					historyItem: {
@@ -967,7 +1092,7 @@ describe("Task persistence", () => {
 
 		it("clears pending metadata after the matching tool result is saved", async () => {
 			mockProvider.clearPendingTaskAction = vi.fn().mockResolvedValue(true)
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -988,17 +1113,17 @@ describe("Task persistence", () => {
 				content: [{ type: "tool_result", tool_use_id: "finish-action", content: "Denied" }],
 			})
 
-			expect(mockProvider.clearPendingTaskAction).toHaveBeenCalledWith("child-1", "finish-action")
+			expect(mockProvider.clearPendingTaskAction).toHaveBeenCalledWith("child-1", "finish-action", task)
 		})
 
-		it("retries a rejected tool-result save before clearing pending metadata", async () => {
+		it("retains pending metadata after a rejected save and clears it only after an authorized replacement saves", async () => {
 			vi.useFakeTimers()
 			try {
 				mockSaveApiMessages
 					.mockRejectedValueOnce(new Error("temporary failure"))
 					.mockResolvedValueOnce(undefined)
 				mockProvider.clearPendingTaskAction = vi.fn().mockResolvedValue(true)
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					historyItem: {
@@ -1023,8 +1148,21 @@ describe("Task persistence", () => {
 
 				await vi.advanceTimersByTimeAsync(100)
 				await saving
+				expect(mockSaveApiMessages).toHaveBeenCalledTimes(1)
+				expect(task.executionBlocked).toBe(true)
+				expect(task.getPendingTaskAction()).toEqual(pendingAction)
+				expect(mockProvider.clearPendingTaskAction).not.toHaveBeenCalled()
+				const replacement = await replaceAfterCleanup(task)
+				await replacement["addToApiConversationHistory"]({
+					role: "user",
+					content: [{ type: "tool_result", tool_use_id: "finish-action", content: "Denied" }],
+				})
 				expect(mockSaveApiMessages).toHaveBeenCalledTimes(2)
-				expect(mockProvider.clearPendingTaskAction).toHaveBeenCalledWith("child-1", "finish-action")
+				expect(mockProvider.clearPendingTaskAction).toHaveBeenCalledWith(
+					"child-1",
+					"finish-action",
+					replacement,
+				)
 			} finally {
 				vi.useRealTimers()
 			}
@@ -1032,7 +1170,7 @@ describe("Task persistence", () => {
 
 		it("reconciles stale in-memory metadata after an idempotent clear without clearing a newer action", async () => {
 			mockProvider.clearPendingTaskAction = vi.fn().mockResolvedValue(false)
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -1047,7 +1185,7 @@ describe("Task persistence", () => {
 				},
 				startTask: false,
 			})
-			const storeGet = vi.mocked(mockProvider.taskHistoryStore.get)
+			const storeGet = vi.spyOn(mockProvider.taskHistoryStore, "get")
 			storeGet.mockReturnValueOnce(undefined)
 
 			await getTaskPersistenceAccess(task).addToApiConversationHistory({
@@ -1084,7 +1222,7 @@ describe("Task persistence", () => {
 				finishClear = resolve
 			})
 			mockProvider.clearPendingTaskAction = vi.fn(() => clearing)
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -1115,7 +1253,7 @@ describe("Task persistence", () => {
 
 		it("leaves a newer action untouched when an obsolete durable result arrives", async () => {
 			mockProvider.clearPendingTaskAction = vi.fn().mockResolvedValue(true)
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -1146,7 +1284,7 @@ describe("Task persistence", () => {
 			const clearError = new Error("metadata store unavailable")
 			mockProvider.clearPendingTaskAction = vi.fn().mockRejectedValue(clearError)
 			const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined)
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -1177,58 +1315,99 @@ describe("Task persistence", () => {
 			consoleError.mockRestore()
 		})
 
-		it("completes the deny-with-feedback lifecycle using the sanitized action id", async () => {
-			const rawToolUseId = "finish.action/with spaces"
-			const sanitizedActionId = "finish_action_with_spaces"
-			const lifecycleAction: PendingTaskAction = {
-				...pendingAction,
-				actionId: sanitizedActionId,
-			}
-			mockProvider.clearPendingTaskAction = vi.fn().mockResolvedValue(true)
-			const task = new Task({
-				provider: mockProvider,
-				apiConfiguration: mockApiConfig,
-				historyItem: {
-					id: "child-1",
-					number: 1,
-					ts: 1,
-					task: "Child",
-					tokensIn: 0,
-					tokensOut: 0,
-					totalCost: 0,
-					pendingAction: lifecycleAction,
-				},
-				startTask: false,
-			})
-			vi.spyOn(task, "ask").mockResolvedValue({
-				response: "messageResponse",
-				text: "Please revise",
-				queuedMessageId: "queued-lifecycle",
-			})
-			const persist = vi.spyOn(task, "persistQueuedFeedbackAndAcknowledge").mockResolvedValue(true)
-			const initiate = vi
-				.spyOn(getTaskPersistenceAccess(task), "initiateTaskLoop")
-				.mockImplementation(async (content) => {
-					await getTaskPersistenceAccess(task).addToApiConversationHistory({ role: "user", content })
+		it.each([false, true])(
+			"preserves sanitized deny-with-feedback intent across approval; revoked=%s",
+			async (revoked) => {
+				const rawToolUseId = "finish.action/with spaces"
+				const sanitizedActionId = "finish_action_with_spaces"
+				const lifecycleAction: PendingTaskAction = {
+					...pendingAction,
+					actionId: sanitizedActionId,
+				}
+				mockProvider.clearPendingTaskAction = vi.fn().mockResolvedValue(true)
+				const parent = await createClaimedTask({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					taskId: "parent-1",
+					task: "Parent",
+					startTask: false,
 				})
+				const task = await createClaimedTask({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					parentTask: parent,
+					historyItem: {
+						id: "child-1",
+						number: 1,
+						ts: 1,
+						task: "Child",
+						tokensIn: 0,
+						tokensOut: 0,
+						totalCost: 0,
+						pendingAction: lifecycleAction,
+					},
+					startTask: false,
+				})
+				expect(await mockProvider["cleanupTask"](parent)).toBe(true)
+				vi.spyOn(mockProvider, "getCurrentTask").mockReturnValue(task)
+				vi.spyOn(mockProvider, "prepareDelegatedCompletion")
+				vi.spyOn(task, "ask").mockImplementation(async () => {
+					const request = mockProvider["completionApprovals"].get(task)
+					expect(request).toMatchObject({ childToken: task.executionToken, finish: lifecycleAction })
+					expect(Object.isFrozen(request)).toBe(true)
+					expect(Object.isFrozen(request?.childToken)).toBe(true)
+					if (revoked) {
+						expect((await mockProvider.taskHistoryStore.interruptTask(task.executionToken!)).kind).toBe(
+							"applied",
+						)
+					}
+					return { response: "messageResponse", text: "Please revise", queuedMessageId: "queued-lifecycle" }
+				})
+				const persist = vi.spyOn(task, "persistQueuedFeedbackAndAcknowledge").mockResolvedValue(true)
+				const initiate = vi
+					.spyOn(getTaskPersistenceAccess(task), "initiateTaskLoop")
+					.mockImplementation(async (content) => {
+						await getTaskPersistenceAccess(task).addToApiConversationHistory({ role: "user", content })
+					})
+				// Child claim creation seeds its initial transcript; isolate replay writes.
+				mockSaveApiMessages.mockClear()
+				mockSaveTaskMessages.mockClear()
 
-			await getTaskPersistenceAccess(task).resumePendingTaskAction(lifecycleAction)
+				await getTaskPersistenceAccess(task).resumePendingTaskAction(lifecycleAction)
 
-			expect(rawToolUseId).not.toBe(sanitizedActionId)
-			expect(persist).toHaveBeenCalledWith("queued-lifecycle", "Please revise", undefined)
-			expect(initiate).toHaveBeenCalledWith([
-				expect.objectContaining({ type: "tool_result", tool_use_id: sanitizedActionId }),
-			])
-			expect(mockSaveApiMessages).toHaveBeenCalled()
-			expect(mockProvider.clearPendingTaskAction).toHaveBeenCalledWith("child-1", sanitizedActionId)
-			expect(persist.mock.invocationCallOrder[0]).toBeLessThan(initiate.mock.invocationCallOrder[0])
-		})
+				expect(rawToolUseId).not.toBe(sanitizedActionId)
+				expect(mockProvider.prepareDelegatedCompletion).toHaveBeenCalledWith(task, lifecycleAction)
+				expect(vi.mocked(mockProvider.prepareDelegatedCompletion).mock.invocationCallOrder[0]).toBeLessThan(
+					vi.mocked(task.ask).mock.invocationCallOrder[0],
+				)
+				if (revoked) {
+					expect(persist).not.toHaveBeenCalled()
+					expect(initiate).not.toHaveBeenCalled()
+					expect(mockSaveApiMessages).not.toHaveBeenCalled()
+					expect(mockProvider.clearPendingTaskAction).not.toHaveBeenCalled()
+					expect(task.getPendingTaskAction()).toEqual(lifecycleAction)
+					expect(task.executionBlocked).toBe(true)
+					return
+				}
+				expect(persist).toHaveBeenCalledWith("queued-lifecycle", "Please revise", undefined)
+				expect(initiate).toHaveBeenCalledWith([
+					expect.objectContaining({ type: "tool_result", tool_use_id: sanitizedActionId }),
+				])
+				expect(mockSaveApiMessages).toHaveBeenCalled()
+				expect(mockProvider.clearPendingTaskAction).toHaveBeenCalledWith("child-1", sanitizedActionId, task)
+				expect(persist.mock.invocationCallOrder[0]).toBeLessThan(initiate.mock.invocationCallOrder[0])
+			},
+		)
 	})
 
 	describe("resumeTaskFromHistory", () => {
-		it.each(["active", "completed"] as const)(
-			"publishes hydrated history before the %s task resume prompt",
-			async (status) => {
+		it.each([
+			{ status: "active", authorized: true },
+			{ status: "completed", authorized: false },
+			{ status: "active", authorized: false },
+		] as const)(
+			"publishes $status history before any prompt; authorized=$authorized",
+			async ({ status, authorized }) => {
 				const messages = [
 					{ ts: 1, type: "say", say: "text", text: "Saved transcript" },
 				] satisfies ClineMessage[]
@@ -1237,7 +1416,7 @@ describe("Task persistence", () => {
 				const snapshotDeferred = createDeferred<void>()
 				mockReadTaskMessages.mockResolvedValue(messages)
 				mockReadApiMessages.mockReturnValueOnce(apiRead.promise)
-				const task = new Task({
+				const options: TaskOptions = {
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					historyItem: {
@@ -1252,7 +1431,8 @@ describe("Task persistence", () => {
 					},
 					initialStatus: status,
 					startTask: false,
-				})
+				}
+				const task = authorized ? await createClaimedTask(options) : createInspectionTask(options)
 				const snapshot = vi.mocked(mockProvider.postClineMessagesSnapshot).mockImplementationOnce(() => {
 					expect(task.clineMessages).toEqual(messages)
 					expect(task.apiConversationHistory).toEqual(apiMessages)
@@ -1260,8 +1440,10 @@ describe("Task persistence", () => {
 				})
 				const stopAfterPrompt = new Error("stop after resume prompt")
 				const ask = vi.spyOn(task, "ask").mockRejectedValueOnce(stopAfterPrompt)
-				const resumePromise = task.run()
-				const completion = expect(resumePromise).rejects.toThrow(stopAfterPrompt)
+				const resumePromise = authorized ? task.run() : task.hydrateForRecovery()
+				const completion = authorized
+					? expect(resumePromise).rejects.toThrow(stopAfterPrompt)
+					: expect(resumePromise).resolves.toBeUndefined()
 
 				await vi.waitFor(() => expect(mockReadApiMessages).toHaveBeenCalledOnce())
 				expect(snapshot).not.toHaveBeenCalled()
@@ -1276,7 +1458,15 @@ describe("Task persistence", () => {
 				await completion
 
 				expect(snapshot).toHaveBeenCalledOnce()
-				expect(ask).toHaveBeenCalledWith(status === "completed" ? "resume_completed_task" : "resume_task")
+				if (authorized) expect(ask).toHaveBeenCalledWith("resume_task")
+				else {
+					await task.run()
+					expect(ask).not.toHaveBeenCalled()
+					expect(task.executionToken).toBeUndefined()
+					expect(await mockProvider.taskHistoryStore.readAuthoritative(task.taskId)).toEqual(
+						options.historyItem,
+					)
+				}
 				expect(mockSaveTaskMessages).not.toHaveBeenCalled()
 				expect(mockSaveApiMessages).not.toHaveBeenCalled()
 			},
@@ -1287,7 +1477,7 @@ describe("Task persistence", () => {
 			async (flag) => {
 				mockReadTaskMessages.mockResolvedValue([{ ts: 1, type: "say", say: "text", text: "Saved transcript" }])
 				mockReadApiMessages.mockResolvedValue([{ role: "user", content: "Saved API history" }])
-				const task = new Task({
+				const task = await createClaimedTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					historyItem: {
@@ -1322,7 +1512,7 @@ describe("Task persistence", () => {
 		it("does not prompt or persist when the resume snapshot fails", async () => {
 			mockReadTaskMessages.mockResolvedValue([{ ts: 1, type: "say", say: "text", text: "Saved transcript" }])
 			mockReadApiMessages.mockResolvedValue([{ role: "user", content: "Saved API history" }])
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -1347,10 +1537,10 @@ describe("Task persistence", () => {
 			expect(mockSaveApiMessages).not.toHaveBeenCalled()
 		})
 
-		it("can hydrate and reach the resume prompt without a provider reference", async () => {
+		it("can inspect history without a provider but cannot authorize a resume prompt", async () => {
 			mockReadTaskMessages.mockResolvedValue([{ ts: 1, type: "say", say: "text", text: "Saved transcript" }])
 			mockReadApiMessages.mockResolvedValue([{ role: "user", content: "Saved API history" }])
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -1368,11 +1558,14 @@ describe("Task persistence", () => {
 			const stopAfterPrompt = new Error("stop after resume prompt")
 			const ask = vi.spyOn(task, "ask").mockRejectedValueOnce(stopAfterPrompt)
 
-			await expect(task.run()).rejects.toThrow(stopAfterPrompt)
+			await expect(task.run()).resolves.toBeUndefined()
+			expect(mockReadTaskMessages).not.toHaveBeenCalled()
+			await task.hydrateForRecovery()
 
 			expect(task.clineMessages).toEqual([expect.objectContaining({ text: "Saved transcript" })])
 			expect(task.apiConversationHistory).toEqual([expect.objectContaining({ content: "Saved API history" })])
-			expect(ask).toHaveBeenCalledWith("resume_task")
+			expect(ask).not.toHaveBeenCalled()
+			expect(task.executionBlocked).toBe(true)
 			expect(mockProvider.postClineMessagesSnapshot).not.toHaveBeenCalled()
 		})
 
@@ -1381,7 +1574,7 @@ describe("Task persistence", () => {
 			async (kind) => {
 				mockReadTaskMessages.mockRejectedValue(Object.assign(new Error(`history ${kind}`), { kind }))
 
-				const task = new Task({
+				const task = createInspectionTask({
 					provider: mockProvider,
 					apiConfiguration: mockApiConfig,
 					historyItem: {
@@ -1399,7 +1592,7 @@ describe("Task persistence", () => {
 				})
 				const askSpy = vi.spyOn(task, "ask")
 
-				await expect(getTaskPersistenceAccess(task).resumeTaskFromHistory()).rejects.toThrow(`history ${kind}`)
+				await expect(task.hydrateForRecovery()).rejects.toThrow(`history ${kind}`)
 				await task.abortTask(true)
 
 				expect(askSpy).not.toHaveBeenCalled()
@@ -1409,52 +1602,59 @@ describe("Task persistence", () => {
 			},
 		)
 
-		it("preserves finalized trailing reasoning without rewriting history during hydration", async () => {
-			const messages = [
-				{ ts: 1, type: "say" as const, say: "text" as const, text: "Original task" },
-				{ ts: 2, type: "say" as const, say: "completion_result" as const, text: "Initial result" },
-				{ ts: 3, type: "ask" as const, ask: "resume_completed_task" as const },
-				{ ts: 4, type: "say" as const, say: "user_feedback" as const, text: "Continue investigating" },
-				{
-					ts: 5,
-					type: "say" as const,
-					say: "reasoning" as const,
-					text: "Critical current conclusion",
-					partial: false,
-				},
-			]
-			mockReadTaskMessages.mockResolvedValue(messages)
-			mockReadApiMessages.mockResolvedValue([
-				{ role: "user", content: [{ type: "text", text: "Continue investigating" }] },
-			])
+		it.each(["active", "completed"] as const)(
+			"preserves finalized trailing reasoning during %s hydration",
+			async (status) => {
+				const messages = [
+					{ ts: 1, type: "say" as const, say: "text" as const, text: "Original task" },
+					{ ts: 2, type: "say" as const, say: "completion_result" as const, text: "Initial result" },
+					{ ts: 3, type: "ask" as const, ask: "resume_completed_task" as const },
+					{ ts: 4, type: "say" as const, say: "user_feedback" as const, text: "Continue investigating" },
+					{
+						ts: 5,
+						type: "say" as const,
+						say: "reasoning" as const,
+						text: "Critical current conclusion",
+						partial: false,
+					},
+				]
+				mockReadTaskMessages.mockResolvedValue(messages)
+				mockReadApiMessages.mockResolvedValue([
+					{ role: "user", content: [{ type: "text", text: "Continue investigating" }] },
+				])
 
-			const task = new Task({
-				provider: mockProvider,
-				apiConfiguration: mockApiConfig,
-				historyItem: {
-					id: "issue-1279-current",
-					number: 1,
-					ts: 5,
-					task: "Original task",
-					status: "completed",
-					tokensIn: 10,
-					tokensOut: 5,
-					totalCost: 0.001,
-				},
-				initialStatus: "completed",
-				startTask: false,
-			})
-			vi.spyOn(task, "ask").mockImplementation(async (type) => {
-				expect(type).toBe("resume_completed_task")
+				const options: TaskOptions = {
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					historyItem: {
+						id: "issue-1279-current",
+						number: 1,
+						ts: 5,
+						task: "Original task",
+						status,
+						tokensIn: 10,
+						tokensOut: 5,
+						totalCost: 0.001,
+					},
+					initialStatus: status,
+					startTask: false,
+				}
+				const task = status === "active" ? await createClaimedTask(options) : createInspectionTask(options)
+				const ask = vi.spyOn(task, "ask").mockRejectedValue(new Error("stop after hydration"))
+
+				if (status === "active") {
+					await expect(task.run()).rejects.toThrow("stop after hydration")
+					expect(ask).toHaveBeenCalledWith("resume_task")
+				} else {
+					await task.hydrateForRecovery()
+					expect(ask).not.toHaveBeenCalled()
+				}
 				expect(task.clineMessages).toContainEqual(
 					expect.objectContaining({ text: "Critical current conclusion", partial: false }),
 				)
-				throw new Error("stop after hydration")
-			})
-
-			await expect(getTaskPersistenceAccess(task).resumeTaskFromHistory()).rejects.toThrow("stop after hydration")
-			expect(mockSaveTaskMessages).not.toHaveBeenCalled()
-		})
+				expect(mockSaveTaskMessages).not.toHaveBeenCalled()
+			},
+		)
 
 		it("removes incomplete trailing reasoning before prompting to resume", async () => {
 			mockReadTaskMessages.mockResolvedValue([
@@ -1465,7 +1665,7 @@ describe("Task persistence", () => {
 				{ role: "user", content: [{ type: "text", text: "Original task" }] },
 			])
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -1496,7 +1696,7 @@ describe("Task persistence", () => {
 			mockReadTaskMessages.mockResolvedValue([{ ts: 1, type: "say", say: "text", text: "UI message" }])
 			mockReadApiMessages.mockReturnValue(apiMessagesDeferred.promise)
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -1532,7 +1732,7 @@ describe("Task persistence", () => {
 			mockReadTaskMessages.mockResolvedValue([{ ts: 1, type: "say", say: "text", text: "Original task" }])
 			mockReadApiMessages.mockReturnValue(apiMessagesDeferred.promise)
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				historyItem: {
@@ -1571,7 +1771,7 @@ describe("Task persistence", () => {
 		it("retains userMessageContent on save failure", async () => {
 			mockSaveApiMessages.mockRejectedValueOnce(new Error("disk full"))
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
@@ -1603,7 +1803,7 @@ describe("Task persistence", () => {
 		it("clears userMessageContent on save success", async () => {
 			mockSaveApiMessages.mockResolvedValueOnce([])
 
-			const task = new Task({
+			const task = await createClaimedTask({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",

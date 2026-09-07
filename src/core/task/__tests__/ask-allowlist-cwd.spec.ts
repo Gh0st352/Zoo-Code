@@ -3,6 +3,7 @@
 import type { ExtensionState } from "@roo-code/types"
 
 import { Task } from "../Task"
+import { withTaskExecution } from "../../../__tests__/helpers/execution-fixtures"
 
 // The allowlist patterns are resolved against a workspace root, and the path in
 // the tool message was made relative by `getReadablePath(task.cwd, ...)`. So the
@@ -23,6 +24,8 @@ type ProviderStub = {
 
 function buildTask(provider: ProviderStub, taskCwd: string) {
 	const task = Object.create(Task.prototype) as Task
+	Object.assign(task, { taskId: "allowlist-ask", instanceId: "allowlist-ask-runtime", abort: false })
+	withTaskExecution(task)
 	task["abort"] = false
 	task["clineMessages"] = []
 	task["askResponse"] = undefined
@@ -83,13 +86,16 @@ const askToWriteRelativePath = async (allowedWriteFiles: string[]) => {
 	// A relative path, as `getReadablePath(task.cwd, relPath)` produces for a file
 	// inside the task's own workspace.
 	const asked = task.ask("tool", JSON.stringify({ tool: "newFileCreated", path: "notes.md" }), false)
+	const settled = expect(asked).resolves.toMatchObject({ response: "yesButtonClicked" })
 
 	const addToClineMessages = task["addToClineMessages"] as ReturnType<typeof vi.fn>
 	await vi.waitUntil(() => addToClineMessages.mock.calls.length > 0)
 	const message = addToClineMessages.mock.calls[0][0]
 
 	task.approveAsk()
-	await asked
+	await settled
+	task.cancelAutoApprovalTimeout()
+	task.messageQueueService.dispose()
 
 	return message.autoApprovalDecision ?? ("ask" as const)
 }

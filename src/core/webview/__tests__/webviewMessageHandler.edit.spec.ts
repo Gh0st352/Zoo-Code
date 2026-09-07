@@ -43,6 +43,7 @@ import type { ClineProvider } from "../ClineProvider"
 import type { ClineMessage } from "@roo-code/types"
 import type { ApiMessage } from "../../task-persistence/apiMessages"
 import { MessageManager } from "../../message-manager"
+import type { Task } from "../../task/Task"
 
 describe("webviewMessageHandler - Edit Message with Timestamp Fallback", () => {
 	let mockClineProvider: ClineProvider
@@ -54,6 +55,7 @@ describe("webviewMessageHandler - Edit Message with Timestamp Fallback", () => {
 		// Create a mock task with messages
 		mockCurrentTask = {
 			taskId: "test-task-id",
+			guardExecution: vi.fn<Task["guardExecution"]>().mockResolvedValue(true),
 			clineMessages: [] as ClineMessage[],
 			apiConversationHistory: [] as ApiMessage[],
 			overwriteClineMessages: vi.fn(),

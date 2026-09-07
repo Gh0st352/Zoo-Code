@@ -1,4 +1,5 @@
 import * as vscode from "vscode"
+import crypto from "crypto"
 
 import type { PendingTaskAction, TodoItem } from "@roo-code/types"
 
@@ -11,6 +12,7 @@ import { Package } from "../../shared/package"
 import { BaseTool, ToolCallbacks } from "./BaseTool"
 import type { ToolUse } from "../../shared/tools"
 import { sanitizeToolUseId } from "../../utils/tool-id"
+import { StaleDelegationActionError } from "../task-persistence/taskLifecycle"
 
 interface NewTaskParams {
 	mode: string
@@ -22,8 +24,9 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 	readonly name = "new_task" as const
 
 	async execute(params: NewTaskParams, task: Task, callbacks: ToolCallbacks): Promise<void> {
+		if (!(await task.guardExecution())) return
 		const { mode, message, todos } = params
-		const { askApproval, handleError, pushToolResult, toolCallId } = callbacks
+		const { askApproval, pushToolResult, toolCallId } = callbacks
 
 		try {
 			// Validate required parameters.
@@ -52,6 +55,7 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 			}
 
 			const state = await provider.getState()
+			if (!(await task.guardExecution())) return
 
 			// Use the package name as the VSCode configuration namespace.
 			const requireTodos = vscode.workspace
@@ -102,28 +106,32 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 				content: message,
 				todos: todoItems,
 			})
-			const pendingActionId = toolCallId ? sanitizeToolUseId(toolCallId) : undefined
-			if (pendingActionId) {
-				const pendingAction: PendingTaskAction = {
-					kind: "create_subtask",
-					actionId: pendingActionId,
-					approvalText: toolMessage,
-					mode,
-					message: unescapedMessage,
-					todos: todoItems,
-				}
-				await provider.setPendingTaskAction(task.taskId, pendingAction)
-				task.setPendingTaskAction(pendingAction)
+			const pendingActionId = toolCallId ? sanitizeToolUseId(toolCallId) : `internal-${crypto.randomUUID()}`
+			const pendingAction: PendingTaskAction = {
+				kind: "create_subtask",
+				actionId: pendingActionId,
+				approvalText: toolMessage,
+				mode,
+				message: unescapedMessage,
+				todos: todoItems,
 			}
+			await provider.setPendingTaskAction(task.taskId, pendingAction, task)
+			if (!(await task.guardExecution())) return
+			task.setPendingTaskAction(pendingAction)
+			if (!(await provider.validateTaskDelegation(task, pendingAction))) return
+			if (!(await task.guardExecution())) return
 
 			const didApprove = await askApproval("tool", toolMessage)
+			if (!(await task.guardExecution())) return
 
 			if (!didApprove) {
+				await provider.denyTaskDelegation(task, pendingAction)
 				return
 			}
 
 			// Delegate parent and open child as sole active task
-			const child = await (provider as any).delegateParentAndOpenChild({
+			const child = await provider.delegateParentAndOpenChild({
+				origin: task,
 				parentTaskId: task.taskId,
 				message: unescapedMessage,
 				initialTodos: todoItems,
@@ -135,12 +143,23 @@ export class NewTaskTool extends BaseTool<"new_task"> {
 			pushToolResult(`Delegated to child task ${child.taskId}`)
 			return
 		} catch (error) {
-			await handleError("creating new task", error)
+			if (error instanceof StaleDelegationActionError) return
+			if (task.executionBlocked || task.abort || task.abandoned) return
+			// An unclassified persistence/admission exception cannot become a new model
+			// attempt. The provider receipt (if admitted) blocks replay across reload.
+			task.executionBlocked = true
+			await task
+				.hydrateForRecovery(`Delegation stopped: ${error instanceof Error ? error.message : String(error)}`)
+				.catch((hydrateError) => {
+					console.error("[NewTaskTool] Recovery history unavailable", hydrateError)
+					void vscode.window.showErrorMessage(String(hydrateError))
+				})
 			return
 		}
 	}
 
 	override async handlePartial(task: Task, block: ToolUse<"new_task">): Promise<void> {
+		if (!(await task.guardExecution())) return
 		const mode: string | undefined = block.params.mode
 		const message: string | undefined = block.params.message
 		const todos: string | undefined = block.params.todos

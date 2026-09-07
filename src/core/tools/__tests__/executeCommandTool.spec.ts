@@ -79,6 +79,7 @@ describe("executeCommandTool", () => {
 		mockCline = {
 			ask: vitest.fn().mockResolvedValue(undefined),
 			say: vitest.fn().mockResolvedValue(undefined),
+			requireExecution: vitest.fn().mockResolvedValue(undefined),
 			sayAndCreateMissingParamError: vitest.fn().mockResolvedValue("Missing parameter error"),
 			consecutiveMistakeCount: 0,
 			didRejectTool: false,

@@ -1,4 +1,6 @@
 import { Task } from "../Task"
+import { ExecutionAuthorityError } from "../../task-persistence/taskLifecycle"
+import { withTaskExecution } from "../../../__tests__/helpers/execution-fixtures"
 
 type QueueTaskTestAccess = {
 	say: Task["say"]
@@ -16,6 +18,8 @@ const getQueueTaskTestAccess = (task: Task) => task as unknown as QueueTaskTestA
 describe("Task.ask queued message drain", () => {
 	function createTask(provider?: { getState: () => Promise<Record<string, boolean>> }) {
 		const task = Object.create(Task.prototype) as Task
+		Object.assign(task, { taskId: "queued-ask", instanceId: "queued-ask-runtime", abort: false })
+		withTaskExecution(task)
 		;(task as any).abort = false
 		;(task as any).clineMessages = []
 		;(task as any).askResponse = undefined
@@ -212,7 +216,7 @@ describe("Task.ask queued message drain", () => {
 		access.addToClineMessages = vi.fn(() => addingAsk)
 		task.messageQueueService.addMessage("Still durable")
 		const ask = task.ask("tool", JSON.stringify({ tool: "finishTask" }), false)
-		await Promise.resolve()
+		await vi.waitFor(() => expect(access.addToClineMessages).toHaveBeenCalledOnce())
 		access.lastMessageTs = Date.now() + 1
 		finishAddingAsk()
 
@@ -231,11 +235,11 @@ describe("Task.ask queued message drain", () => {
 		access.addToClineMessages = vi.fn(() => addingAsk)
 		task.messageQueueService.addMessage("Persist me later")
 		const ask = task.ask("completion_result", "Done", false)
-		await Promise.resolve()
+		await vi.waitFor(() => expect(access.addToClineMessages).toHaveBeenCalledOnce())
 		access.abort = true
 		finishAddingAsk()
 
-		await expect(ask).rejects.toThrow("aborted")
+		await expect(ask).rejects.toBeInstanceOf(ExecutionAuthorityError)
 		expect(task.messageQueueService.messages).toHaveLength(1)
 		expect(task.messageQueueService.claimNextMessage()?.text).toBe("Persist me later")
 	})

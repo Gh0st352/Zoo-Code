@@ -2,6 +2,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest"
 import { presentAssistantMessage } from "../presentAssistantMessage"
+import { withTaskExecution } from "../../../__tests__/helpers/execution-fixtures"
 import { isValidToolName } from "../../tools/validateToolUse"
 
 const mockNewTaskHandle = vi.hoisted(() => vi.fn())
@@ -30,7 +31,8 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 	beforeEach(() => {
 		mockNewTaskHandle.mockReset()
 		// Create a mock Task with minimal properties needed for testing
-		mockTask = {
+		mockTask = withTaskExecution({
+			assistantMessageSavedToHistory: true,
 			taskId: "test-task-id",
 			instanceId: "test-instance",
 			abort: false,
@@ -62,7 +64,7 @@ describe("presentAssistantMessage - Unknown Tool Handling", () => {
 			},
 			say: vi.fn().mockResolvedValue(undefined),
 			ask: vi.fn().mockResolvedValue({ response: "yesButtonClicked" }),
-		}
+		})
 
 		// Add pushToolResultToUserContent method after mockTask is created so 'this' binds correctly
 		mockTask.pushToolResultToUserContent = vi.fn().mockImplementation((toolResult: any) => {
