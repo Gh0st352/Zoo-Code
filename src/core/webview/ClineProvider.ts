@@ -1585,6 +1585,8 @@ export class ClineProvider
 				? this.bumpClineMessagesSeq(taskId)
 				: this.getClineMessagesSeq(taskId)
 			: 0
+		// Capture the payload with its sequence so later deltas cannot leak into this snapshot.
+		const messages = structuredClone(currentTask?.clineMessages ?? [])
 		const snapshotId = `${taskId ?? "none"}:${++this.nextClineMessagesSnapshotId}`
 		const generation = options.generation ?? this.clineMessagesTransportGeneration
 
@@ -1595,7 +1597,6 @@ export class ClineProvider
 			if (!isCurrent()) {
 				return
 			}
-			const messages = structuredClone(currentTask?.clineMessages ?? [])
 
 			await this.postMessageToWebview({
 				type: "clineMessagesSnapshotStart",

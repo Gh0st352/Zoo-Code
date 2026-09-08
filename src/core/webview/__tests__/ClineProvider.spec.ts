@@ -1060,6 +1060,80 @@ describe("ClineProvider", () => {
 			expect(new Set(posts.map(({ snapshotId }) => snapshotId)).size).toBe(1)
 		})
 
+		test.each([false, true])(
+			"captures snapshot payload with its sequence before queued deltas (bumpSeq=%s)",
+			async (bumpSeq) => {
+				const messages = Array.from(
+					{ length: 200 },
+					(_, index): ClineMessage => ({
+						ts: index + 1,
+						type: "say",
+						say: "text",
+						text: `message ${index + 1}`,
+						images: ["original-image"],
+					}),
+				)
+				const task = { taskId: "task-1", clineMessages: messages }
+				setCurrentTask(task)
+				provider["clineMessagesSeqByTaskId"].set(task.taskId, 4)
+				const postSpy = vi.spyOn(provider, "postMessageToWebview").mockResolvedValue(undefined)
+				const expectedSnapshot = structuredClone(messages)
+				let releaseQueue!: () => void
+				provider["clineMessagesPostQueue"] = new Promise<void>((resolve) => {
+					releaseQueue = resolve
+				})
+
+				const snapshot = provider.postClineMessagesSnapshot(task.taskId, { bumpSeq })
+				const appended: ClineMessage = { ts: 201, type: "say", say: "text", text: "appended after snapshot" }
+				task.clineMessages.push(appended)
+				const append = provider.postClineMessageAppended(task.taskId, appended)
+				messages[0].text = "updated after snapshot"
+				messages[0].images?.push("updated-image")
+				const update = provider.postClineMessageUpdated(task.taskId, messages[0])
+				releaseQueue()
+				await Promise.all([snapshot, append, update])
+
+				const snapshotSeq = bumpSeq ? 5 : 4
+				const snapshotId = "task-1:1"
+				expect(postSpy.mock.calls.map(([message]) => message)).toEqual([
+					{
+						type: "clineMessagesSnapshotStart",
+						taskId: task.taskId,
+						clineMessagesSeq: snapshotSeq,
+						snapshotId,
+						snapshotTotal: 200,
+					},
+					{
+						type: "clineMessagesSnapshotChunk",
+						taskId: task.taskId,
+						clineMessagesSeq: snapshotSeq,
+						snapshotId,
+						snapshotStartIndex: 0,
+						clineMessages: expectedSnapshot,
+					},
+					{
+						type: "clineMessagesSnapshotEnd",
+						taskId: task.taskId,
+						clineMessagesSeq: snapshotSeq,
+						snapshotId,
+						snapshotTotal: 200,
+					},
+					{
+						type: "clineMessageAppended",
+						taskId: task.taskId,
+						clineMessagesSeq: snapshotSeq + 1,
+						clineMessage: appended,
+					},
+					{
+						type: "clineMessageUpdated",
+						taskId: task.taskId,
+						clineMessagesSeq: snapshotSeq + 2,
+						clineMessage: messages[0],
+					},
+				])
+			},
+		)
+
 		test.each([
 			["append", "clineMessageAppended"],
 			["update", "clineMessageUpdated"],
@@ -1215,33 +1289,34 @@ describe("ClineProvider", () => {
 			)
 		})
 
-		test("drops a snapshot invalidated before its first post without cloning it", async () => {
-			const task = {
-				taskId: "task-1",
-				clineMessages: [{ ts: 1, type: "say", say: "text", text: "message" }] as ClineMessage[],
-			}
-			setCurrentTask(task)
-			const postSpy = vi.spyOn(provider, "postMessageToWebview")
-			let releaseQueue!: () => void
-			Object.assign(provider, {
-				clineMessagesPostQueue: new Promise<void>((resolve) => {
-					releaseQueue = resolve
-				}),
-			})
+		test.each(["focus", "generation"] as const)(
+			"drops a snapshot when %s changes before its first post",
+			async (change) => {
+				const task = {
+					taskId: "task-1",
+					clineMessages: [{ ts: 1, type: "say", say: "text", text: "message" }] as ClineMessage[],
+				}
+				setCurrentTask(task)
+				const postSpy = vi.spyOn(provider, "postMessageToWebview")
+				let releaseQueue!: () => void
+				Object.assign(provider, {
+					clineMessagesPostQueue: new Promise<void>((resolve) => {
+						releaseQueue = resolve
+					}),
+				})
 
-			const structuredCloneSpy = vi.spyOn(globalThis, "structuredClone")
-			try {
 				const snapshot = provider.postClineMessagesSnapshot("task-1")
-				task.taskId = "task-2"
+				if (change === "focus") {
+					task.taskId = "task-2"
+				} else {
+					provider["clineMessagesTransportGeneration"]++
+				}
 				releaseQueue()
 				await snapshot
 
 				expect(postSpy).not.toHaveBeenCalled()
-				expect(structuredCloneSpy).not.toHaveBeenCalled()
-			} finally {
-				structuredCloneSpy.mockRestore()
-			}
-		})
+			},
+		)
 
 		test("uses monotonic task-scoped snapshot IDs and an empty no-task snapshot", async () => {
 			await provider.resolveWebviewView(mockWebviewView)
