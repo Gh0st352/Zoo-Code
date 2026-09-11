@@ -143,12 +143,58 @@ export interface ExtensionMessage {
 		isActive: boolean
 		path?: string
 	}>
+	/**
+	 * Task scope for transcript deltas and every snapshot frame; it must match the
+	 * webview's focused task. Omitted for the no-task scope, whose snapshot is empty
+	 * with sequence 0. Unrelated message types may also use this as their task target.
+	 */
 	taskId?: string
+	/**
+	 * Complete message value for clineMessageAppended or clineMessageUpdated; updates
+	 * replace the existing message identified by ts, not an array index or text patch.
+	 * Also used by legacy messageUpdated (CLI); the sequenced webview requests a resync
+	 * instead of applying that unsequenced legacy update.
+	 */
 	clineMessage?: ClineMessage
+	/**
+	 * Nonempty, ordered message slice for clineMessagesSnapshotChunk, beginning at
+	 * snapshotStartIndex. Buffered until the matching end frame atomically replaces
+	 * the transcript; start/end frames carry no messages. Legacy full transcripts
+	 * live in state.clineMessages, not this top-level field.
+	 */
 	clineMessages?: ClineMessage[]
+	/**
+	 * Authoritative nonnegative safe-integer transcript revision, scoped to a task
+	 * within this provider's retained transport state (not globally or persistently).
+	 * Starts at 0; each accepted append/update or replacement increments it once.
+	 * Focus/resync snapshots reuse the current revision, and all start/chunk/end
+	 * frames share it. Deltas must be lastApplied + 1; snapshots may bridge gaps or
+	 * reapply the current revision. No-task snapshots use 0. Legacy messageUpdated
+	 * is unsequenced; generic browser state messages do not carry transcript revisions.
+	 */
 	clineMessagesSeq?: number
+	/**
+	 * Nonempty correlation ID shared by one snapshot's start, contiguous chunks, and
+	 * end, together with taskId and clineMessagesSeq. The host uses the task ID (or
+	 * "none") plus a provider-wide monotonically increasing snapshot counter, even
+	 * when the revision is unchanged. Treat it as opaque, not a sequence/generation.
+	 * Only a complete matching start/chunks/end transaction is applied atomically;
+	 * an empty snapshot has start/end only, including in the no-task scope.
+	 */
 	snapshotId?: string
+	/**
+	 * Zero-based nonnegative safe-integer offset for clineMessagesSnapshotChunk.
+	 * Must equal the number of messages buffered so far (no gaps/overlaps), be less
+	 * than snapshotTotal, and satisfy offset + clineMessages.length <= snapshotTotal.
+	 * Omitted on start/end; empty snapshots have no chunks.
+	 */
 	snapshotStartIndex?: number
+	/**
+	 * Nonnegative safe-integer message count declared by clineMessagesSnapshotStart
+	 * and repeated unchanged by clineMessagesSnapshotEnd; omitted on chunks. The
+	 * assembled count must equal it before atomic application. Zero means an empty
+	 * transcript and no chunk frames, for either an empty task or the no-task scope.
+	 */
 	snapshotTotal?: number
 	routerModels?: RouterModels
 	openAiModels?: string[]
@@ -663,7 +709,19 @@ export interface WebviewMessage {
 		| "requestClineMessagesResync"
 	text?: string
 	taskId?: string
+	/**
+	 * Optional requestClineMessagesResync diagnostic: the NEXT sequence the webview
+	 * expected (lastApplied + 1), not the last applied sequence. Untrusted and
+	 * non-authoritative; the host may log valid nonnegative safe integers only and
+	 * must not use this value to change its sequence or recovery behavior.
+	 */
 	expectedSeq?: number
+	/**
+	 * Optional requestClineMessagesResync diagnostic: the incoming sequence observed
+	 * by the webview, if available. Untrusted and non-authoritative; the host may log
+	 * valid nonnegative safe integers only, never use it to choose a snapshot revision
+	 * or otherwise change recovery behavior. Omit when no sequence was observed.
+	 */
 	receivedSeq?: number
 	editedMessageContent?: string
 	tab?: "settings" | "history" | "mcp" | "modes" | "chat" | "marketplace" | "cloud"

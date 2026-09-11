@@ -576,7 +576,7 @@ export const webviewMessageHandler = async (
 
 	switch (message.type) {
 		case "requestClineMessagesResync":
-			await provider.resyncClineMessagesToWebview(message.taskId)
+			await provider.resyncClineMessagesToWebview(message.taskId, message.expectedSeq, message.receivedSeq)
 			break
 		case "themeFixtureProbeResponse":
 			if (process.env.ROO_CODE_THEME_FIXTURE_PROBE === "1" && message.requestId && message.themeFixture) {
@@ -1936,7 +1936,7 @@ export const webviewMessageHandler = async (
 				const existingPrompts = getGlobalState("customModePrompts") ?? {}
 				const updatedPrompts = { ...existingPrompts, [message.promptMode]: message.customPrompt }
 				await updateGlobalState("customModePrompts", updatedPrompts)
-				await provider.postStateToWebviewWithoutClineMessages()
+				await provider.postStateToWebviewWithoutTaskHistory()
 
 				if (TelemetryService.hasInstance()) {
 					// Determine which setting was changed by comparing objects

@@ -1,10 +1,11 @@
 import { ClineProvider } from "../../core/webview/ClineProvider"
 import { TaskRegistry } from "../../core/task/TaskRegistry"
 import { type Task } from "../../core/task/Task"
+import { TranscriptTransport } from "../../core/webview/transcriptTransport"
 
 type ProviderStubFields = {
 	cancelledDelegationChildIds?: Set<string>
-	clineMessagesSeqByTaskId?: Map<string, number>
+	clineMessagesTransport?: TranscriptTransport
 	log?: ReturnType<typeof vi.fn>
 	syncFocusedTaskToWebview?: ReturnType<typeof vi.fn>
 	taskHistoryStore?: { get: (id: string) => unknown; invalidate?: (id: string) => Promise<void> }
@@ -37,7 +38,11 @@ export function makeProviderStub<T extends object>(stub: T): ClineProvider {
 	const s = stub as T & ProviderStubFields
 	const proto = ClineProvider.prototype as unknown as PrivateProviderMethods
 	s.cancelledDelegationChildIds ??= new Set()
-	s.clineMessagesSeqByTaskId ??= new Map()
+	s.clineMessagesTransport ??= new TranscriptTransport(
+		() => undefined,
+		async () => {},
+		() => {},
+	)
 	s.log ??= vi.fn()
 	s.syncFocusedTaskToWebview ??= vi.fn().mockResolvedValue(undefined)
 	s.taskHistoryStore ??= { get: () => undefined }
