@@ -69,7 +69,7 @@ vi.mock("@roo-code/telemetry", () => ({
 	},
 }))
 
-import type { ModelRecord } from "@roo-code/types"
+import type { ModelRecord, WebviewMessage } from "@roo-code/types"
 
 import { webviewMessageHandler } from "../webviewMessageHandler"
 import type { ClineProvider } from "../ClineProvider"
@@ -151,16 +151,41 @@ describe("webviewMessageHandler - transcript resync", () => {
 		vi.clearAllMocks()
 	})
 
-	it("delegates a task-scoped transcript resync to the provider", async () => {
+	it.each<Pick<WebviewMessage, "taskId" | "expectedSeq" | "receivedSeq">>([
+		{ taskId: "task-1", expectedSeq: 4, receivedSeq: 7 },
+		{ taskId: "task-1" },
+		{ taskId: "task-1", expectedSeq: Number.MAX_SAFE_INTEGER, receivedSeq: 0 },
+		{ taskId: "task-1", expectedSeq: 0 },
+		{ taskId: "task-1", receivedSeq: 0 },
+		{},
+		{ expectedSeq: 1, receivedSeq: 0 },
+	])("forwards transcript resync scope and optional diagnostics: %j", async (request) => {
 		await webviewMessageHandler(mockClineProvider, {
 			type: "requestClineMessagesResync",
-			taskId: "task-1",
-			expectedSeq: 4,
-			receivedSeq: 7,
+			...request,
 		})
 
 		expect(mockClineProvider.resyncClineMessagesToWebview).toHaveBeenCalledOnce()
-		expect(mockClineProvider.resyncClineMessagesToWebview).toHaveBeenCalledWith("task-1")
+		expect(mockClineProvider.resyncClineMessagesToWebview).toHaveBeenCalledWith(
+			request.taskId,
+			request.expectedSeq,
+			request.receivedSeq,
+		)
+		expect(mockClineProvider.log).not.toHaveBeenCalled()
+	})
+
+	it("leaves validation of untrusted diagnostics to the provider without logging the payload", async () => {
+		const expectedSeq = { secret: "must not be logged" }
+		const receivedSeq = ["must not be logged"]
+		const message: WebviewMessage = { type: "requestClineMessagesResync", taskId: "task-1" }
+		// Runtime webview payloads can violate the compile-time message contract.
+		Object.assign(message, { expectedSeq, receivedSeq })
+
+		await webviewMessageHandler(mockClineProvider, message)
+
+		expect(mockClineProvider.resyncClineMessagesToWebview).toHaveBeenCalledOnce()
+		expect(mockClineProvider.resyncClineMessagesToWebview).toHaveBeenCalledWith("task-1", expectedSeq, receivedSeq)
+		expect(mockClineProvider.log).not.toHaveBeenCalled()
 	})
 })
 

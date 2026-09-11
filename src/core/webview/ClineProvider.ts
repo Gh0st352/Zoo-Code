@@ -132,6 +132,7 @@ import { getUri } from "./getUri"
 import { REQUESTY_BASE_URL } from "../../shared/utils/requesty"
 import { validateAndFixToolResultIds } from "../task/validateToolResultIds"
 import { PendingEditOperationStore, type PendingEditOperationInput } from "./PendingEditOperationStore"
+import { TranscriptTransport } from "./transcriptTransport"
 
 /**
  * https://github.com/microsoft/vscode-webview-ui-toolkit-samples/blob/main/default/weather-webview/src/providers/WeatherViewProvider.ts
@@ -222,15 +223,16 @@ export class ClineProvider
 	private taskEventListeners: WeakMap<Task, Array<() => void>> = new WeakMap()
 	private currentWorkspacePath: string | undefined
 	private _disposed = false
-	private static readonly CLINE_MESSAGES_SNAPSHOT_CHUNK_SIZE = 200
-	private readonly clineMessagesSeqByTaskId = new Map<string, number>()
-	private clineMessagesPostQueue: Promise<void> = Promise.resolve()
-	private clineMessagesTransportGeneration = 0
-	private nextClineMessagesSnapshotId = 0
+	private readonly clineMessagesTransport = new TranscriptTransport(
+		() => this.getCurrentTask()?.taskId,
+		(message) => this.postMessageToWebview(message),
+		(error) =>
+			this.log(`[clineMessages] transport failure: ${error instanceof Error ? error.message : String(error)}`),
+	)
 	private readonly _postStateToWebviewThrottled = debounce(
 		async () => {
 			try {
-				await this.postStateToWebviewWithoutClineMessages()
+				await this.postStateToWebviewWithoutTaskHistory()
 			} catch (error) {
 				this.log(
 					`[ClineProvider#postStateToWebviewThrottled] Failed to post state: ${
@@ -366,7 +368,7 @@ export class ClineProvider
 		this.providerSettingsManager = new ProviderSettingsManager(this.context)
 
 		this.customModesManager = new CustomModesManager(this.context, async () => {
-			await this.postStateToWebviewWithoutClineMessages()
+			await this.postStateToWebviewWithoutTaskHistory()
 		})
 
 		// Initialize MCP Hub through the singleton manager
@@ -623,7 +625,7 @@ export class ClineProvider
 		}
 
 		if (task) {
-			this.clineMessagesSeqByTaskId.delete(task.taskId)
+			this.clineMessagesTransport.forgetTask(task.taskId)
 			task.emit(RooCodeEventName.TaskUnfocused)
 
 			try {
@@ -1499,25 +1501,11 @@ export class ClineProvider
 	}
 
 	private getClineMessagesSeq(taskId: string): number {
-		return this.clineMessagesSeqByTaskId.get(taskId) ?? 0
-	}
-
-	private bumpClineMessagesSeq(taskId: string): number {
-		const next = this.getClineMessagesSeq(taskId) + 1
-		this.clineMessagesSeqByTaskId.set(taskId, next)
-		return next
-	}
-
-	private enqueueClineMessagesPost(operation: () => Promise<void>): Promise<void> {
-		const run = this.clineMessagesPostQueue.then(operation, operation)
-		this.clineMessagesPostQueue = run.catch((error) => {
-			this.log(`[clineMessages] transport failure: ${error instanceof Error ? error.message : String(error)}`)
-		})
-		return run
+		return this.clineMessagesTransport.getSequence(taskId)
 	}
 
 	private invalidateClineMessagesTransport(): number {
-		return ++this.clineMessagesTransportGeneration
+		return this.clineMessagesTransport.invalidate()
 	}
 
 	public postClineMessageAppended(taskId: string, message: ClineMessage): Promise<void> {
@@ -1528,20 +1516,7 @@ export class ClineProvider
 			return this.postStateToWebviewWithoutTaskHistory()
 		}
 
-		const seq = this.bumpClineMessagesSeq(taskId)
-		const generation = this.clineMessagesTransportGeneration
-		const clonedMessage = structuredClone(message)
-		return this.enqueueClineMessagesPost(async () => {
-			if (generation !== this.clineMessagesTransportGeneration || this.getCurrentTask()?.taskId !== taskId) {
-				return
-			}
-			await this.postMessageToWebview({
-				type: "clineMessageAppended",
-				taskId,
-				clineMessage: clonedMessage,
-				clineMessagesSeq: seq,
-			})
-		})
+		return this.clineMessagesTransport.enqueue({ kind: "append", taskId }, [message])
 	}
 
 	public postClineMessageUpdated(taskId: string, message: ClineMessage): Promise<void> {
@@ -1552,20 +1527,7 @@ export class ClineProvider
 			return this.postMessageToWebview({ type: "messageUpdated", clineMessage: structuredClone(message) })
 		}
 
-		const seq = this.bumpClineMessagesSeq(taskId)
-		const generation = this.clineMessagesTransportGeneration
-		const clonedMessage = structuredClone(message)
-		return this.enqueueClineMessagesPost(async () => {
-			if (generation !== this.clineMessagesTransportGeneration || this.getCurrentTask()?.taskId !== taskId) {
-				return
-			}
-			await this.postMessageToWebview({
-				type: "clineMessageUpdated",
-				taskId,
-				clineMessage: clonedMessage,
-				clineMessagesSeq: seq,
-			})
-		})
+		return this.clineMessagesTransport.enqueue({ kind: "update", taskId }, [message])
 	}
 
 	public postClineMessagesSnapshot(
@@ -1580,64 +1542,33 @@ export class ClineProvider
 			return this.postStateToWebviewWithoutTaskHistory()
 		}
 
-		const seq = taskId
-			? options.bumpSeq
-				? this.bumpClineMessagesSeq(taskId)
-				: this.getClineMessagesSeq(taskId)
-			: 0
-		// Capture the payload with its sequence so later deltas cannot leak into this snapshot.
-		const messages = structuredClone(currentTask?.clineMessages ?? [])
-		const snapshotId = `${taskId ?? "none"}:${++this.nextClineMessagesSnapshotId}`
-		const generation = options.generation ?? this.clineMessagesTransportGeneration
-
-		return this.enqueueClineMessagesPost(async () => {
-			const isCurrent = () =>
-				generation === this.clineMessagesTransportGeneration &&
-				(this.getCurrentTask()?.taskId ?? undefined) === taskId
-			if (!isCurrent()) {
-				return
-			}
-
-			await this.postMessageToWebview({
-				type: "clineMessagesSnapshotStart",
-				taskId,
-				clineMessagesSeq: seq,
-				snapshotId,
-				snapshotTotal: messages.length,
-			})
-
-			for (let start = 0; start < messages.length; start += ClineProvider.CLINE_MESSAGES_SNAPSHOT_CHUNK_SIZE) {
-				if (!isCurrent()) {
-					return
-				}
-				await this.postMessageToWebview({
-					type: "clineMessagesSnapshotChunk",
-					taskId,
-					clineMessagesSeq: seq,
-					snapshotId,
-					snapshotStartIndex: start,
-					clineMessages: messages.slice(start, start + ClineProvider.CLINE_MESSAGES_SNAPSHOT_CHUNK_SIZE),
-				})
-			}
-
-			if (!isCurrent()) {
-				return
-			}
-			await this.postMessageToWebview({
-				type: "clineMessagesSnapshotEnd",
-				taskId,
-				clineMessagesSeq: seq,
-				snapshotId,
-				snapshotTotal: messages.length,
-			})
-		})
+		return this.clineMessagesTransport.enqueue(
+			{ kind: "snapshot", taskId, ...options },
+			currentTask?.clineMessages ?? [],
+		)
 	}
 
-	public resyncClineMessagesToWebview(taskId?: string): Promise<void> {
-		if ((this.getCurrentTask()?.taskId ?? undefined) !== taskId) {
+	public resyncClineMessagesToWebview(taskId?: string, expectedSeq?: unknown, receivedSeq?: unknown): Promise<void> {
+		const currentTaskId = this.getCurrentTask()?.taskId
+		if (currentTaskId !== taskId) {
 			return Promise.resolve()
 		}
+		// Untrusted webview diagnostics are log-only; never derive transport state from them.
+		const diagnosticSequence = (value: unknown): number | undefined =>
+			typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+		const previousGeneration = this.clineMessagesTransport.generation
+		const currentSeq = currentTaskId === undefined ? 0 : this.getClineMessagesSeq(currentTaskId)
 		const generation = this.invalidateClineMessagesTransport()
+		this.log(
+			`[clineMessages] resync accepted: ${JSON.stringify({
+				taskId: currentTaskId ?? null,
+				previousGeneration,
+				newGeneration: generation,
+				currentSeq,
+				expectedSeq: diagnosticSequence(expectedSeq),
+				receivedSeq: diagnosticSequence(receivedSeq),
+			})}`,
+		)
 		return this.postClineMessagesSnapshot(taskId, { generation })
 	}
 
@@ -1648,7 +1579,7 @@ export class ClineProvider
 		} else {
 			await this.postStateToWebviewWithoutTaskHistory()
 		}
-		if (generation !== this.clineMessagesTransportGeneration) {
+		if (generation !== this.clineMessagesTransport.generation) {
 			return
 		}
 		await this.postClineMessagesSnapshot(this.getCurrentTask()?.taskId, { generation })
@@ -2545,7 +2476,7 @@ export class ClineProvider
 			// Delete all tasks from state in one batch
 			await this.taskHistoryStore.deleteMany(allIdsToDelete)
 			for (const taskId of allIdsToDelete) {
-				this.clineMessagesSeqByTaskId.delete(taskId)
+				this.clineMessagesTransport.forgetTask(taskId)
 			}
 			this.recentTasksCache = undefined
 
@@ -2589,7 +2520,7 @@ export class ClineProvider
 
 	async deleteTaskFromState(id: string) {
 		await this.taskHistoryStore.delete(id)
-		this.clineMessagesSeqByTaskId.delete(id)
+		this.clineMessagesTransport.forgetTask(id)
 		this.recentTasksCache = undefined
 
 		await this.postStateToWebview()
@@ -2639,24 +2570,6 @@ export class ClineProvider
 		}
 
 		await this._postStateToWebviewThrottled.flush()
-	}
-
-	/**
-	 * Compatibility name for callers that need a lightweight generic state post.
-	 * Transcript fields are removed from every generic state message at the
-	 * postMessageToWebview boundary, while the canonical method below also omits
-	 * taskHistory.
-	 *
-	 * Rationale:
-	 * - Cloud event handlers (auth, settings, user-info) and mode changes trigger state pushes
-	 *   that have nothing to do with chat messages. Including clineMessages in these pushes
-	 *   creates race conditions where a stale snapshot of clineMessages (captured during async
-	 *   getStateToPostToWebview) overwrites newer messages the task has streamed in the meantime.
-	 * - This method ensures cloud/mode events only push the state fields they actually affect
-	 *   (cloud auth, org settings, profiles, etc.) without interfering with task message streaming.
-	 */
-	async postStateToWebviewWithoutClineMessages(): Promise<void> {
-		await this.postStateToWebviewWithoutTaskHistory()
 	}
 
 	/**

@@ -188,7 +188,7 @@ vi.mock("../core/webview/ClineProvider", async () => {
 		resolveWebviewView: vi.fn(),
 		postMessageToWebview: vi.fn(),
 		postStateToWebview: vi.fn(),
-		postStateToWebviewWithoutClineMessages: vi.fn().mockResolvedValue(undefined),
+		postStateToWebviewWithoutTaskHistory: vi.fn().mockResolvedValue(undefined),
 		getState: vi.fn().mockResolvedValue({}),
 		initializeCloudProfileSyncWhenReady: vi.fn().mockResolvedValue(undefined),
 		providerSettingsManager: {},
@@ -295,17 +295,17 @@ describe("extension.ts", () => {
 
 			const provider = (
 				ClineProvider as unknown as {
-					getVisibleInstance(): { postStateToWebviewWithoutClineMessages: ReturnType<typeof vi.fn> }
+					getVisibleInstance(): { postStateToWebviewWithoutTaskHistory: ReturnType<typeof vi.fn> }
 				}
 			).getVisibleInstance()
-			provider.postStateToWebviewWithoutClineMessages.mockClear()
+			provider.postStateToWebviewWithoutTaskHistory.mockClear()
 			const refreshError = new Error("state refresh failed")
-			provider.postStateToWebviewWithoutClineMessages.mockRejectedValueOnce(refreshError)
+			provider.postStateToWebviewWithoutTaskHistory.mockRejectedValueOnce(refreshError)
 
 			settingsUpdatedHandler!({})
 			await Promise.resolve()
 
-			expect(provider.postStateToWebviewWithoutClineMessages).toHaveBeenCalledTimes(1)
+			expect(provider.postStateToWebviewWithoutTaskHistory).toHaveBeenCalledTimes(1)
 			const vscode = await import("vscode")
 			const channel = vi.mocked(vscode.window.createOutputChannel).mock.results.at(-1)?.value
 			expect(channel?.appendLine).toHaveBeenCalledWith(
@@ -442,15 +442,15 @@ describe("extension.ts", () => {
 
 			const visibleInstance = (
 				ClineProvider as unknown as {
-					getVisibleInstance(): { postStateToWebviewWithoutClineMessages: ReturnType<typeof vi.fn> }
+					getVisibleInstance(): { postStateToWebviewWithoutTaskHistory: ReturnType<typeof vi.fn> }
 				}
 			).getVisibleInstance()
-			vi.mocked(visibleInstance.postStateToWebviewWithoutClineMessages).mockClear()
+			vi.mocked(visibleInstance.postStateToWebviewWithoutTaskHistory).mockClear()
 
 			const onDidChangeHandler = vi.mocked(vscode.env.onDidChangeTelemetryEnabled).mock.calls[0][0]
 			onDidChangeHandler(undefined as never)
 
-			expect(visibleInstance.postStateToWebviewWithoutClineMessages).toHaveBeenCalled()
+			expect(visibleInstance.postStateToWebviewWithoutTaskHistory).toHaveBeenCalled()
 		})
 	})
 
