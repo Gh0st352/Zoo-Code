@@ -249,13 +249,27 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 					? 1
 					: 0)
 			requireInvariant(job.seq === expectedSeq, "allocated sequence diverged from capture order")
+			requireInvariant(job.total === values.length, "job total differs from captured payload")
+			if (job.kind === "snapshot") {
+				requireInvariant(
+					typeof job.snapshotId === "string" &&
+						job.snapshotId.length > 0 &&
+						!s.captures.some((capture) => capture.job.snapshotId === job.snapshotId),
+					"snapshot lacks a unique identity",
+				)
+			} else {
+				requireInvariant(!("snapshotId" in job), "delta carries snapshot metadata")
+			}
 			s.allocated[scope] = job.seq
 			s.captures.push({ job, scope, values: [...values], failed: false })
 			s.payloads.push(job.id)
 			s.callers.push(job.id)
 		}
 		for (const id of transition.release) s.payloads = s.payloads.filter((value) => value !== id)
-		for (const { id } of transition.settle) s.callers = s.callers.filter((value) => value !== id)
+		for (const { id } of transition.settle) {
+			requireInvariant(s.callers.includes(id), "settlement lacks a registered caller")
+			s.callers = s.callers.filter((value) => value !== id)
+		}
 		if (action.type === "invalidate") {
 			requireInvariant(
 				s.transport.queue.length === 0 && !s.transport.active && s.payloads.length === 0,
@@ -293,6 +307,20 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 				"post or commit initiated after invalidation",
 			)
 			requireInvariant(!capture.failed, "failed snapshot continued posting")
+			if (frame.phase === "chunk") {
+				// Check the descriptor before wire slicing can clamp an overlarge count.
+				requireInvariant(
+					Number.isSafeInteger(frame.start) &&
+						frame.start >= 0 &&
+						frame.start === s.staging?.values.length &&
+						frame.count > 0 &&
+						frame.count === capture.values.slice(frame.start, frame.start + before.chunkSize).length &&
+						frame.start + frame.count <= capture.values.length,
+					"chunk descriptor differs from captured payload range",
+				)
+			} else {
+				requireInvariant(frame.start === 0 && frame.count === 0, "non-chunk frame carries a payload range")
+			}
 			requireInvariant(
 				frame.job.seq >= (s.sent[capture.scope] ?? 0),
 				"sent sequence regressed within task lifetime",
@@ -489,7 +517,7 @@ export const TRANSPORT_MUTATIONS: Mutation[] = [
 		reduce: (state, action) => {
 			const result = reduceTranscriptTransport(state, action)
 			if (result.post?.phase === "chunk") {
-				result.post = { ...result.post, phase: "end" }
+				result.post = { ...result.post, phase: "end", start: 0, count: 0 }
 				result.state = { ...result.state, inFlight: result.post }
 			}
 			return result
@@ -513,6 +541,52 @@ export const TRANSPORT_MUTATIONS: Mutation[] = [
 		expected: "failed snapshot continued posting",
 		reduce: (state, action) =>
 			reduceTranscriptTransport(state, action.type === "settle" ? { ...action, success: true } : action),
+	},
+	{
+		name: "delta-snapshot-metadata",
+		expected: "delta carries snapshot metadata",
+		reduce: (state, action) => {
+			const result = reduceTranscriptTransport(state, action)
+			if (result.accepted && result.accepted.kind !== "snapshot") {
+				const job = { ...result.accepted, snapshotId: "unused" }
+				result.accepted = job
+				result.state = { ...result.state, queue: [...result.state.queue.slice(0, -1), job] }
+			}
+			return result
+		},
+	},
+	{
+		name: "non-chunk-payload-range",
+		expected: "non-chunk frame carries a payload range",
+		reduce: (state, action) => {
+			const result = reduceTranscriptTransport(state, action)
+			if (result.post && result.post.phase !== "chunk") {
+				result.post = { ...result.post, start: 1, count: 1 }
+				result.state = { ...result.state, inFlight: result.post }
+			}
+			return result
+		},
+	},
+	{
+		name: "overrun-final-chunk",
+		expected: "chunk descriptor differs from captured payload range",
+		reduce: (state, action) => {
+			const result = reduceTranscriptTransport(state, action)
+			if (result.post?.phase === "chunk") {
+				result.post = { ...result.post, count: state.chunkSize }
+				result.state = { ...result.state, inFlight: result.post }
+			}
+			return result
+		},
+	},
+	{
+		name: "settle-caller-twice",
+		expected: "settlement lacks a registered caller",
+		reduce: (state, action) => {
+			const result = reduceTranscriptTransport(state, action)
+			result.settle.push(...result.settle)
+			return result
+		},
 	},
 ]
 

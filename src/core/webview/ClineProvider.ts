@@ -1500,10 +1500,6 @@ export class ClineProvider
 		}
 	}
 
-	private getClineMessagesSeq(taskId: string): number {
-		return this.clineMessagesTransport.getSequence(taskId)
-	}
-
 	private invalidateClineMessagesTransport(): number {
 		return this.clineMessagesTransport.invalidate()
 	}
@@ -1554,10 +1550,14 @@ export class ClineProvider
 			return Promise.resolve()
 		}
 		// Untrusted webview diagnostics are log-only; never derive transport state from them.
-		const diagnosticSequence = (value: unknown): number | undefined =>
-			typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+		const diagnosticSequence = (value: unknown): number | undefined => {
+			if (!Number.isSafeInteger(value)) return undefined
+			// isSafeInteger rejects non-numbers without coercion, but is not a TS type predicate.
+			const sequence = value as number
+			return sequence >= 0 ? sequence : undefined
+		}
 		const previousGeneration = this.clineMessagesTransport.generation
-		const currentSeq = currentTaskId === undefined ? 0 : this.getClineMessagesSeq(currentTaskId)
+		const currentSeq = this.clineMessagesTransport.getSequence(currentTaskId)
 		const generation = this.invalidateClineMessagesTransport()
 		this.log(
 			`[clineMessages] resync accepted: ${JSON.stringify({
