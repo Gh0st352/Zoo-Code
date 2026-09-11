@@ -26,8 +26,6 @@ import {
 	DEFAULT_DIFF_FUZZY_THRESHOLD,
 } from "@roo-code/types"
 
-import { findLastIndex } from "@roo/array"
-
 import { checkExistKey } from "@roo/checkExistApiConfig"
 import { Mode, defaultModeSlug, defaultPrompts } from "@roo/modes"
 import { CustomSupportPrompts } from "@roo/support-prompt"
@@ -287,6 +285,12 @@ export const ExtensionStateContextProvider: React.FC<{
 	const activeTaskIdRef = useRef<string | undefined>(state.currentTaskId ?? undefined)
 	const clineMessagesSeqRef = useRef(state.clineMessagesSeq ?? 0)
 	const clineMessagesRef = useRef<ClineMessage[]>(state.clineMessages)
+	const clineMessagesIndexRef = useRef<Map<number, number> | null>(null)
+	if (clineMessagesIndexRef.current === null) {
+		// Initialize once, preserving the last match when timestamps repeat.
+		clineMessagesIndexRef.current = new Map(state.clineMessages.map((message, index) => [message.ts, index]))
+	}
+	const clineMessagesIndex = clineMessagesIndexRef.current
 	const activeSnapshotRef = useRef<ClineMessagesSnapshotBuffer | null>(null)
 	const snapshotTimeoutRef = useRef<number | undefined>(undefined)
 	const resyncPendingRef = useRef(false)
@@ -339,6 +343,15 @@ export const ExtensionStateContextProvider: React.FC<{
 			},
 		}))
 	}, [])
+
+	const replaceClineMessages = useCallback(
+		(messages: ClineMessage[]) => {
+			clineMessagesRef.current = messages
+			clineMessagesIndex.clear()
+			messages.forEach((message, index) => clineMessagesIndex.set(message.ts, index))
+		},
+		[clineMessagesIndex],
+	)
 
 	const clearClineMessagesResync = useCallback(
 		() => {
@@ -447,12 +460,14 @@ export const ExtensionStateContextProvider: React.FC<{
 			let nextMessages: ClineMessage[]
 			if (operation === "append") {
 				nextMessages = [...clineMessagesRef.current, clineMessage]
+				clineMessagesIndex.set(clineMessage.ts, nextMessages.length - 1)
 			} else {
-				const index = findLastIndex(clineMessagesRef.current, (item) => item.ts === clineMessage.ts)
-				if (index === -1) {
+				const index = clineMessagesIndex.get(clineMessage.ts)
+				if (index === undefined) {
 					requestClineMessagesResync(seq)
 					return
 				}
+				// Timestamp lookup is O(1) on average; the immutable array copy is still O(N).
 				nextMessages = [...clineMessagesRef.current]
 				nextMessages[index] = clineMessage
 			}
@@ -465,8 +480,8 @@ export const ExtensionStateContextProvider: React.FC<{
 				clineMessagesSeq: seq,
 			}))
 		},
-		// Stryker disable next-line ArrayDeclaration: both dependencies are stable callbacks; an empty dependency list produces the same closure for the provider lifetime.
-		[clearClineMessagesSnapshot, requestClineMessagesResync, retryClineMessagesResync],
+		// Stryker disable next-line ArrayDeclaration: the index and callbacks are stable; an empty dependency list produces the same closure for the provider lifetime.
+		[clearClineMessagesSnapshot, clineMessagesIndex, requestClineMessagesResync, retryClineMessagesResync],
 	)
 
 	const handleMessage = useCallback(
@@ -488,7 +503,7 @@ export const ExtensionStateContextProvider: React.FC<{
 					if (taskChanged || taskCleared) {
 						activeTaskIdRef.current = nextTaskId
 						clineMessagesSeqRef.current = 0
-						clineMessagesRef.current = []
+						replaceClineMessages([])
 						clearClineMessagesSnapshot()
 						clearClineMessagesResync()
 					}
@@ -687,7 +702,7 @@ export const ExtensionStateContextProvider: React.FC<{
 
 					clearClineMessagesSnapshot()
 					clearClineMessagesResync()
-					clineMessagesRef.current = snapshot.messages
+					replaceClineMessages(snapshot.messages)
 					clineMessagesSeqRef.current = snapshot.seq
 					setState((prevState) => ({
 						...prevState,
@@ -793,6 +808,7 @@ export const ExtensionStateContextProvider: React.FC<{
 			applyClineMessagesDelta,
 			clearClineMessagesSnapshot,
 			clearClineMessagesResync,
+			replaceClineMessages,
 			requestClineMessagesResync,
 			retryClineMessagesResync,
 			setListApiConfigMeta,
