@@ -2267,14 +2267,18 @@ describe("Cline", () => {
 				partial: true,
 			}
 			const replacement = { ...staleMessage, ts: 2, text: "replacement partial" }
+			const firstMessage = { ...staleMessage, text: "first partial" }
+			const updatePostSpy = vi.mocked(mockProvider.postClineMessageUpdated)
 			task.clineMessages = [staleMessage]
+			await taskAccess.updateClineMessage(firstMessage)
 			await taskAccess.updateClineMessage(staleMessage)
+			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, firstMessage]])
 
 			const overwritePromise = task.overwriteClineMessages([replacement], persist)
 			await vi.advanceTimersByTimeAsync(500)
 
 			expect(task.clineMessages).toEqual([replacement])
-			expect(mockProvider.postClineMessageUpdated).not.toHaveBeenCalled()
+			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, firstMessage]])
 			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledTimes(persist ? 0 : 1)
 
 			releaseSave(true)
@@ -2283,13 +2287,16 @@ describe("Cline", () => {
 
 			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledOnce()
 			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledWith(task.taskId, { bumpSeq: true })
-			expect(mockProvider.postClineMessageUpdated).not.toHaveBeenCalled()
+			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, firstMessage]])
 
 			await taskAccess.updateClineMessage(replacement)
+			expect(updatePostSpy.mock.calls).toEqual([
+				[task.taskId, firstMessage],
+				[task.taskId, replacement],
+			])
 			await vi.advanceTimersByTimeAsync(500)
 
-			expect(mockProvider.postClineMessageUpdated).toHaveBeenCalledOnce()
-			expect(mockProvider.postClineMessageUpdated).toHaveBeenCalledWith(task.taskId, replacement)
+			expect(updatePostSpy).toHaveBeenCalledTimes(2)
 		})
 
 		it("propagates an overwrite snapshot failure after persistence", async () => {
@@ -2472,7 +2479,7 @@ describe("Cline", () => {
 			expect(mockProvider.postClineMessageAppended).toHaveBeenCalledWith(task.taskId, message)
 		})
 
-		it("serializes a new partial message before its debounced following update", async () => {
+		it("serializes a new partial message before its immediate leading update", async () => {
 			vi.useFakeTimers()
 			const task = new Task({
 				provider: mockProvider,
@@ -2507,17 +2514,39 @@ describe("Cline", () => {
 			expect(updatePostSpy).not.toHaveBeenCalled()
 
 			releaseAppend()
-			await vi.advanceTimersByTimeAsync(500)
 			await addThenUpdate
 
+			expect(updatePostSpy).toHaveBeenCalledOnce()
 			expect(appendSpy.mock.invocationCallOrder[0]).toBeLessThan(updatePostSpy.mock.invocationCallOrder[0])
 			expect(updatePostSpy).toHaveBeenCalledWith(task.taskId, {
 				...partialMessage,
 				text: "updated partial",
 			})
+
+			await vi.advanceTimersByTimeAsync(500)
+			expect(updatePostSpy).toHaveBeenCalledOnce()
 		})
 
-		it("debounces partial updates and posts the latest revision on the trailing edge", async () => {
+		it("posts the first partial update immediately without duplicating it on the trailing edge", async () => {
+			vi.useFakeTimers()
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			const updatePostSpy = vi.mocked(mockProvider.postClineMessageUpdated)
+			const message = { ts: 1, type: "say" as const, say: "text" as const, text: "first partial", partial: true }
+
+			const updatePromise = getTaskTestAccess(task).updateClineMessage(message)
+
+			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, message]])
+			await updatePromise
+			await vi.advanceTimersByTimeAsync(1_000)
+			expect(updatePostSpy).toHaveBeenCalledOnce()
+		})
+
+		it("coalesces partial updates after the leading post and flushes the latest revision on the trailing edge", async () => {
 			vi.useFakeTimers()
 			const task = new Task({
 				provider: mockProvider,
@@ -2528,34 +2557,33 @@ describe("Cline", () => {
 			const taskAccess = getTaskTestAccess(task)
 			const updatePostSpy = vi.mocked(mockProvider.postClineMessageUpdated)
 
-			void taskAccess.updateClineMessage({
+			const first = {
 				ts: 1,
-				type: "say",
-				say: "text",
+				type: "say" as const,
+				say: "text" as const,
 				text: "first partial",
 				partial: true,
-			})
-			await vi.advanceTimersByTimeAsync(250)
-			void taskAccess.updateClineMessage({
-				ts: 1,
-				type: "say",
-				say: "text",
-				text: "latest partial",
-				partial: true,
-			})
+			}
+			const latest = { ...first, text: "latest partial" }
+			await taskAccess.updateClineMessage(first)
+			await vi.advanceTimersByTimeAsync(100)
+			await taskAccess.updateClineMessage({ ...first, text: "superseded partial" })
+			await vi.advanceTimersByTimeAsync(150)
+			await taskAccess.updateClineMessage(latest)
 
-			await vi.advanceTimersByTimeAsync(499)
-			expect(updatePostSpy).not.toHaveBeenCalled()
+			await vi.advanceTimersByTimeAsync(249)
+			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, first]])
 
 			await vi.advanceTimersByTimeAsync(1)
-			expect(updatePostSpy).toHaveBeenCalledOnce()
-			expect(updatePostSpy).toHaveBeenCalledWith(
-				task.taskId,
-				expect.objectContaining({ text: "latest partial", partial: true }),
-			)
+			expect(updatePostSpy.mock.calls).toEqual([
+				[task.taskId, first],
+				[task.taskId, latest],
+			])
+			await vi.advanceTimersByTimeAsync(1_000)
+			expect(updatePostSpy).toHaveBeenCalledTimes(2)
 		})
 
-		it("drops a debounced partial update when the provider reference expires", async () => {
+		it("bounds ongoing partial delivery by maxWait without posting every revision", async () => {
 			vi.useFakeTimers()
 			const task = new Task({
 				provider: mockProvider,
@@ -2563,22 +2591,66 @@ describe("Cline", () => {
 				task: "test task",
 				startTask: false,
 			})
-			Object.defineProperty(task, "providerRef", {
-				value: { deref: () => undefined },
-				configurable: true,
-			})
+			const taskAccess = getTaskTestAccess(task)
+			const updatePostSpy = vi.mocked(mockProvider.postClineMessageUpdated)
+			const first = { ts: 1, type: "say" as const, say: "text" as const, text: "partial 0", partial: true }
+			await taskAccess.updateClineMessage(first)
 
-			await getTaskTestAccess(task).updateClineMessage({
-				ts: 1,
-				type: "say",
-				say: "text",
-				text: "partial",
-				partial: true,
-			})
-			await vi.advanceTimersByTimeAsync(500)
+			// Updates never pause for the debounce interval, so a trailing-only debounce would starve the webview.
+			for (let elapsed = 100; elapsed <= 1_400; elapsed += 100) {
+				await vi.advanceTimersByTimeAsync(100)
+				await taskAccess.updateClineMessage({ ...first, text: `partial ${elapsed}` })
+				expect(updatePostSpy).toHaveBeenCalledTimes(1 + Math.floor(elapsed / 500))
+			}
 
-			expect(mockProvider.postClineMessageUpdated).not.toHaveBeenCalled()
+			await vi.advanceTimersByTimeAsync(100)
+			expect(updatePostSpy.mock.calls).toEqual([
+				[task.taskId, first],
+				[task.taskId, { ...first, text: "partial 400" }],
+				[task.taskId, { ...first, text: "partial 900" }],
+				[task.taskId, { ...first, text: "partial 1400" }],
+			])
+			await vi.advanceTimersByTimeAsync(1_000)
+			expect(updatePostSpy).toHaveBeenCalledTimes(4)
 		})
+
+		it.each(["leading", "trailing"] as const)(
+			"drops the %s partial update when the provider reference expires",
+			async (edge) => {
+				vi.useFakeTimers()
+				const task = new Task({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					task: "test task",
+					startTask: false,
+				})
+				const taskAccess = getTaskTestAccess(task)
+				const first = {
+					ts: 1,
+					type: "say" as const,
+					say: "text" as const,
+					text: "first partial",
+					partial: true,
+				}
+				if (edge === "trailing") {
+					await taskAccess.updateClineMessage(first)
+					await taskAccess.updateClineMessage({ ...first, text: "queued partial" })
+				}
+				Object.defineProperty(task, "providerRef", {
+					value: { deref: () => undefined },
+					configurable: true,
+				})
+
+				if (edge === "leading") {
+					await taskAccess.updateClineMessage(first)
+				}
+				await vi.advanceTimersByTimeAsync(500)
+
+				expect(vi.mocked(mockProvider.postClineMessageUpdated).mock.calls).toEqual(
+					edge === "leading" ? [] : [[task.taskId, first]],
+				)
+			},
+		)
 
 		it("emits a complete update when the provider reference is unavailable", async () => {
 			const task = new Task({
@@ -2600,27 +2672,38 @@ describe("Cline", () => {
 			expect(messageListener).toHaveBeenCalledWith({ action: "updated", message })
 		})
 
-		it("cancels a pending partial update when the task is disposed", async () => {
-			vi.useFakeTimers()
-			const task = new Task({
-				provider: mockProvider,
-				apiConfiguration: mockApiConfig,
-				task: "test task",
-				startTask: false,
-			})
+		it.each(["dispose", "abortTask"] as const)(
+			"cancels a queued trailing partial update on %s",
+			async (cleanup) => {
+				vi.useFakeTimers()
+				const task = new Task({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					task: "test task",
+					startTask: false,
+				})
+				const taskAccess = getTaskTestAccess(task)
+				vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
+				const updatePostSpy = vi.mocked(mockProvider.postClineMessageUpdated)
+				const first = {
+					ts: 1,
+					type: "say" as const,
+					say: "text" as const,
+					text: "first partial",
+					partial: true,
+				}
 
-			await getTaskTestAccess(task).updateClineMessage({
-				ts: 1,
-				type: "say",
-				say: "text",
-				text: "partial",
-				partial: true,
-			})
-			await task.dispose()
-			await vi.advanceTimersByTimeAsync(500)
+				await taskAccess.updateClineMessage(first)
+				await vi.advanceTimersByTimeAsync(100)
+				await taskAccess.updateClineMessage({ ...first, text: "queued partial" })
+				expect(updatePostSpy.mock.calls).toEqual([[task.taskId, first]])
 
-			expect(mockProvider.postClineMessageUpdated).not.toHaveBeenCalled()
-		})
+				await task[cleanup]()
+				await vi.advanceTimersByTimeAsync(1_000)
+
+				expect(updatePostSpy.mock.calls).toEqual([[task.taskId, first]])
+			},
+		)
 
 		it.each([
 			["false", { ts: 1, type: "say" as const, say: "text" as const, text: "complete", partial: false }],
@@ -2638,24 +2721,47 @@ describe("Cline", () => {
 				const taskAccess = getTaskTestAccess(task)
 				const updatePostSpy = vi.mocked(mockProvider.postClineMessageUpdated)
 
-				void taskAccess.updateClineMessage({
+				const first = {
 					ts: 1,
-					type: "say",
-					say: "text",
-					text: "partial",
+					type: "say" as const,
+					say: "text" as const,
+					text: "first partial",
 					partial: true,
+				}
+				await taskAccess.updateClineMessage(first)
+				await vi.advanceTimersByTimeAsync(100)
+				await taskAccess.updateClineMessage({ ...first, text: "superseded partial" })
+				expect(updatePostSpy.mock.calls).toEqual([[task.taskId, first]])
+
+				let releasePost!: () => void
+				const pendingPost = new Promise<void>((resolve) => {
+					releasePost = resolve
 				})
-				await taskAccess.updateClineMessage(complete)
+				updatePostSpy.mockReturnValueOnce(pendingPost)
+				const messageListener = vi.fn()
+				task.on(RooCodeEventName.Message, messageListener)
+				const completionPromise = taskAccess.updateClineMessage(complete)
 
-				expect(updatePostSpy).toHaveBeenCalledOnce()
-				expect(updatePostSpy).toHaveBeenCalledWith(task.taskId, complete)
+				expect(updatePostSpy.mock.calls).toEqual([
+					[task.taskId, first],
+					[task.taskId, complete],
+				])
+				expect(messageListener).not.toHaveBeenCalled()
 
-				await vi.advanceTimersByTimeAsync(500)
-				expect(updatePostSpy).toHaveBeenCalledOnce()
+				// A queued partial must not arrive after the final post, even while that post is still pending.
+				await vi.advanceTimersByTimeAsync(1_000)
+				expect(updatePostSpy).toHaveBeenCalledTimes(2)
+				expect(messageListener).not.toHaveBeenCalled()
+
+				releasePost()
+				await completionPromise
+				expect(messageListener).toHaveBeenCalledExactlyOnceWith({ action: "updated", message: complete })
+				await vi.advanceTimersByTimeAsync(1_000)
+				expect(updatePostSpy).toHaveBeenCalledTimes(2)
 			},
 		)
 
-		it("handles a rejected debounced partial update", async () => {
+		it.each(["leading", "trailing"] as const)("handles a rejected %s partial update", async (edge) => {
 			vi.useFakeTimers()
 			const task = new Task({
 				provider: mockProvider,
@@ -2663,24 +2769,24 @@ describe("Cline", () => {
 				task: "test task",
 				startTask: false,
 			})
+			const taskAccess = getTaskTestAccess(task)
+			const first = { ts: 1, type: "say" as const, say: "text" as const, text: "first partial", partial: true }
+			if (edge === "trailing") {
+				await taskAccess.updateClineMessage(first)
+			}
 			const postError = new Error("incremental update failed")
 			vi.mocked(mockProvider.postClineMessageUpdated).mockRejectedValueOnce(postError)
 			const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
 
 			try {
-				void getTaskTestAccess(task).updateClineMessage({
-					ts: 1,
-					type: "say",
-					say: "text",
-					text: "partial",
-					partial: true,
-				})
+				await taskAccess.updateClineMessage({ ...first, text: "rejected partial" })
 				await vi.advanceTimersByTimeAsync(500)
 
-				expect(consoleErrorSpy).toHaveBeenCalledWith(
-					"[Task#updateClineMessage] incremental post failed:",
-					postError,
-				)
+				expect(
+					consoleErrorSpy.mock.calls.filter(
+						([message]) => message === "[Task#updateClineMessage] incremental post failed:",
+					),
+				).toEqual([["[Task#updateClineMessage] incremental post failed:", postError]])
 			} finally {
 				consoleErrorSpy.mockRestore()
 			}

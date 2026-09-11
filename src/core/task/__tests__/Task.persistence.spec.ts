@@ -1344,7 +1344,7 @@ describe("Task persistence", () => {
 			result: "Done",
 		}
 
-		it("replays an unresolved pending action instead of a generic resume ask", async () => {
+		it("awaits the hydrated snapshot before replaying an unresolved pending action instead of a generic resume ask", async () => {
 			const messages: ClineMessage[] = [
 				{ ts: 1, type: "say", say: "text", text: "Child" },
 				{ ts: 2, type: "ask", ask: "tool", text: pendingAction.approvalText },
@@ -1371,26 +1371,51 @@ describe("Task persistence", () => {
 				},
 				startTask: false,
 			})
+			const events: string[] = []
 			const replay = vi
 				.spyOn(getTaskPersistenceAccess(task), "resumePendingTaskAction")
 				.mockImplementation(async () => {
+					events.push("replay")
 					expect(task.isInitialized).toBe(true)
 				})
 			const ask = vi.spyOn(task, "ask")
+			const snapshotStarted = createDeferred<void>()
 			const snapshotDeferred = createDeferred<void>()
-			const snapshot = vi
-				.mocked(mockProvider.postClineMessagesSnapshot)
-				.mockReturnValueOnce(snapshotDeferred.promise)
+			const snapshot = vi.mocked(mockProvider.postClineMessagesSnapshot).mockImplementationOnce(async () => {
+				events.push("snapshot started")
+				snapshotStarted.resolve()
+				await snapshotDeferred.promise
+				events.push("snapshot resolved")
+			})
 
-			const resumePromise = getTaskPersistenceAccess(task).resumeTaskFromHistory()
-			await vi.waitFor(() => expect(snapshot).toHaveBeenCalledWith(task.taskId, { bumpSeq: true }))
-			expect(replay).not.toHaveBeenCalled()
-			expect(task.clineMessages).toEqual([expect.objectContaining({ text: "Child" })])
-			expect(task.apiConversationHistory).toHaveLength(1)
-			snapshotDeferred.resolve()
-			await resumePromise
+			const resumePromise = getTaskPersistenceAccess(task)
+				.resumeTaskFromHistory()
+				.then(() => {
+					events.push("resume finished")
+				})
+			try {
+				// An explicit entry signal avoids polling or guessed microtask counts. Racing resume settlement
+				// also makes a swapped branch that returns before the snapshot fail without hanging the test.
+				await Promise.race([snapshotStarted.promise, resumePromise])
+				expect(snapshot).toHaveBeenCalledExactlyOnceWith(task.taskId, { bumpSeq: true })
+				expect(events).toEqual(["snapshot started"])
+				expect(replay).not.toHaveBeenCalled()
+				expect(ask).not.toHaveBeenCalled()
+				expect(task.isInitialized).toBe(false)
+				expect(task.clineMessages).toEqual([expect.objectContaining({ text: "Child" })])
+				expect(task.apiConversationHistory).toEqual([
+					expect.objectContaining({
+						role: "assistant",
+						content: [{ type: "tool_use", id: "finish-action", name: "attempt_completion", input: {} }],
+					}),
+				])
+			} finally {
+				snapshotDeferred.resolve()
+				await resumePromise
+			}
 
-			expect(replay).toHaveBeenCalledWith(pendingAction)
+			expect(events).toEqual(["snapshot started", "snapshot resolved", "replay", "resume finished"])
+			expect(replay).toHaveBeenCalledExactlyOnceWith(pendingAction)
 			expect(ask).not.toHaveBeenCalled()
 			expect(task.clineMessages).not.toEqual(
 				expect.arrayContaining([expect.objectContaining({ text: pendingAction.approvalText })]),
