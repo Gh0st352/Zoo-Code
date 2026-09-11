@@ -3,6 +3,7 @@ import type { ClineMessage, ExtensionMessage } from "@roo-code/types"
 export type TranscriptRequest = {
 	kind: "append" | "update" | "snapshot"
 	taskId: string | undefined
+	taskInstanceId?: string
 	generation?: number
 	bumpSeq?: boolean
 }
@@ -11,6 +12,7 @@ export type TranscriptJob = {
 	id: number
 	generation: number
 	taskId: string | undefined
+	taskInstanceId: string | undefined
 	seq: number
 	kind: TranscriptRequest["kind"]
 	total: number
@@ -39,10 +41,16 @@ export type TranscriptTransportState = {
 }
 
 export type TranscriptAction =
-	| { type: "enqueue"; request: TranscriptRequest; total: number; focusedTaskId: string | undefined }
+	| {
+			type: "enqueue"
+			request: TranscriptRequest
+			total: number
+			focusedTaskId: string | undefined
+			focusedTaskInstanceId?: string
+	  }
 	| { type: "invalidate" }
 	| { type: "forget-task"; taskId: string }
-	| { type: "pump"; focusedTaskId: string | undefined }
+	| { type: "pump"; focusedTaskId: string | undefined; focusedTaskInstanceId?: string }
 	| { type: "settle"; success: boolean }
 
 export type TranscriptTransition = {
@@ -66,10 +74,12 @@ export function isTranscriptRequestCurrent(
 	state: TranscriptTransportState,
 	request: TranscriptRequest,
 	focusedTaskId: string | undefined,
+	focusedTaskInstanceId?: string,
 ): boolean {
 	return (
 		(request.generation ?? state.generation) === state.generation &&
 		request.taskId === focusedTaskId &&
+		request.taskInstanceId === focusedTaskInstanceId &&
 		(request.kind === "snapshot" || request.taskId !== undefined)
 	)
 }
@@ -86,8 +96,9 @@ export function reduceTranscriptTransport(
 	}
 	switch (action.type) {
 		case "enqueue": {
-			const { request, total, focusedTaskId } = action
-			if (!isTranscriptRequestCurrent(state, request, focusedTaskId)) return result
+			const { request, total, focusedTaskId, focusedTaskInstanceId } = action
+			if (request.kind !== "snapshot" && total === 0) return result
+			if (!isTranscriptRequestCurrent(state, request, focusedTaskId, focusedTaskInstanceId)) return result
 			const sequences = new Map(state.sequences)
 			const seq = request.taskId
 				? (sequences.get(request.taskId) ?? 0) + (request.kind !== "snapshot" || request.bumpSeq ? 1 : 0)
@@ -98,6 +109,7 @@ export function reduceTranscriptTransport(
 				id: state.nextJobId + 1,
 				generation: state.generation,
 				taskId: request.taskId,
+				taskInstanceId: request.taskInstanceId,
 				seq,
 				kind: request.kind,
 				total,
@@ -126,7 +138,11 @@ export function reduceTranscriptTransport(
 			while (active || queue.length) {
 				active ??= { job: queue.shift()!, position: 0 }
 				const { job, position } = active
-				if (job.generation !== state.generation || job.taskId !== action.focusedTaskId) {
+				if (
+					job.generation !== state.generation ||
+					job.taskId !== action.focusedTaskId ||
+					job.taskInstanceId !== action.focusedTaskInstanceId
+				) {
 					discard(job)
 					active = undefined
 					continue
@@ -168,7 +184,7 @@ export function reduceTranscriptTransport(
 
 export function transcriptFrameMessage(frame: TranscriptFrame, messages: readonly ClineMessage[]): ExtensionMessage {
 	const { job, phase } = frame
-	const common = { taskId: job.taskId, clineMessagesSeq: job.seq }
+	const common = { taskId: job.taskId, taskInstanceId: job.taskInstanceId, clineMessagesSeq: job.seq }
 	if (phase === "append" || phase === "update") {
 		return {
 			...common,
@@ -203,6 +219,7 @@ export class TranscriptTransport {
 		private readonly focusedTaskId: () => string | undefined,
 		private readonly postMessage: (message: ExtensionMessage) => Promise<void>,
 		private readonly onError: (error: unknown) => void,
+		private readonly focusedTaskInstanceId: () => string | undefined = () => undefined,
 	) {}
 
 	get generation(): number {
@@ -225,10 +242,15 @@ export class TranscriptTransport {
 	}
 
 	enqueue(request: TranscriptRequest, messages: readonly ClineMessage[]): Promise<void> {
+		// An empty delta must not consume a sequence or enter admission at all.
+		if (request.kind !== "snapshot" && messages.length === 0) return Promise.resolve()
 		// Guard before deep cloning (and allocating a sequence/ID). A delayed focus sync
 		// must not traverse a large, already-obsolete transcript.
 		const capturedRequest = { ...request, generation: request.generation ?? this.generation }
-		if (!isTranscriptRequestCurrent(this.state, capturedRequest, this.focusedTaskId())) return Promise.resolve()
+		if (
+			!isTranscriptRequestCurrent(this.state, capturedRequest, this.focusedTaskId(), this.focusedTaskInstanceId())
+		)
+			return Promise.resolve()
 		// Task mutates message objects AND nested fields while posts are queued. Capture
 		// the complete value now, together with its sequence, not at physical-send time.
 		const payload = structuredClone(messages)
@@ -237,6 +259,7 @@ export class TranscriptTransport {
 			request: capturedRequest,
 			total: payload.length,
 			focusedTaskId: this.focusedTaskId(),
+			focusedTaskInstanceId: this.focusedTaskInstanceId(),
 		})
 		if (!accepted) return Promise.resolve()
 		this.payloads.set(accepted.id, payload)
@@ -261,7 +284,11 @@ export class TranscriptTransport {
 	}
 
 	private drain(): void {
-		const { post } = this.apply({ type: "pump", focusedTaskId: this.focusedTaskId() })
+		const { post } = this.apply({
+			type: "pump",
+			focusedTaskId: this.focusedTaskId(),
+			focusedTaskInstanceId: this.focusedTaskInstanceId(),
+		})
 		if (post) void this.send(post)
 	}
 

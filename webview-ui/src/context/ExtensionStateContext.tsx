@@ -279,10 +279,12 @@ export const ExtensionStateContextProvider: React.FC<{
 	children: React.ReactNode
 	initialState?: ExtensionStateProviderInitialState
 }> = ({ children, initialState }) => {
-	const [state, setState] = useState<ExtensionState>(() =>
-		mergeExtensionState(createInitialExtensionState(), initialState ?? {}),
-	)
+	const [state, setState] = useState<ExtensionState>(() => {
+		const initial = mergeExtensionState(createInitialExtensionState(), initialState ?? {})
+		return initial.currentTaskId === null ? { ...initial, currentTaskInstanceId: null } : initial
+	})
 	const activeTaskIdRef = useRef<string | undefined>(state.currentTaskId ?? undefined)
+	const activeTaskInstanceIdRef = useRef<string | undefined>(state.currentTaskInstanceId ?? undefined)
 	const clineMessagesSeqRef = useRef(state.clineMessagesSeq ?? 0)
 	const clineMessagesRef = useRef<ClineMessage[]>(state.clineMessages)
 	const clineMessagesIndexRef = useRef<Map<number, number> | null>(null)
@@ -421,7 +423,10 @@ export const ExtensionStateContextProvider: React.FC<{
 		(message: ExtensionMessage, operation: "append" | "update") => {
 			const seq = message.clineMessagesSeq as number
 			const clineMessage = message.clineMessage
-			if (message.taskId !== activeTaskIdRef.current) {
+			if (
+				message.taskId !== activeTaskIdRef.current ||
+				message.taskInstanceId !== activeTaskInstanceIdRef.current
+			) {
 				return
 			}
 			if (!Number.isSafeInteger(seq) || seq < 0 || !clineMessage) {
@@ -484,31 +489,56 @@ export const ExtensionStateContextProvider: React.FC<{
 			}
 			const message: ExtensionMessage = event.data
 			switch (message.type) {
+				case "clineMessagesFocus":
 				case "state": {
 					const {
 						clineMessages: _ignoredMessages,
 						clineMessagesSeq: _ignoredMessagesSeq,
 						...newState
-					} = message.state ?? {}
+					} = message.type === "clineMessagesFocus"
+						? {
+								currentTaskId: message.taskId ?? null,
+								currentTaskInstanceId: message.taskInstanceId ?? null,
+							}
+						: (message.state ?? {})
 					const hasCurrentTaskId = Object.prototype.hasOwnProperty.call(newState, "currentTaskId")
 					const nextTaskId = hasCurrentTaskId
 						? (newState.currentTaskId ?? undefined)
 						: activeTaskIdRef.current
 					const taskChanged = hasCurrentTaskId && nextTaskId !== activeTaskIdRef.current
 					const taskCleared = hasCurrentTaskId && newState.currentTaskId === null
-					if (taskChanged || taskCleared) {
+					const nextTaskInstanceId = taskCleared
+						? undefined
+						: newState.currentTaskInstanceId !== undefined
+							? (newState.currentTaskInstanceId ?? undefined)
+							: taskChanged
+								? undefined
+								: activeTaskInstanceIdRef.current
+					const focusChanged = taskChanged || nextTaskInstanceId !== activeTaskInstanceIdRef.current
+					if (focusChanged || taskCleared) {
+						// Update both refs before React renders so queued frames cannot use the old scope.
 						activeTaskIdRef.current = nextTaskId
+						activeTaskInstanceIdRef.current = nextTaskInstanceId
 						clineMessagesSeqRef.current = 0
 						replaceClineMessages([])
 						clearClineMessagesSnapshot()
 						clearClineMessagesResync()
 					}
 					setState((prevState) => {
-						const merged = mergeExtensionState(prevState, newState)
+						const merged = mergeExtensionState(prevState, {
+							...newState,
+							currentTaskInstanceId:
+								newState.currentTaskInstanceId !== undefined
+									? newState.currentTaskInstanceId
+									: taskChanged
+										? undefined
+										: prevState.currentTaskInstanceId,
+						})
 						if (taskCleared) {
 							return {
 								...merged,
 								currentTaskId: null,
+								currentTaskInstanceId: null,
 								currentTaskItem: undefined,
 								currentTaskTodos: [],
 								messageQueue: [],
@@ -516,11 +546,14 @@ export const ExtensionStateContextProvider: React.FC<{
 								clineMessagesSeq: 0,
 							}
 						}
-						return taskChanged ? { ...merged, clineMessages: [], clineMessagesSeq: 0 } : merged
+						return focusChanged ? { ...merged, clineMessages: [], clineMessagesSeq: 0 } : merged
 					})
 					if (taskCleared) {
 						setCurrentCheckpoint(undefined)
 					}
+					// Early scope publication is not settings hydration. In particular, it must
+					// not reopen setup and unmount the chat while generic metadata is pending.
+					if (message.type === "clineMessagesFocus") break
 					setShowWelcome(!checkExistKey(newState.apiConfiguration, newState.zooCodeIsAuthenticated))
 					setDidHydrateState(true)
 					// Update alwaysAllowFollowupQuestions if present in state message
@@ -583,7 +616,10 @@ export const ExtensionStateContextProvider: React.FC<{
 					break
 				}
 				case "clineMessagesSnapshotStart": {
-					if (message.taskId !== activeTaskIdRef.current) {
+					if (
+						message.taskId !== activeTaskIdRef.current ||
+						message.taskInstanceId !== activeTaskInstanceIdRef.current
+					) {
 						break
 					}
 
@@ -623,7 +659,10 @@ export const ExtensionStateContextProvider: React.FC<{
 					break
 				}
 				case "clineMessagesSnapshotChunk": {
-					if (message.taskId !== activeTaskIdRef.current) {
+					if (
+						message.taskId !== activeTaskIdRef.current ||
+						message.taskInstanceId !== activeTaskInstanceIdRef.current
+					) {
 						break
 					}
 
@@ -666,7 +705,10 @@ export const ExtensionStateContextProvider: React.FC<{
 					break
 				}
 				case "clineMessagesSnapshotEnd": {
-					if (message.taskId !== activeTaskIdRef.current) {
+					if (
+						message.taskId !== activeTaskIdRef.current ||
+						message.taskInstanceId !== activeTaskInstanceIdRef.current
+					) {
 						break
 					}
 

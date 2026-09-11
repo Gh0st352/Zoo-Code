@@ -191,7 +191,13 @@ export async function activate(context: vscode.ExtensionContext) {
 			// Push the new vscode.env.isTelemetryEnabled value to the webview too, so its
 			// own PostHog client (gated separately in TelemetryClient.ts) can't keep
 			// sending events after the global toggle flips off mid-session.
-			void ClineProvider.getVisibleInstance()?.postStateToWebviewWithoutTaskHistory()
+			void ClineProvider.getVisibleInstance()
+				?.postStateToWebviewWithoutTaskHistory()
+				.catch((error: unknown) => {
+					outputChannel.appendLine(
+						`[TelemetryService] Failed to refresh state after telemetry toggle: ${error instanceof Error ? error.message : String(error)}`,
+					)
+				})
 		}),
 	)
 

@@ -1,3 +1,4 @@
+import type { ExtensionMessage } from "@roo-code/types"
 import {
 	createTranscriptTransportState,
 	reduceTranscriptTransport,
@@ -19,10 +20,29 @@ type Intent =
 	| "clear"
 	| "focus"
 	| "stale-snapshot"
-type Capture = { job: TranscriptJob; scope: string; values: number[]; failed: boolean }
+	| "replace-instance"
+	| "sync-instance"
+	| "stale-instance-append"
+	| "stale-instance-snapshot"
+	| "empty-append"
+	| "empty-update"
+	| "empty-snapshot"
+type Capture = {
+	job: TranscriptJob
+	taskInstanceId: string | undefined
+	scope: string
+	values: number[]
+	failed: boolean
+}
 type ModelState = {
 	transport: TranscriptTransportState
 	focus: TaskId | undefined
+	focusInstance: string | undefined
+	instanceSyncPending: boolean
+	staleInstanceRejected: boolean
+	discardedInstanceJobs: string[]
+	rejectedInstancePhases: string[]
+	appliedInstanceDeltas: string[]
 	producer: number
 	controller: number
 	failures: number
@@ -32,6 +52,7 @@ type ModelState = {
 	payloads: number[]
 	callers: number[]
 	physical?: TranscriptFrame
+	physicalMessage?: ExtensionMessage
 	allocated: Record<string, number>
 	sent: Record<string, number>
 	visible: number[]
@@ -45,7 +66,12 @@ type Scenario = { name: string; producer: Intent[]; controller: Intent[] }
 type Event = { name: string; actor?: "producer" | "controller"; intent?: Intent; action?: TranscriptAction }
 type Node = { state: ModelState; parent: number; event: string; depth: number }
 type Reducer = typeof reduceTranscriptTransport
-type Mutation = { name: string; expected: string; reduce: Reducer }
+type ReceiverScope = Pick<ModelState, "focus" | "focusInstance">
+type Faults = {
+	wire?: typeof transcriptFrameMessage
+	accepts?: (message: ExtensionMessage, scope: ReceiverScope) => boolean
+}
+type Mutation = Faults & { name: string; expected: string; reduce?: Reducer }
 
 export const TRANSPORT_MODEL_BOUNDS = { depth: 40, states: 30_000, chunkSize: 2, failures: 1 } as const
 export const TRANSPORT_SCENARIOS: Scenario[] = [
@@ -65,6 +91,21 @@ export const TRANSPORT_SCENARIOS: Scenario[] = [
 		producer: ["snapshot", "append", "update"],
 		controller: ["focus", "resync", "stale-snapshot"],
 	},
+	{
+		name: "same-task-instance-snapshot-before-sync",
+		producer: ["snapshot", "stale-instance-append"],
+		controller: ["replace-instance", "sync-instance", "append", "update"],
+	},
+	{
+		name: "same-task-instance-deltas-before-sync",
+		producer: ["append", "update", "stale-instance-snapshot"],
+		controller: ["replace-instance", "sync-instance"],
+	},
+	{
+		name: "empty-deltas-before-valid-work",
+		producer: ["empty-append", "empty-update", "append", "empty-snapshot"],
+		controller: [],
+	},
 ]
 export const TRANSPORT_ACTIONS = [
 	"snapshot",
@@ -76,6 +117,13 @@ export const TRANSPORT_ACTIONS = [
 	"clear",
 	"focus",
 	"stale-snapshot",
+	"replace-instance",
+	"sync-instance",
+	"stale-instance-append",
+	"stale-instance-snapshot",
+	"empty-append",
+	"empty-update",
+	"empty-snapshot",
 	"pump",
 	"start",
 	"chunk",
@@ -108,12 +156,37 @@ export const TRANSPORT_LANDMARKS = {
 		s.committed.some((id) => s.captures.some((c) => c.failed && c.job.id < id)),
 	"delta-applied-after-snapshot": (s: ModelState) =>
 		s.committed.length > 0 && s.appliedSeq > s.captures[s.committed.at(-1)! - 1].job.seq,
+	"same-task-instance-published-before-sync": (s: ModelState) =>
+		s.focus === "a" && s.focusInstance === "a:1" && s.instanceSyncPending && s.transport.generation === 0,
+	"instance-replacement-with-held-send": (s: ModelState) =>
+		s.focusInstance === "a:1" && s.physical?.job.taskInstanceId === "a:0",
+	"stale-instance-current-generation-rejected": (s: ModelState) => s.staleInstanceRejected,
+	"stale-instance-queued-job-discarded": (s: ModelState) => s.discardedInstanceJobs.includes("queued"),
+	"stale-instance-active-suffix-discarded": (s: ModelState) => s.discardedInstanceJobs.includes("active"),
+	"old-instance-end-ignored": (s: ModelState) => s.rejectedInstancePhases.includes("end"),
+	"old-instance-append-ignored": (s: ModelState) => s.rejectedInstancePhases.includes("append"),
+	"old-instance-update-ignored": (s: ModelState) => s.rejectedInstancePhases.includes("update"),
+	"new-instance-snapshot-committed": (s: ModelState) =>
+		s.committed.some((id) => s.captures[id - 1].job.taskInstanceId === "a:1"),
+	"new-instance-append-applied": (s: ModelState) => s.appliedInstanceDeltas.includes("append"),
+	"new-instance-update-applied": (s: ModelState) => s.appliedInstanceDeltas.includes("update"),
+	"new-instance-recovers-after-old-end-rejected": (s: ModelState) =>
+		s.rejectedInstancePhases.includes("end") &&
+		s.committed.some((id) => s.captures[id - 1].job.taskInstanceId === "a:1") &&
+		s.appliedInstanceDeltas.includes("append") &&
+		s.appliedInstanceDeltas.includes("update"),
 } satisfies Record<string, (s: ModelState) => boolean>
 
 function initialState(): ModelState {
 	return {
 		transport: createTranscriptTransportState(TRANSPORT_MODEL_BOUNDS.chunkSize),
 		focus: "a",
+		focusInstance: "a:0",
+		instanceSyncPending: false,
+		staleInstanceRejected: false,
+		discardedInstanceJobs: [],
+		rejectedInstancePhases: [],
+		appliedInstanceDeltas: [],
 		producer: 0,
 		controller: 0,
 		failures: 0,
@@ -136,10 +209,15 @@ function enabled(s: ModelState, scenario: Scenario): Event[] {
 	const events: Event[] = []
 	for (const actor of ["producer", "controller"] as const) {
 		const intent = scenario[actor][s[actor]]
+		// A delayed old producer resumes only after the replacement has been published.
+		if (intent?.startsWith("stale-instance-") && s.focusInstance !== "a:1") continue
 		if (intent) events.push({ name: `${actor}:${intent}`, actor, intent })
 	}
 	if (!s.transport.inFlight && (s.transport.active || s.transport.queue.length)) {
-		events.push({ name: "pump", action: { type: "pump", focusedTaskId: s.focus } })
+		events.push({
+			name: "pump",
+			action: { type: "pump", focusedTaskId: s.focus, focusedTaskInstanceId: s.focusInstance },
+		})
 	}
 	if (s.transport.inFlight) {
 		events.push({ name: "settle", action: { type: "settle", success: true } })
@@ -153,19 +231,28 @@ function requireInvariant(condition: unknown, message: string): asserts conditio
 	if (!condition) throw new Error(message)
 }
 
-/** Independent receiver oracle. It sees physical deliveries, not private generation tokens. */
-function deliver(s: ModelState, frame: TranscriptFrame): void {
+function acceptsFocusedMessage(message: ExtensionMessage, scope: ReceiverScope): boolean {
+	return message.taskId === scope.focus && message.taskInstanceId === scope.focusInstance
+}
+
+/** Independent receiver oracle. It sees captured wire identity, not private generation tokens. */
+function deliver(s: ModelState, frame: TranscriptFrame, message: ExtensionMessage, faults: Faults): void {
 	const { job, phase } = frame
-	if (job.taskId !== s.focus) return
+	const accepted = (faults.accepts ?? acceptsFocusedMessage)(message, s)
+	const current = message.taskId === s.focus && message.taskInstanceId === s.focusInstance
+	requireInvariant(!accepted || current, "receiver accepted a stale-instance frame")
+	if (!accepted) {
+		if (message.taskId === s.focus && message.taskInstanceId !== s.focusInstance) {
+			s.rejectedInstancePhases = [...new Set([...s.rejectedInstancePhases, phase])].sort()
+		}
+		return
+	}
 	const capture = s.captures[job.id - 1]
 	const oldVisible = [...s.visible]
 	const oldSeq = s.appliedSeq
-	const message = transcriptFrameMessage(
-		frame,
-		capture.values.map((value) => ({ ts: value, type: "say", text: String(value) })),
-	)
+	const seq = message.clineMessagesSeq ?? 0
 	if (phase === "start") {
-		if (job.seq >= s.appliedSeq) s.staging = { id: job.id, values: [] }
+		if (seq >= s.appliedSeq) s.staging = { id: job.id, values: [] }
 	} else if (phase === "chunk") {
 		if (s.staging?.id === job.id) {
 			requireInvariant(message.snapshotStartIndex === s.staging.values.length, "non-contiguous snapshot chunk")
@@ -177,16 +264,20 @@ function deliver(s: ModelState, frame: TranscriptFrame): void {
 			JSON.stringify(s.staging.values) === JSON.stringify(capture.values),
 			"snapshot commit before complete chunks",
 		)
-		if (job.seq >= s.appliedSeq) {
+		if (seq >= s.appliedSeq) {
 			s.visible = s.staging.values
-			s.appliedSeq = job.seq
+			s.appliedSeq = seq
 			s.committed.push(job.id)
 		}
 		s.staging = undefined
-	} else if (!s.staging && job.seq === s.appliedSeq + 1) {
-		if (phase === "append") s.visible.push(capture.values[0])
-		else if (s.visible.length) s.visible[0] = capture.values[0]
-		s.appliedSeq = job.seq
+	} else if (!s.staging && seq === s.appliedSeq + 1) {
+		requireInvariant(message.clineMessage, "delta lacks a wire payload")
+		if (phase === "append") s.visible.push(message.clineMessage.ts)
+		else if (s.visible.length) s.visible[0] = message.clineMessage.ts
+		s.appliedSeq = seq
+		if (message.taskInstanceId === "a:1") {
+			s.appliedInstanceDeltas = [...new Set([...s.appliedInstanceDeltas, phase])].sort()
+		}
 	}
 	if (phase === "start" || phase === "chunk") {
 		requireInvariant(
@@ -207,16 +298,16 @@ class ModelViolation extends Error {
 	}
 }
 
-function step(source: ModelState, event: Event, reducer: Reducer, coverage: Set<string>): ModelState {
+function step(source: ModelState, event: Event, reducer: Reducer, coverage: Set<string>, faults: Faults): ModelState {
 	const s = structuredClone(source)
 	try {
-		return executeStep(s, event, reducer, coverage)
+		return executeStep(s, event, reducer, coverage, faults)
 	} catch (error) {
 		throw new ModelViolation(error instanceof Error ? error.message : String(error), s)
 	}
 }
 
-function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Set<string>): ModelState {
+function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Set<string>, faults: Faults): ModelState {
 	const apply = (action: TranscriptAction, values: number[] = []) => {
 		const before = s.transport
 		const transition = reducer(before, action)
@@ -225,6 +316,21 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 			s.transport.generation === before.generation + (action.type === "invalidate" ? 1 : 0),
 			"generation is not monotonic",
 		)
+		if (action.type === "enqueue") {
+			const unchanged =
+				!transition.accepted &&
+				s.transport === before &&
+				!transition.post &&
+				transition.release.length === 0 &&
+				transition.settle.length === 0
+			if (action.request.kind !== "snapshot" && action.total === 0) {
+				requireInvariant(unchanged, "empty delta allocated work")
+			}
+			if (action.request.taskInstanceId !== action.focusedTaskInstanceId) {
+				requireInvariant(unchanged, "stale-instance request allocated work")
+				if (action.request.generation === before.generation) s.staleInstanceRejected = true
+			}
+		}
 		if (
 			action.type === "enqueue" &&
 			action.request.generation !== undefined &&
@@ -239,6 +345,10 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 		}
 		if (transition.accepted) {
 			const job = transition.accepted
+			requireInvariant(
+				action.type === "enqueue" && job.taskInstanceId === action.request.taskInstanceId,
+				"descriptor lost originating instance identity",
+			)
 			const scope = job.taskId ? `${job.taskId}:${s.epochs[job.taskId as TaskId]}` : "none"
 			const previousSeq = s.allocated[scope] ?? 0
 			const expectedSeq =
@@ -261,11 +371,26 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 				requireInvariant(!("snapshotId" in job), "delta carries snapshot metadata")
 			}
 			s.allocated[scope] = job.seq
-			s.captures.push({ job, scope, values: [...values], failed: false })
+			s.captures.push({
+				job,
+				taskInstanceId: action.request.taskInstanceId,
+				scope,
+				values: [...values],
+				failed: false,
+			})
 			s.payloads.push(job.id)
 			s.callers.push(job.id)
 		}
-		for (const id of transition.release) s.payloads = s.payloads.filter((value) => value !== id)
+		for (const id of transition.release) {
+			if (action.type === "pump") {
+				const job = s.captures[id - 1].job
+				if (job.taskId === s.focus && job.taskInstanceId !== s.focusInstance) {
+					const location = before.active?.job.id === id ? "active" : "queued"
+					s.discardedInstanceJobs = [...new Set([...s.discardedInstanceJobs, location])].sort()
+				}
+			}
+			s.payloads = s.payloads.filter((value) => value !== id)
+		}
 		for (const { id } of transition.settle) {
 			requireInvariant(s.callers.includes(id), "settlement lacks a registered caller")
 			s.callers = s.callers.filter((value) => value !== id)
@@ -288,15 +413,23 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 				action.success &&
 				physical.phase === "end" &&
 				physical.job.generation < s.transport.generation &&
-				physical.job.taskId === s.focus
+				physical.job.taskId === s.focus &&
+				physical.job.taskInstanceId === s.focusInstance
 			)
 				s.staleCommitCompletions++
-			if (action.success) deliver(s, physical)
-			else {
+			if (action.success) {
+				requireInvariant(s.physicalMessage, "physical send lost its captured wire message")
+				requireInvariant(
+					s.physicalMessage.taskInstanceId === s.captures[physical.job.id - 1].taskInstanceId,
+					"wire lost originating instance identity",
+				)
+				deliver(s, physical, s.physicalMessage, faults)
+			} else {
 				s.captures[physical.job.id - 1].failed = true
 				s.failures++
 			}
 			s.physical = undefined
+			s.physicalMessage = undefined
 		}
 		if (transition.post) {
 			const frame = transition.post
@@ -305,6 +438,19 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 			requireInvariant(
 				capture.job.generation === s.transport.generation && frame.job.taskId === s.focus,
 				"post or commit initiated after invalidation",
+			)
+			requireInvariant(capture.taskInstanceId === s.focusInstance, "post initiated for a stale instance")
+			requireInvariant(
+				frame.job.taskInstanceId === capture.taskInstanceId,
+				"frame lost originating instance identity",
+			)
+			const message = (faults.wire ?? transcriptFrameMessage)(
+				frame,
+				capture.values.map((value) => ({ ts: value, type: "say", text: String(value) })),
+			)
+			requireInvariant(
+				message.taskId === capture.job.taskId && message.taskInstanceId === capture.taskInstanceId,
+				"wire lost originating instance identity",
 			)
 			requireInvariant(!capture.failed, "failed snapshot continued posting")
 			if (frame.phase === "chunk") {
@@ -329,6 +475,7 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 			requireInvariant(s.payloads.includes(frame.job.id), "post without payload ownership")
 			s.sent[capture.scope] = frame.job.seq
 			s.physical = frame
+			s.physicalMessage = message
 			coverage.add(frame.phase)
 		}
 		if ((action.type === "pump" || action.type === "invalidate") && transition.release.length)
@@ -355,34 +502,56 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 		s[event.actor]++
 		coverage.add(event.intent)
 		const intent = event.intent
-		if (intent === "switch" || intent === "clear" || intent === "focus") {
+		if (intent === "switch" || intent === "clear" || intent === "focus" || intent === "replace-instance") {
 			const previous = s.focus
-			s.focus = intent === "clear" ? undefined : "b"
+			s.focus = intent === "replace-instance" ? "a" : intent === "clear" ? undefined : "b"
+			s.focusInstance = intent === "replace-instance" ? "a:1" : s.focus ? `${s.focus}:0` : undefined
+			if (intent === "replace-instance") {
+				// Publication is synchronous; later sync/invalidation may not have resumed yet.
+				s.instanceSyncPending = true
+				s.data.a = [5]
+			}
 			s.visible = []
 			s.appliedSeq = 0
 			s.staging = undefined
-			if (previous && intent !== "focus") {
+			if (previous && (intent === "switch" || intent === "clear")) {
 				apply({ type: "forget-task", taskId: previous })
 				s.epochs[previous]++
 			}
 		}
-		if (["switch", "clear", "invalidate", "resync"].includes(intent)) apply({ type: "invalidate" })
-		if (intent !== "invalidate" && intent !== "focus") {
-			const kind = intent === "append" || intent === "update" ? intent : "snapshot"
-			if (s.focus && kind === "append") s.data[s.focus].push(4)
-			if (s.focus && kind === "update") s.data[s.focus][0] = 9
-			const values = !s.focus ? [] : kind === "snapshot" ? s.data[s.focus] : kind === "append" ? [4] : [9]
+		if (["switch", "clear", "invalidate", "resync", "sync-instance"].includes(intent)) apply({ type: "invalidate" })
+		if (intent === "sync-instance") s.instanceSyncPending = false
+		if (intent !== "invalidate" && intent !== "focus" && intent !== "replace-instance") {
+			const staleInstance = intent.startsWith("stale-instance-")
+			const empty = intent.startsWith("empty-")
+			const kind = intent.endsWith("append") ? "append" : intent.endsWith("update") ? "update" : "snapshot"
+			if (s.focus && !staleInstance && !empty) {
+				if (kind === "append") s.data[s.focus].push(4)
+				if (kind === "update") s.data[s.focus][0] = 9
+			}
+			const values =
+				empty || !s.focus
+					? []
+					: staleInstance
+						? [8]
+						: kind === "snapshot"
+							? s.data[s.focus]
+							: kind === "append"
+								? [4]
+								: [9]
 			apply(
 				{
 					type: "enqueue",
 					request: {
 						kind,
 						taskId: s.focus,
+						taskInstanceId: staleInstance ? "a:0" : s.focusInstance,
 						bumpSeq: intent === "snapshot",
-						...(intent === "stale-snapshot" ? { generation: s.transport.generation - 1 } : {}),
+						generation: s.transport.generation - (intent === "stale-snapshot" ? 1 : 0),
 					},
 					total: values.length,
 					focusedTaskId: s.focus,
+					focusedTaskInstanceId: s.focusInstance,
 				},
 				values,
 			)
@@ -399,6 +568,7 @@ export function exploreTranscriptTransport(
 	scenario: Scenario,
 	reducer: Reducer = reduceTranscriptTransport,
 	bounds: { depth: number; states: number } = TRANSPORT_MODEL_BOUNDS,
+	faults: Faults = {},
 ) {
 	const nodes: Node[] = [{ state: initialState(), parent: -1, event: "initial", depth: 0 }]
 	const visited = new Set([canonical(nodes[0].state)])
@@ -419,7 +589,7 @@ export function exploreTranscriptTransport(
 		for (const event of enabled(node.state, scenario)) {
 			let next: ModelState
 			try {
-				next = step(node.state, event, reducer, actions)
+				next = step(node.state, event, reducer, actions, faults)
 			} catch (error) {
 				const witness = trace(index, event.name, error instanceof ModelViolation ? error.state : node.state)
 				return {
@@ -490,7 +660,11 @@ export const TRANSPORT_MUTATIONS: Mutation[] = [
 			reduceTranscriptTransport(
 				state,
 				action.type === "pump"
-					? { ...action, focusedTaskId: state.active?.job.taskId ?? state.queue[0]?.taskId }
+					? {
+							...action,
+							focusedTaskId: state.active?.job.taskId ?? state.queue[0]?.taskId,
+							focusedTaskInstanceId: state.active?.job.taskInstanceId ?? state.queue[0]?.taskInstanceId,
+						}
 					: action,
 			),
 	},
@@ -588,6 +762,78 @@ export const TRANSPORT_MUTATIONS: Mutation[] = [
 			return result
 		},
 	},
+	{
+		name: "admit-empty-delta",
+		expected: "empty delta allocated work",
+		reduce: (state, action) =>
+			reduceTranscriptTransport(
+				state,
+				action.type === "enqueue" && action.request.kind !== "snapshot" && action.total === 0
+					? { ...action, total: 1 }
+					: action,
+			),
+	},
+	{
+		name: "admit-stale-instance",
+		expected: "stale-instance request allocated work",
+		reduce: (state, action) =>
+			reduceTranscriptTransport(
+				state,
+				action.type === "enqueue"
+					? { ...action, focusedTaskInstanceId: action.request.taskInstanceId }
+					: action,
+			),
+	},
+	{
+		name: "ignore-instance-at-post",
+		expected: "post initiated for a stale instance",
+		reduce: (state, action) =>
+			reduceTranscriptTransport(
+				state,
+				action.type === "pump"
+					? { ...action, focusedTaskInstanceId: (state.active?.job ?? state.queue[0])?.taskInstanceId }
+					: action,
+			),
+	},
+	{
+		name: "drop-descriptor-instance",
+		expected: "descriptor lost originating instance identity",
+		reduce: (state, action) => {
+			const result = reduceTranscriptTransport(state, action)
+			if (result.accepted) {
+				const job = { ...result.accepted, taskInstanceId: undefined }
+				result.accepted = job
+				result.state = { ...result.state, queue: [...result.state.queue.slice(0, -1), job] }
+			}
+			return result
+		},
+	},
+	{
+		name: "drop-wire-instance",
+		expected: "wire lost originating instance identity",
+		wire: (frame, messages) => ({ ...transcriptFrameMessage(frame, messages), taskInstanceId: undefined }),
+	},
+	{
+		name: "receiver-ignores-instance",
+		expected: "receiver accepted a stale-instance frame",
+		accepts: (message, scope) => message.taskId === scope.focus,
+	},
+	{
+		name: "receiver-accepts-stale-end",
+		expected: "receiver accepted a stale-instance frame",
+		accepts: (message, scope) =>
+			message.taskId === scope.focus &&
+			(message.type === "clineMessagesSnapshotEnd" || message.taskInstanceId === scope.focusInstance),
+	},
+	{
+		name: "receiver-accepts-stale-delta",
+		expected: "receiver accepted a stale-instance frame",
+		accepts: (message, scope) =>
+			message.taskId === scope.focus &&
+			(message.type === "clineMessageAppended" ||
+				message.type === "clineMessageUpdated" ||
+				message.taskInstanceId === scope.focusInstance),
+	},
 ]
 
 export function checkTranscriptTransportModel() {
@@ -609,7 +855,7 @@ export function checkTranscriptTransportModel() {
 	const counterexamples = TRANSPORT_MUTATIONS.map((mutation) => {
 		const failures = TRANSPORT_SCENARIOS.map((scenario) => ({
 			scenario: scenario.name,
-			...exploreTranscriptTransport(scenario, mutation.reduce),
+			...exploreTranscriptTransport(scenario, mutation.reduce, TRANSPORT_MODEL_BOUNDS, mutation),
 		})).filter((result) => result.violation)
 		const result = failures.sort((a, b) => a.witness!.length - b.witness!.length)[0]
 		requireInvariant(result, `${mutation.name}: expected a counterexample`)

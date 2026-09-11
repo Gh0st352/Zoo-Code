@@ -37,6 +37,7 @@ export interface ExtensionMessage {
 		| "theme"
 		| "workspaceUpdated"
 		| "invoke"
+		| "clineMessagesFocus"
 		| "clineMessageAppended"
 		| "clineMessageUpdated"
 		| "clineMessagesSnapshotStart"
@@ -147,8 +148,18 @@ export interface ExtensionMessage {
 	 * Task scope for transcript deltas and every snapshot frame; it must match the
 	 * webview's focused task. Omitted for the no-task scope, whose snapshot is empty
 	 * with sequence 0. Unrelated message types may also use this as their task target.
+	 * On clineMessagesFocus, publishes the authoritative task/instance scope before
+	 * asynchronous preparation; omission clears focus. This message carries no
+	 * generic state, does not hydrate settings, and is ignored by legacy CLI clients.
 	 */
 	taskId?: string
+	/**
+	 * Originating task instance for every dedicated transcript delta and snapshot
+	 * frame. Both taskId and taskInstanceId must match the webview's focused scope;
+	 * a replacement instance must never retag frames from the previous instance.
+	 * Omitted for no-task frames and legacy consumers without instance metadata.
+	 */
+	taskInstanceId?: string
 	/**
 	 * Complete message value for clineMessageAppended or clineMessageUpdated; updates
 	 * replace the existing message identified by ts, not an array index or text patch.
@@ -175,9 +186,9 @@ export interface ExtensionMessage {
 	clineMessagesSeq?: number
 	/**
 	 * Nonempty correlation ID shared by one snapshot's start, contiguous chunks, and
-	 * end, together with taskId and clineMessagesSeq. The host uses the task ID (or
-	 * "none") plus a provider-wide monotonically increasing snapshot counter, even
-	 * when the revision is unchanged. Treat it as opaque, not a sequence/generation.
+	 * end, together with taskId, taskInstanceId, and clineMessagesSeq. The host uses
+	 * the task ID (or "none") plus a provider-wide monotonically increasing snapshot
+	 * counter, even when the revision is unchanged. Treat it as opaque, not a sequence/generation.
 	 * Only a complete matching start/chunks/end transaction is applied atomically;
 	 * an empty snapshot has start/end only, including in the no-task scope.
 	 */
@@ -396,6 +407,13 @@ export type ExtensionState = Pick<
 	 * change task focus; null authoritatively means no task is focused.
 	 */
 	currentTaskId?: string | null
+	/**
+	 * Focused task instance, published with currentTaskId before replacement work
+	 * begins. Undefined supports legacy/initial partial metadata; omitted instance
+	 * metadata preserves the same task's scope but is cleared on a task switch.
+	 * Null explicitly clears the instance, including an authoritative no-task state.
+	 */
+	currentTaskInstanceId?: string | null
 	currentTaskItem?: HistoryItem
 	currentTaskTodos?: TodoItem[] // Initial todos for the current task
 	apiConfiguration: ProviderSettings
