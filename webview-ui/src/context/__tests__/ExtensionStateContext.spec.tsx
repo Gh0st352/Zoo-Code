@@ -1,5 +1,5 @@
 import { providerIdentifiers } from "@roo-code/types"
-import { render, screen, act, appendClineMessage, hydrateExtensionState } from "@/utils/test-utils"
+import { render, renderHook, screen, act, appendClineMessage, hydrateExtensionState } from "@/utils/test-utils"
 import React from "react"
 
 import {
@@ -482,10 +482,275 @@ describe("ExtensionStateContext", () => {
 			postMessage.mockClear()
 			return postMessage
 		}
+		const updateClineMessage = (clineMessage: ClineMessage, clineMessagesSeq: number, taskId?: string) =>
+			dispatchExtensionMessage({ type: "clineMessageUpdated", taskId, clineMessagesSeq, clineMessage })
 
 		afterEach(() => {
 			vi.restoreAllMocks()
 			vi.useRealTimers()
+		})
+
+		it.each(["initial state", "appends", "snapshot"])(
+			"updates first, middle, and last timestamps after %s, including repeated updates",
+			(source) => {
+				const messages = Array.from({ length: 5 }, (_, index) => makeMessage(index, `message ${index}`))
+				Object.freeze(messages)
+				const postMessage = renderTranscriptWithPostMessageSpy(
+					source === "initial state" ? { clineMessages: messages, clineMessagesSeq: 5 } : {},
+				)
+				act(() => {
+					if (source === "appends") {
+						messages.forEach((message, index) => appendClineMessage(message, index + 1, "task-1"))
+					} else if (source === "snapshot") {
+						hydrateExtensionState({ clineMessages: messages, clineMessagesSeq: 5 }, { taskId: "task-1" })
+					}
+				})
+
+				let expectedMessages = messages
+				let seq = 5
+				for (const index of [0, 2, 4]) {
+					for (const text of ["updated", "updated again"]) {
+						const updated = makeMessage(index, text)
+						seq += 1
+						act(() => updateClineMessage(updated, seq, "task-1"))
+						expectedMessages = expectedMessages.map((message, position) =>
+							position === index ? updated : message,
+						)
+						expect(readTranscriptFields()).toEqual({
+							currentTaskId: "task-1",
+							clineMessages: expectedMessages,
+							clineMessagesSeq: seq,
+						})
+					}
+				}
+				expect(postMessage).not.toHaveBeenCalled()
+				expect(messages).toEqual(
+					Array.from({ length: 5 }, (_, index) => makeMessage(index, `message ${index}`)),
+				)
+			},
+		)
+
+		it("looks up updates without rereading transcript timestamps or rebuilding the index on render", () => {
+			const readTimestamp = vi.fn((ts: number) => ts)
+			const messages: ClineMessage[] = Array.from({ length: 1_000 }, (_, index) => ({
+				...makeMessage(index, `message ${index}`),
+				get ts() {
+					return readTimestamp(index)
+				},
+			}))
+			const { result } = renderHook(() => useExtensionState(), {
+				wrapper: ({ children }) => (
+					<ExtensionStateContextProvider
+						initialState={{ currentTaskId: "task-1", clineMessages: messages, clineMessagesSeq: 1 }}>
+						{children}
+					</ExtensionStateContextProvider>
+				),
+			})
+
+			for (const [offset, index] of [0, 500, 999].entries()) {
+				const previous = result.current.clineMessages
+				const updated = makeMessage(index, "updated")
+				readTimestamp.mockClear()
+				act(() => updateClineMessage(updated, offset + 2, "task-1"))
+
+				expect(readTimestamp).not.toHaveBeenCalled()
+				expect(result.current.clineMessages === previous).toBe(false)
+				expect(result.current.clineMessages[index]).toBe(updated)
+				expect(previous[index]).toBe(messages[index])
+				expect(result.current.clineMessages[1]).toBe(messages[1])
+				expect(result.current.clineMessagesSeq).toBe(offset + 2)
+			}
+		})
+
+		it("rebuilds moved timestamps and drops removed timestamps when a replacement snapshot commits", () => {
+			const original = [makeMessage(10, "first"), makeMessage(20, "removed"), makeMessage(30, "last")]
+			const replacement = [makeMessage(30, "moved first"), makeMessage(40, "new"), makeMessage(10, "moved last")]
+			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessages: original, clineMessagesSeq: 1 })
+
+			act(() => {
+				startSnapshot({ snapshotTotal: 3 })
+				appendSnapshotChunk({ clineMessages: replacement })
+			})
+			expect(readTranscriptFields()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: original,
+				clineMessagesSeq: 1,
+			})
+
+			const updatedFirst = makeMessage(30, "updated first")
+			const updatedMiddle = makeMessage(40, "updated middle")
+			const updatedLast = makeMessage(10, "updated last")
+			act(() => {
+				endSnapshot({ snapshotTotal: 3 })
+				updateClineMessage(updatedFirst, 3, "task-1")
+				updateClineMessage(updatedMiddle, 4, "task-1")
+				updateClineMessage(updatedLast, 5, "task-1")
+			})
+			expect(postMessage).not.toHaveBeenCalled()
+			const committed = {
+				currentTaskId: "task-1",
+				clineMessages: [updatedFirst, updatedMiddle, updatedLast],
+				clineMessagesSeq: 5,
+			}
+			expect(readTranscriptFields()).toEqual(committed)
+
+			act(() => updateClineMessage(makeMessage(20, "stale timestamp"), 6, "task-1"))
+			expect(readTranscriptFields()).toEqual(committed)
+			expect(postMessage.mock.calls).toEqual([
+				[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 6, receivedSeq: 6 }],
+			])
+		})
+
+		it("drops all timestamp entries when an empty snapshot replaces the transcript", () => {
+			const postMessage = renderTranscriptWithPostMessageSpy({
+				clineMessages: [makeMessage(10, "old")],
+				clineMessagesSeq: 1,
+			})
+			act(() => {
+				startSnapshot({ snapshotTotal: 0 })
+				endSnapshot({ snapshotTotal: 0 })
+				updateClineMessage(makeMessage(10, "stale timestamp"), 3, "task-1")
+			})
+
+			expect(readTranscriptFields()).toEqual({ currentTaskId: "task-1", clineMessages: [], clineMessagesSeq: 2 })
+			expect(postMessage.mock.calls).toEqual([
+				[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 3, receivedSeq: 3 }],
+			])
+		})
+
+		it.each([
+			{ name: "task switch", initialTaskId: "task-1", nextTaskId: "task-2" },
+			{ name: "task clear", initialTaskId: "task-1", nextTaskId: null },
+			{ name: "repeated no-task clear", initialTaskId: null, nextTaskId: null },
+		])(
+			"clears stale timestamp entries after $name and indexes subsequent appends",
+			({ initialTaskId, nextTaskId }) => {
+				const postMessage = renderTranscriptWithPostMessageSpy({
+					currentTaskId: initialTaskId,
+					clineMessages: [makeMessage(10, "first"), makeMessage(20, "middle"), makeMessage(30, "last")],
+					clineMessagesSeq: 3,
+				})
+				const taskId = nextTaskId ?? undefined
+				act(() => {
+					dispatchExtensionMessage({ type: "state", state: { currentTaskId: nextTaskId } })
+					updateClineMessage(makeMessage(20, "stale timestamp"), 1, taskId)
+				})
+
+				expect(readTranscriptFields()).toEqual({
+					currentTaskId: nextTaskId,
+					clineMessages: [],
+					clineMessagesSeq: 0,
+				})
+				expect(postMessage.mock.calls).toEqual([
+					[{ type: "requestClineMessagesResync", taskId, expectedSeq: 1, receivedSeq: 1 }],
+				])
+				postMessage.mockClear()
+
+				const updated = makeMessage(30, "updated at new position")
+				act(() => {
+					appendClineMessage(makeMessage(30, "reused timestamp"), 1, taskId)
+					updateClineMessage(updated, 2, taskId)
+				})
+				expect(readTranscriptFields()).toEqual({
+					currentTaskId: nextTaskId,
+					clineMessages: [updated],
+					clineMessagesSeq: 2,
+				})
+				expect(postMessage).not.toHaveBeenCalled()
+			},
+		)
+
+		it("preserves last-match timestamp semantics across initialization, appends, and snapshot replacement", () => {
+			const first = makeMessage(10, "earlier duplicate")
+			const last = makeMessage(10, "last duplicate")
+			const updated = makeMessage(10, "updated")
+			const postMessage = renderTranscriptWithPostMessageSpy({
+				clineMessages: [first, last],
+				clineMessagesSeq: 1,
+			})
+
+			act(() => updateClineMessage(updated, 2, "task-1"))
+			expect(readTranscript().clineMessages).toEqual([first, updated])
+
+			const updatedAppend = makeMessage(10, "updated append")
+			act(() => {
+				appendClineMessage(last, 3, "task-1")
+				updateClineMessage(updatedAppend, 4, "task-1")
+			})
+			expect(readTranscript().clineMessages).toEqual([first, updated, updatedAppend])
+
+			act(() => {
+				hydrateExtensionState({ clineMessages: [first, last], clineMessagesSeq: 5 }, { taskId: "task-1" })
+				updateClineMessage(updated, 6, "task-1")
+			})
+			expect(readTranscriptFields()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: [first, updated],
+				clineMessagesSeq: 6,
+			})
+			expect(postMessage).not.toHaveBeenCalled()
+		})
+
+		it.each<{ name: string; message: ExtensionMessage; requestsResync: boolean }>([
+			{
+				name: "partial generic state",
+				message: {
+					type: "state",
+					state: { clineMessages: [makeMessage(30, "ignored replacement")], clineMessagesSeq: 99 },
+				},
+				requestsResync: false,
+			},
+			{
+				name: "same-task generic state",
+				message: {
+					type: "state",
+					state: {
+						currentTaskId: "task-1",
+						clineMessages: [makeMessage(30, "ignored replacement")],
+						clineMessagesSeq: 99,
+					},
+				},
+				requestsResync: false,
+			},
+			{
+				name: "legacy message update",
+				message: { type: "messageUpdated", clineMessage: makeMessage(20, "ignored update") },
+				requestsResync: true,
+			},
+		])("preserves the timestamp index through $name", ({ message, requestsResync }) => {
+			const original = [makeMessage(10, "first"), makeMessage(20, "middle"), makeMessage(30, "last")]
+			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessages: original, clineMessagesSeq: 3 })
+
+			act(() => dispatchExtensionMessage(message))
+			expect(readTranscriptFields()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: original,
+				clineMessagesSeq: 3,
+			})
+			expect(postMessage.mock.calls).toEqual(
+				requestsResync
+					? [
+							[
+								{
+									type: "requestClineMessagesResync",
+									taskId: "task-1",
+									expectedSeq: 4,
+									receivedSeq: undefined,
+								},
+							],
+						]
+					: [],
+			)
+			postMessage.mockClear()
+
+			const updated = original.map((entry) => makeMessage(entry.ts, "updated"))
+			act(() => updated.forEach((entry, index) => updateClineMessage(entry, index + 4, "task-1")))
+			expect(readTranscriptFields()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: updated,
+				clineMessagesSeq: 6,
+			})
+			expect(postMessage).not.toHaveBeenCalled()
 		})
 
 		it("ignores a delta for a different task", () => {
@@ -656,24 +921,46 @@ describe("ExtensionStateContext", () => {
 			expect(vi.getTimerCount()).toBe(1)
 		})
 
-		it("abandons an incomplete snapshot and requests recovery after the snapshot timeout", () => {
+		it("abandons an incomplete replacement snapshot without changing the transcript or applied sequence", () => {
 			vi.useFakeTimers()
-			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
+			const existing = [makeMessage(1, "existing first"), makeMessage(2, "existing last")]
+			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessages: existing, clineMessagesSeq: 7 })
+			const unchanged = { currentTaskId: "task-1", clineMessages: existing, clineMessagesSeq: 7 }
 
 			act(() => {
-				startSnapshot()
-				appendSnapshotChunk()
-				vi.advanceTimersByTime(30_000)
+				startSnapshot({ clineMessagesSeq: 10, snapshotTotal: 3 })
+				appendSnapshotChunk({
+					clineMessagesSeq: 10,
+					clineMessages: [makeMessage(2, "partial replacement")],
+				})
 			})
+			expect(readTranscriptFields()).toEqual(unchanged)
 
-			expect(postMessage).toHaveBeenCalledTimes(1)
-			expect(postMessage).toHaveBeenCalledWith({
-				type: "requestClineMessagesResync",
-				taskId: "task-1",
-				expectedSeq: 2,
-				receivedSeq: 2,
-			})
+			act(() => vi.advanceTimersByTime(29_999))
+			expect(postMessage).not.toHaveBeenCalled()
+			expect(readTranscriptFields()).toEqual(unchanged)
+
+			act(() => vi.advanceTimersByTime(1))
+			expect(readTranscriptFields()).toEqual(unchanged)
+			expect(postMessage.mock.calls).toEqual([
+				[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 8, receivedSeq: 10 }],
+			])
 			expect(vi.getTimerCount()).toBe(1)
+
+			act(() => vi.advanceTimersByTime(30_000))
+			expect(readTranscriptFields()).toEqual(unchanged)
+			expect(postMessage).toHaveBeenCalledTimes(1)
+			expect(vi.getTimerCount()).toBe(0)
+
+			// The discarded snapshot must not change the index or sequence used by the next delta.
+			const updated = makeMessage(1, "updated after timeout")
+			act(() => updateClineMessage(updated, 8, "task-1"))
+			expect(readTranscriptFields()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: [updated, existing[1]],
+				clineMessagesSeq: 8,
+			})
+			expect(postMessage).toHaveBeenCalledTimes(1)
 		})
 
 		it("clears the snapshot timeout when a snapshot completes", () => {
