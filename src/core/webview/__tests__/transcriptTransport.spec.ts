@@ -1,5 +1,5 @@
 import type { ClineMessage, ExtensionMessage } from "@roo-code/types"
-import { createTranscriptTransportState, TranscriptTransport } from "../transcriptTransport"
+import { createTranscriptTransportState, reduceTranscriptTransport, TranscriptTransport } from "../transcriptTransport"
 import {
 	checkTranscriptTransportModel,
 	exploreTranscriptTransport,
@@ -42,8 +42,56 @@ describe("transcript transport bounded model", () => {
 	})
 })
 
+describe("transcript transport reducer", () => {
+	test.each([true, false])("ignores settlement without a physical send (success=%s)", (success) => {
+		const state = createTranscriptTransportState()
+		const transition = reduceTranscriptTransport(state, { type: "settle", success })
+		expect(transition).toEqual({ state, release: [], settle: [] })
+		expect(transition.state).toBe(state)
+	})
+})
+
 describe("transcript transport driver", () => {
 	const message: ClineMessage = { ts: 1, type: "say", text: "initial", images: ["image"] }
+
+	test.each(["append", "update", "snapshot"] as const)(
+		"rejects an unfocused %s before reading the payload or allocating work",
+		async (kind) => {
+			const readText = vi.fn(() => "obsolete")
+			const unread: ClineMessage = {
+				ts: 1,
+				type: "say",
+				get text() {
+					return readText()
+				},
+			}
+			const post = vi.fn<(frame: ExtensionMessage) => Promise<void>>().mockResolvedValue(undefined)
+			const transport = new TranscriptTransport(() => "a", post, vi.fn())
+			const state = transport["state"]
+
+			await transport.enqueue({ kind, taskId: "b" }, [unread])
+
+			expect(readText).not.toHaveBeenCalled()
+			expect(post).not.toHaveBeenCalled()
+			expect(transport["state"]).toBe(state)
+			expect(transport.getSequence("b")).toBe(0)
+			expect(transport["payloads"].size).toBe(0)
+			expect(transport["callers"].size).toBe(0)
+		},
+	)
+
+	test.each(["append", "update"] as const)("rejects a %s without a task scope", async (kind) => {
+		const post = vi.fn<(frame: ExtensionMessage) => Promise<void>>().mockResolvedValue(undefined)
+		const transport = new TranscriptTransport(() => undefined, post, vi.fn())
+		const state = transport["state"]
+
+		await transport.enqueue({ kind, taskId: undefined }, [message])
+
+		expect(post).not.toHaveBeenCalled()
+		expect(transport["state"]).toBe(state)
+		expect(transport["payloads"].size).toBe(0)
+		expect(transport["callers"].size).toBe(0)
+	})
 
 	test.each(["start", "chunk", "end", "delta"] as const)(
 		"keeps the physical barrier across rejected held %s and recovers",
@@ -124,6 +172,25 @@ describe("transcript transport driver", () => {
 	test("rejects invalid chunk-size bounds", () => {
 		for (const size of [0, -1, 1.5, Infinity])
 			expect(() => createTranscriptTransportState(size)).toThrow("positive safe integer")
+	})
+
+	test("delivers one message per chunk at the minimum valid chunk size", async () => {
+		const post = vi.fn<(frame: ExtensionMessage) => Promise<void>>().mockResolvedValue(undefined)
+		const transport = new TranscriptTransport(() => "a", post, vi.fn())
+		transport["state"] = createTranscriptTransportState(1)
+		const second = { ...message, ts: 2, text: "second" }
+
+		await transport.enqueue({ kind: "snapshot", taskId: "a" }, [message, second])
+
+		const common = { taskId: "a", clineMessagesSeq: 0, snapshotId: "a:1" }
+		expect(post.mock.calls.map(([frame]) => frame)).toEqual([
+			{ ...common, type: "clineMessagesSnapshotStart", snapshotTotal: 2 },
+			{ ...common, type: "clineMessagesSnapshotChunk", snapshotStartIndex: 0, clineMessages: [message] },
+			{ ...common, type: "clineMessagesSnapshotChunk", snapshotStartIndex: 1, clineMessages: [second] },
+			{ ...common, type: "clineMessagesSnapshotEnd", snapshotTotal: 2 },
+		])
+		expect(transport["payloads"].size).toBe(0)
+		expect(transport["callers"].size).toBe(0)
 	})
 
 	test("does not adopt a newer generation if cloning reenters invalidation", async () => {

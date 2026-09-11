@@ -1006,25 +1006,32 @@ describe("ClineProvider", () => {
 			])
 		})
 
-		test("ignores transcript work for a task that is not focused", async () => {
-			const task = { taskId: "task-1", clineMessages: [] as ClineMessage[] }
-			setCurrentTask(task)
-			const message = { ts: 1, type: "say", say: "text", text: "ignored" } as ClineMessage
-			const postSpy = vi.spyOn(provider, "postMessageToWebview")
-			const previousGeneration = provider["clineMessagesTransport"].generation
-			const previousSnapshotId = provider["clineMessagesTransport"]["state"].nextSnapshotId
+		test.each(["0", "1"])("ignores unfocused transcript work with CLI runtime %s", async (cliRuntime) => {
+			vi.stubEnv("ROO_CLI_RUNTIME", cliRuntime)
+			try {
+				const task = { taskId: "task-1", clineMessages: [] as ClineMessage[] }
+				setCurrentTask(task)
+				const message = { ts: 1, type: "say", say: "text", text: "ignored" } as ClineMessage
+				const postSpy = vi.spyOn(provider, "postMessageToWebview")
+				const stateSpy = vi.spyOn(provider, "postStateToWebviewWithoutTaskHistory").mockResolvedValue(undefined)
+				const previousGeneration = provider["clineMessagesTransport"].generation
+				const previousSnapshotId = provider["clineMessagesTransport"]["state"].nextSnapshotId
 
-			await Promise.all([
-				provider.postClineMessageAppended("task-2", message),
-				provider.postClineMessageUpdated("task-2", message),
-				provider.postClineMessagesSnapshot("task-2"),
-				provider.resyncClineMessagesToWebview("task-2"),
-			])
+				await Promise.all([
+					provider.postClineMessageAppended("task-2", message),
+					provider.postClineMessageUpdated("task-2", message),
+					provider.postClineMessagesSnapshot("task-2"),
+					provider.resyncClineMessagesToWebview("task-2"),
+				])
 
-			expect(postSpy).not.toHaveBeenCalled()
-			expect(provider["clineMessagesTransport"]["state"].sequences.has("task-2")).toBe(false)
-			expect(provider["clineMessagesTransport"].generation).toBe(previousGeneration)
-			expect(provider["clineMessagesTransport"]["state"].nextSnapshotId).toBe(previousSnapshotId)
+				expect(postSpy).not.toHaveBeenCalled()
+				expect(stateSpy).not.toHaveBeenCalled()
+				expect(provider["clineMessagesTransport"]["state"].sequences.has("task-2")).toBe(false)
+				expect(provider["clineMessagesTransport"].generation).toBe(previousGeneration)
+				expect(provider["clineMessagesTransport"]["state"].nextSnapshotId).toBe(previousSnapshotId)
+			} finally {
+				vi.unstubAllEnvs()
+			}
 		})
 
 		test("safely rejects transcript work when no task is focused", async () => {
