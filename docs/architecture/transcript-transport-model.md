@@ -35,9 +35,10 @@ The model exposes a scheduling point between settlement and the next pump, and b
 
 1. Generation increases exactly once per invalidation and never otherwise. Stale-generation admission allocates no job or snapshot ID.
 2. No physical send overlaps another, including an old generation's held send. No old-generation or old-focus post/commit is **initiated** after ownership changes.
-3. Invalidation retains no obsolete queue or payload. Discarded waiting callers settle immediately. Remaining payloads correspond exactly to active/queued jobs; remaining callers correspond exactly to those jobs plus an already-initiated physical send.
+3. Invalidation retains no obsolete queue or payload. Discarded waiting callers settle immediately. Each settlement must consume a registered caller exactly once. Remaining payloads correspond exactly to active/queued jobs; remaining callers correspond exactly to those jobs plus an already-initiated physical send.
 4. Allocated sequences follow enqueue/capture order: deltas and bumping snapshots increment; resync retains the current value. Sent sequence is nondecreasing and never exceeds allocation. Failed snapshots never resume their suffix.
 5. The independent receiver oracle stages contiguous, exact snapshot payloads and exposes them only at a matching complete end marker. Start/chunks cannot change visible transcript or applied sequence. Applied sequence cannot decrease within one focused-task scope.
+6. Job totals equal captured payload lengths. Only snapshots carry snapshot identities, unique across captures. Non-chunk frame ranges are zero; chunk descriptors have contiguous starts and positive, exact lengths bounded by the captured payload and chunk size. These checks precede wire conversion, whose array slicing can otherwise hide an overlarge final count.
 
 Sequence monotonicity is **not global across task IDs or removed/recreated task lifetimes**. The production provider prunes a task's sequence on stack removal/history deletion; the model exercises the shared pruning action on switch/clear and tags its allocation/sent oracle with a task-lifetime epoch. A no-task snapshot has sequence zero. Receiver applied sequence resets on focus change/clear, as distinct from resync of the same task. The checker does not invent a persisted generation token or silently demand globally increasing sequences after clear.
 
@@ -60,7 +61,7 @@ All 16 action classes are required: snapshot, append, update, resync, invalidate
 
 ## Invariant sensitivity
 
-Eight test-only reducer wrappers must produce their expected violation class through the same exhaustive explorer. No mutation switch exists in production.
+Twelve test-only reducer wrappers must produce their expected violation class through the same exhaustive explorer. No mutation switch exists in production.
 
 | Mutant                              | Shortest witness, excluding initial state | Detected violation                |
 | ----------------------------------- | ----------------------------------------- | --------------------------------- |
@@ -72,8 +73,14 @@ Eight test-only reducer wrappers must produce their expected violation class thr
 | commit-before-chunks                | snapshot, pump, settle, pump, settle      | incomplete atomic snapshot        |
 | reuse-delta-sequence                | snapshot, append                          | incorrect allocated sequence      |
 | continue-after-rejection            | snapshot, pump, fail, pump                | failed snapshot resumes posting   |
+| delta-snapshot-metadata             | snapshot, append                          | delta carries snapshot metadata   |
+| non-chunk-payload-range             | snapshot, pump                            | non-chunk payload range           |
+| overrun-final-chunk                 | switch, pump, settle, pump                | chunk exceeds captured range      |
+| settle-caller-twice                 | snapshot, resync                          | settlement without owned caller   |
 
 [transcriptTransport.spec.ts](../../src/core/webview/__tests__/transcriptTransport.spec.ts) runs the full checker, verifies deterministic shortest witnesses and both fail-closed budget paths, and exercises the actual driver with held/rejected start, chunk, end, and delta sends, plus synchronous rejection/recovery. The [CLI entry point](../../scripts/check-transcript-transport.ts) prints counts, action/landmark names, bounds, and mutant traces.
+
+Focused reducer tests also check canonical descriptors for empty, exact-boundary, and partial-final chunks independently of wire output. Adversarial queued/active states retain obsolete-generation work with unchanged focus to verify the defense-in-depth pre-send guard discards it and permits current work. Such states are deliberately **not claimed reachable** through normal invalidation, which releases that work; no artificial action is added to the reachable-state explorer. A driver regression retains one held caller through two invalidations and checks both successful and failed settlement followed by recovery.
 
 ## Limitations: initiation is not delivery revocation
 

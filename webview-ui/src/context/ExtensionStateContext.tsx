@@ -344,15 +344,6 @@ export const ExtensionStateContextProvider: React.FC<{
 		}))
 	}, [])
 
-	const replaceClineMessages = useCallback(
-		(messages: ClineMessage[]) => {
-			clineMessagesRef.current = messages
-			clineMessagesIndex.clear()
-			messages.forEach((message, index) => clineMessagesIndex.set(message.ts, index))
-		},
-		[clineMessagesIndex],
-	)
-
 	const clearClineMessagesResync = useCallback(
 		() => {
 			resyncPendingRef.current = false
@@ -486,6 +477,11 @@ export const ExtensionStateContextProvider: React.FC<{
 
 	const handleMessage = useCallback(
 		(event: MessageEvent) => {
+			const replaceClineMessages = (messages: ClineMessage[]) => {
+				clineMessagesRef.current = messages
+				clineMessagesIndex.clear()
+				messages.forEach((message, index) => clineMessagesIndex.set(message.ts, index))
+			}
 			const message: ExtensionMessage = event.data
 			switch (message.type) {
 				case "state": {
@@ -803,12 +799,12 @@ export const ExtensionStateContextProvider: React.FC<{
 				}
 			}
 		},
-		// Stryker disable next-line ArrayDeclaration: every listed dependency is a stable callback; removing the list does not change this listener closure.
+		// Stryker disable next-line ArrayDeclaration: the index and callbacks are stable; removing the list does not change this listener closure.
 		[
 			applyClineMessagesDelta,
 			clearClineMessagesSnapshot,
 			clearClineMessagesResync,
-			replaceClineMessages,
+			clineMessagesIndex,
 			requestClineMessagesResync,
 			retryClineMessagesResync,
 			setListApiConfigMeta,

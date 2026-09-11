@@ -14,12 +14,14 @@ export type TranscriptJob = {
 	seq: number
 	kind: TranscriptRequest["kind"]
 	total: number
+	/** Snapshot identity is absent on delta descriptors. */
 	snapshotId?: string
 }
 
 export type TranscriptFrame = {
 	job: TranscriptJob
 	phase: "append" | "update" | "start" | "chunk" | "end"
+	/** Exact captured-payload range for chunks; both values are zero for other phases. */
 	start: number
 	count: number
 }
@@ -207,8 +209,10 @@ export class TranscriptTransport {
 		return this.state.generation
 	}
 
-	getSequence(taskId: string): number {
-		return this.state.sequences.get(taskId) ?? 0
+	getSequence(taskId: string | undefined): number {
+		// Allow absent scopes in the read-only view; writers still require string task IDs.
+		const sequences: ReadonlyMap<string | undefined, number> = this.state.sequences
+		return sequences.get(taskId) ?? 0
 	}
 
 	forgetTask(taskId: string): void {
@@ -246,10 +250,12 @@ export class TranscriptTransport {
 		this.state = transition.state
 		for (const id of transition.release) this.payloads.delete(id)
 		for (const { id, failed } of transition.settle) {
-			const caller = this.callers.get(id)
+			// Admission registers before drain. The reducer settles each caller exactly once,
+			// retaining a physical-send caller across invalidations until its send settles.
+			const caller = this.callers.get(id)!
 			this.callers.delete(id)
-			if (failed) caller?.reject(error)
-			else caller?.resolve()
+			if (failed) caller.reject(error)
+			else caller.resolve()
 		}
 		return transition
 	}
