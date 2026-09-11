@@ -303,6 +303,232 @@ describe("Task persistence", () => {
 		mockProvider.log = vi.fn()
 	})
 
+	describe("real Task/provider transcript adapters", () => {
+		const historyItem = {
+			id: "same-task",
+			number: 1,
+			ts: 1,
+			task: "Same task, distinct instances",
+			tokensIn: 0,
+			tokensOut: 0,
+			totalCost: 0,
+		}
+		const message = (text: string): ClineMessage => ({ ts: 1, type: "say", say: "text", text })
+		const createTask = () =>
+			new Task({ provider: mockProvider, apiConfiguration: mockApiConfig, historyItem, startTask: false })
+
+		beforeEach(() => {
+			// Keep the real constructor, registry, producer methods and transport. Only
+			// editor I/O, persistence and generic metadata services are test doubles.
+			mockProvider.postClineMessageAppended = ClineProvider.prototype.postClineMessageAppended
+			mockProvider.postClineMessageUpdated = ClineProvider.prototype.postClineMessageUpdated
+			mockProvider.postClineMessagesSnapshot = ClineProvider.prototype.postClineMessagesSnapshot
+		})
+
+		it("publishes new focus before preparation and clears it before removal cleanup", async () => {
+			const task = createTask()
+			const post = vi.mocked(mockProvider.postMessageToWebview)
+			const preparing = createDeferred<void>()
+			const preparation = createDeferred<void>()
+			const generation = mockProvider["clineMessagesTransport"].generation
+			vi.spyOn(mockProvider, "performPreparationTasks").mockImplementationOnce(async () => {
+				preparing.resolve()
+				await preparation.promise
+			})
+			const adding = mockProvider.addClineToStack(task)
+			try {
+				// The post invocation and invalidation precede even the first async continuation.
+				expect(post).toHaveBeenCalledWith({
+					type: "clineMessagesFocus",
+					taskId: task.taskId,
+					taskInstanceId: task.instanceId,
+				})
+				expect(mockProvider["clineMessagesTransport"].generation).toBe(generation + 1)
+				await preparing.promise
+			} finally {
+				preparation.resolve()
+				await adding
+			}
+			const abortStarted = createDeferred<void>()
+			const abort = createDeferred<void>()
+			vi.spyOn(task, "abortTask").mockImplementation(async () => {
+				abortStarted.resolve()
+				await abort.promise
+			})
+			const removing = mockProvider.removeClineFromStack()
+			try {
+				expect(mockProvider.getCurrentTask()).toBeUndefined()
+				expect(post).toHaveBeenLastCalledWith({
+					type: "clineMessagesFocus",
+					taskId: undefined,
+					taskInstanceId: undefined,
+				})
+				await abortStarted.promise
+				expect(mockProvider["clineMessagesTransport"]["state"].sequences.has(task.taskId)).toBe(false)
+			} finally {
+				abort.resolve()
+				await removing
+			}
+		})
+
+		it.each([
+			"clineMessagesSnapshotStart",
+			"clineMessagesSnapshotChunk",
+			"clineMessagesSnapshotEnd",
+			"clineMessageAppended",
+			"clineMessageUpdated",
+		] as const)("publishes replacement before cleanup/preparation while old %s is held", async (heldType) => {
+			const oldTask = createTask()
+			oldTask.clineMessages = [message("old")]
+			await mockProvider.addClineToStack(oldTask)
+			oldTask["saveClineMessages"] = vi.fn().mockResolvedValue(true)
+			const held = createDeferred<void>()
+			const started = createDeferred<void>()
+			const abort = createDeferred<void>()
+			const preparing = createDeferred<void>()
+			const preparation = createDeferred<void>()
+			let activeSends = 0
+			let maximumSends = 0
+			const post = vi.mocked(mockProvider.postMessageToWebview).mockImplementation(async (frame) => {
+				// Task initialization also posts unrelated metadata/actions outside this FIFO.
+				if (frame.taskInstanceId === undefined || frame.type === "clineMessagesFocus") return
+				activeSends++
+				maximumSends = Math.max(maximumSends, activeSends)
+				if (frame.type === heldType && frame.taskInstanceId === oldTask.instanceId) {
+					started.resolve()
+					await held.promise
+				}
+				activeSends--
+			})
+			post.mockClear()
+			const active =
+				heldType === "clineMessageAppended"
+					? oldTask["addToClineMessages"](message("held append"))
+					: heldType === "clineMessageUpdated"
+						? oldTask["updateClineMessage"](message("held update"))
+						: oldTask.overwriteClineMessages([message("held snapshot")], false)
+			await started.promise
+			const queued = oldTask["updateClineMessage"](message("queued old update"))
+			const transport = mockProvider["clineMessagesTransport"]
+			const oldGeneration = transport.generation
+			const abortSpy = vi.spyOn(oldTask, "abortTask").mockImplementation(async () => {
+				const replacement = mockProvider.getCurrentTask()!
+				expect(replacement).not.toBe(oldTask)
+				expect(replacement.taskId).toBe(oldTask.taskId)
+				expect(replacement.instanceId).not.toBe(oldTask.instanceId)
+				expect(transport.generation).toBe(oldGeneration + 1)
+				expect(post).toHaveBeenLastCalledWith({
+					type: "clineMessagesFocus",
+					taskId: oldTask.taskId,
+					taskInstanceId: replacement.instanceId,
+				})
+				await abort.promise
+			})
+			vi.spyOn(mockProvider, "performPreparationTasks").mockImplementation(async () => {
+				preparing.resolve()
+				await preparation.promise
+			})
+			const replacing = mockProvider.createTaskWithHistoryItem(historyItem, { startTask: false })
+			try {
+				await vi.waitFor(() => expect(abortSpy).toHaveBeenCalledOnce())
+				await queued // Invalidated callers settle even though the physical post remains held.
+				expect(transport["payloads"].size).toBe(0)
+				expect(activeSends).toBe(1)
+				abort.resolve()
+				await preparing.promise
+				const beforeRelease = post.mock.calls.length
+				held.resolve()
+				await active
+				expect(post.mock.calls).toHaveLength(beforeRelease) // No old suffix after replacement.
+				preparation.resolve()
+				const replacement = await replacing
+				const newFrames = post.mock.calls
+					.slice(beforeRelease)
+					.map(([frame]) => frame)
+					.filter((frame) => frame.type !== "clineMessagesFocus")
+				expect(newFrames.filter((frame) => frame.type !== "state").map((frame) => frame.type)).toEqual([
+					"clineMessagesSnapshotStart",
+					"clineMessagesSnapshotEnd",
+				])
+				expect(
+					newFrames
+						.filter((frame) => frame.type !== "state")
+						.every((frame) => frame.taskInstanceId === replacement.instanceId),
+				).toBe(true)
+				const heldFrame = post.mock.calls.find(([frame]) => frame.type === heldType)![0]
+				expect(heldFrame.taskInstanceId).toBe(oldTask.instanceId)
+				expect(maximumSends).toBe(1)
+				expect(transport["callers"].size).toBe(0)
+			} finally {
+				held.resolve()
+				abort.resolve()
+				preparation.resolve()
+				await Promise.all([active, queued, replacing])
+			}
+		})
+
+		it("rejects delayed old producers with the current generation and recovers through new Task producers", async () => {
+			vi.useFakeTimers()
+			const oldTask = createTask()
+			const replacement = createTask()
+			const saved = createDeferred<boolean>()
+			try {
+				await mockProvider.addClineToStack(oldTask)
+				oldTask["saveClineMessages"] = vi.fn().mockReturnValueOnce(saved.promise).mockResolvedValue(true)
+				replacement["saveClineMessages"] = vi.fn().mockResolvedValue(true)
+				await oldTask["updateClineMessage"]({ ...message("leading"), partial: true })
+				await oldTask["updateClineMessage"]({ ...message("delayed trailing"), partial: true })
+				const overwrite = oldTask.overwriteClineMessages([message("delayed persisted snapshot")])
+				// Requeue a trailing callback after overwrite's deliberate cancellation.
+				await oldTask["updateClineMessage"]({ ...message("leading again"), partial: true })
+				await oldTask["updateClineMessage"]({ ...message("delayed trailing"), partial: true })
+				await mockProvider.addClineToStack(replacement)
+				const post = vi.mocked(mockProvider.postMessageToWebview)
+				post.mockClear()
+				const transport = mockProvider["clineMessagesTransport"]
+				const before = transport["state"]
+				saved.resolve(true)
+				await overwrite
+				await vi.advanceTimersByTimeAsync(500)
+				await oldTask["addToClineMessages"](message("late append"))
+				await oldTask["updateClineMessage"](message("late final update"))
+				await mockProvider.postClineMessagesSnapshot(oldTask.taskId, {
+					generation: transport.generation,
+					taskInstanceId: oldTask.instanceId,
+					bumpSeq: true,
+				})
+				expect(post).not.toHaveBeenCalled()
+				expect(transport["state"]).toBe(before)
+
+				await replacement.overwriteClineMessages([message("recovered")], false)
+				await replacement["addToClineMessages"]({ ...message("new append"), ts: 2 })
+				await replacement["updateClineMessage"]({ ...message("new update"), ts: 2 })
+				const frames = post.mock.calls.map(([frame]) => frame)
+				expect(frames.map((frame) => frame.type)).toEqual([
+					"clineMessagesSnapshotStart",
+					"clineMessagesSnapshotChunk",
+					"clineMessagesSnapshotEnd",
+					"clineMessageAppended",
+					"clineMessageUpdated",
+				])
+				expect(frames.every((frame) => frame.taskInstanceId === replacement.instanceId)).toBe(true)
+				const seq = before.sequences.get(replacement.taskId) ?? 0
+				expect(frames.map((frame) => frame.clineMessagesSeq)).toEqual([
+					seq + 1,
+					seq + 1,
+					seq + 1,
+					seq + 2,
+					seq + 3,
+				])
+			} finally {
+				saved.resolve(true)
+				oldTask["debouncedPostPartialMessageUpdate"].cancel()
+				replacement["debouncedPostPartialMessageUpdate"].cancel()
+				vi.useRealTimers()
+			}
+		})
+	})
+
 	// ── saveApiConversationHistory (via retrySaveApiConversationHistory) ──
 
 	describe("saveApiConversationHistory", () => {
@@ -1397,7 +1623,10 @@ describe("Task persistence", () => {
 				// An explicit entry signal avoids polling or guessed microtask counts. Racing resume settlement
 				// also makes a swapped branch that returns before the snapshot fail without hanging the test.
 				await Promise.race([snapshotStarted.promise, resumePromise])
-				expect(snapshot).toHaveBeenCalledExactlyOnceWith(task.taskId, { bumpSeq: true })
+				expect(snapshot).toHaveBeenCalledExactlyOnceWith(task.taskId, {
+					bumpSeq: true,
+					taskInstanceId: task.instanceId,
+				})
 				expect(events).toEqual(["snapshot started"])
 				expect(replay).not.toHaveBeenCalled()
 				expect(ask).not.toHaveBeenCalled()
@@ -1801,7 +2030,12 @@ describe("Task persistence", () => {
 				expect(ask).not.toHaveBeenCalled()
 				apiRead.resolve(apiMessages)
 
-				await vi.waitFor(() => expect(snapshot).toHaveBeenCalledWith(task.taskId, { bumpSeq: true }))
+				await vi.waitFor(() =>
+					expect(snapshot).toHaveBeenCalledWith(task.taskId, {
+						bumpSeq: true,
+						taskInstanceId: task.instanceId,
+					}),
+				)
 				expect(ask).not.toHaveBeenCalled()
 				expect(mockSaveTaskMessages).not.toHaveBeenCalled()
 				expect(mockSaveApiMessages).not.toHaveBeenCalled()

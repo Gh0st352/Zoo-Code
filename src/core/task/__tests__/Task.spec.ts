@@ -2211,7 +2211,10 @@ describe("Cline", () => {
 
 			expect(saveSpy).toHaveBeenCalledOnce()
 			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledOnce()
-			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledWith(task.taskId, { bumpSeq: true })
+			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledWith(task.taskId, {
+				bumpSeq: true,
+				taskInstanceId: task.instanceId,
+			})
 		})
 
 		it.each([true, false])("awaits the overwrite snapshot when persist is %s", async (persist) => {
@@ -2233,7 +2236,12 @@ describe("Cline", () => {
 				overwriteFinished = true
 			})
 
-			await vi.waitFor(() => expect(snapshotSpy).toHaveBeenCalledWith(task.taskId, { bumpSeq: true }))
+			await vi.waitFor(() =>
+				expect(snapshotSpy).toHaveBeenCalledWith(task.taskId, {
+					bumpSeq: true,
+					taskInstanceId: task.instanceId,
+				}),
+			)
 			expect(task.clineMessages).toEqual(messages)
 			expect(saveSpy).toHaveBeenCalledTimes(persist ? 1 : 0)
 			expect(overwriteFinished).toBe(false)
@@ -2272,13 +2280,13 @@ describe("Cline", () => {
 			task.clineMessages = [staleMessage]
 			await taskAccess.updateClineMessage(firstMessage)
 			await taskAccess.updateClineMessage(staleMessage)
-			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, firstMessage]])
+			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, firstMessage, task.instanceId]])
 
 			const overwritePromise = task.overwriteClineMessages([replacement], persist)
 			await vi.advanceTimersByTimeAsync(500)
 
 			expect(task.clineMessages).toEqual([replacement])
-			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, firstMessage]])
+			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, firstMessage, task.instanceId]])
 			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledTimes(persist ? 0 : 1)
 
 			releaseSave(true)
@@ -2286,13 +2294,16 @@ describe("Cline", () => {
 			await vi.advanceTimersByTimeAsync(500)
 
 			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledOnce()
-			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledWith(task.taskId, { bumpSeq: true })
-			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, firstMessage]])
+			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledWith(task.taskId, {
+				bumpSeq: true,
+				taskInstanceId: task.instanceId,
+			})
+			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, firstMessage, task.instanceId]])
 
 			await taskAccess.updateClineMessage(replacement)
 			expect(updatePostSpy.mock.calls).toEqual([
-				[task.taskId, firstMessage],
-				[task.taskId, replacement],
+				[task.taskId, firstMessage, task.instanceId],
+				[task.taskId, replacement, task.instanceId],
 			])
 			await vi.advanceTimersByTimeAsync(500)
 
@@ -2315,7 +2326,10 @@ describe("Cline", () => {
 
 			expect(task.clineMessages).toEqual(messages)
 			expect(saveSpy).toHaveBeenCalledWith(false)
-			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledWith(task.taskId, { bumpSeq: true })
+			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledWith(task.taskId, {
+				bumpSeq: true,
+				taskInstanceId: task.instanceId,
+			})
 		})
 
 		it("still overwrites the transcript when the provider reference is unavailable", async () => {
@@ -2356,7 +2370,7 @@ describe("Cline", () => {
 			await getTaskTestAccess(task).addToClineMessages(message)
 
 			expect(mockProvider.postClineMessageAppended).toHaveBeenCalledOnce()
-			expect(mockProvider.postClineMessageAppended).toHaveBeenCalledWith(task.taskId, message)
+			expect(mockProvider.postClineMessageAppended).toHaveBeenCalledWith(task.taskId, message, task.instanceId)
 			expect(mockProvider.postStateToWebviewThrottled).not.toHaveBeenCalled()
 			expect(mockProvider.postStateToWebviewWithoutTaskHistory).not.toHaveBeenCalled()
 		})
@@ -2414,7 +2428,7 @@ describe("Cline", () => {
 			const addPromise = taskAccess.addToClineMessages(message)
 
 			await Promise.resolve()
-			expect(postSpy).toHaveBeenCalledWith(task.taskId, message)
+			expect(postSpy).toHaveBeenCalledWith(task.taskId, message, task.instanceId)
 			expect(messageListener).not.toHaveBeenCalled()
 
 			releasePost()
@@ -2476,7 +2490,7 @@ describe("Cline", () => {
 			}
 			await getTaskTestAccess(task).addToClineMessages(message)
 
-			expect(mockProvider.postClineMessageAppended).toHaveBeenCalledWith(task.taskId, message)
+			expect(mockProvider.postClineMessageAppended).toHaveBeenCalledWith(task.taskId, message, task.instanceId)
 		})
 
 		it("serializes a new partial message before its immediate leading update", async () => {
@@ -2509,7 +2523,7 @@ describe("Cline", () => {
 			})
 
 			await Promise.resolve()
-			expect(appendSpy).toHaveBeenCalledWith(task.taskId, partialMessage)
+			expect(appendSpy).toHaveBeenCalledWith(task.taskId, partialMessage, task.instanceId)
 			expect(partialAddSettled).toBe(false)
 			expect(updatePostSpy).not.toHaveBeenCalled()
 
@@ -2518,10 +2532,11 @@ describe("Cline", () => {
 
 			expect(updatePostSpy).toHaveBeenCalledOnce()
 			expect(appendSpy.mock.invocationCallOrder[0]).toBeLessThan(updatePostSpy.mock.invocationCallOrder[0])
-			expect(updatePostSpy).toHaveBeenCalledWith(task.taskId, {
-				...partialMessage,
-				text: "updated partial",
-			})
+			expect(updatePostSpy).toHaveBeenCalledWith(
+				task.taskId,
+				{ ...partialMessage, text: "updated partial" },
+				task.instanceId,
+			)
 
 			await vi.advanceTimersByTimeAsync(500)
 			expect(updatePostSpy).toHaveBeenCalledOnce()
@@ -2540,7 +2555,7 @@ describe("Cline", () => {
 
 			const updatePromise = getTaskTestAccess(task).updateClineMessage(message)
 
-			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, message]])
+			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, message, task.instanceId]])
 			await updatePromise
 			await vi.advanceTimersByTimeAsync(1_000)
 			expect(updatePostSpy).toHaveBeenCalledOnce()
@@ -2572,12 +2587,12 @@ describe("Cline", () => {
 			await taskAccess.updateClineMessage(latest)
 
 			await vi.advanceTimersByTimeAsync(249)
-			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, first]])
+			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, first, task.instanceId]])
 
 			await vi.advanceTimersByTimeAsync(1)
 			expect(updatePostSpy.mock.calls).toEqual([
-				[task.taskId, first],
-				[task.taskId, latest],
+				[task.taskId, first, task.instanceId],
+				[task.taskId, latest, task.instanceId],
 			])
 			await vi.advanceTimersByTimeAsync(1_000)
 			expect(updatePostSpy).toHaveBeenCalledTimes(2)
@@ -2605,10 +2620,10 @@ describe("Cline", () => {
 
 			await vi.advanceTimersByTimeAsync(100)
 			expect(updatePostSpy.mock.calls).toEqual([
-				[task.taskId, first],
-				[task.taskId, { ...first, text: "partial 400" }],
-				[task.taskId, { ...first, text: "partial 900" }],
-				[task.taskId, { ...first, text: "partial 1400" }],
+				[task.taskId, first, task.instanceId],
+				[task.taskId, { ...first, text: "partial 400" }, task.instanceId],
+				[task.taskId, { ...first, text: "partial 900" }, task.instanceId],
+				[task.taskId, { ...first, text: "partial 1400" }, task.instanceId],
 			])
 			await vi.advanceTimersByTimeAsync(1_000)
 			expect(updatePostSpy).toHaveBeenCalledTimes(4)
@@ -2647,7 +2662,7 @@ describe("Cline", () => {
 				await vi.advanceTimersByTimeAsync(500)
 
 				expect(vi.mocked(mockProvider.postClineMessageUpdated).mock.calls).toEqual(
-					edge === "leading" ? [] : [[task.taskId, first]],
+					edge === "leading" ? [] : [[task.taskId, first, task.instanceId]],
 				)
 			},
 		)
@@ -2696,12 +2711,12 @@ describe("Cline", () => {
 				await taskAccess.updateClineMessage(first)
 				await vi.advanceTimersByTimeAsync(100)
 				await taskAccess.updateClineMessage({ ...first, text: "queued partial" })
-				expect(updatePostSpy.mock.calls).toEqual([[task.taskId, first]])
+				expect(updatePostSpy.mock.calls).toEqual([[task.taskId, first, task.instanceId]])
 
 				await task[cleanup]()
 				await vi.advanceTimersByTimeAsync(1_000)
 
-				expect(updatePostSpy.mock.calls).toEqual([[task.taskId, first]])
+				expect(updatePostSpy.mock.calls).toEqual([[task.taskId, first, task.instanceId]])
 			},
 		)
 
@@ -2731,7 +2746,7 @@ describe("Cline", () => {
 				await taskAccess.updateClineMessage(first)
 				await vi.advanceTimersByTimeAsync(100)
 				await taskAccess.updateClineMessage({ ...first, text: "superseded partial" })
-				expect(updatePostSpy.mock.calls).toEqual([[task.taskId, first]])
+				expect(updatePostSpy.mock.calls).toEqual([[task.taskId, first, task.instanceId]])
 
 				let releasePost!: () => void
 				const pendingPost = new Promise<void>((resolve) => {
@@ -2743,8 +2758,8 @@ describe("Cline", () => {
 				const completionPromise = taskAccess.updateClineMessage(complete)
 
 				expect(updatePostSpy.mock.calls).toEqual([
-					[task.taskId, first],
-					[task.taskId, complete],
+					[task.taskId, first, task.instanceId],
+					[task.taskId, complete, task.instanceId],
 				])
 				expect(messageListener).not.toHaveBeenCalled()
 
@@ -3949,7 +3964,11 @@ describe("Cline", () => {
 
 			expect(updateSpy).toHaveBeenCalledTimes(expectedUpdateCount)
 			if (!removeRequestDuringSave) {
-				expect(updateSpy).toHaveBeenCalledWith(task.taskId, expect.objectContaining({ say: "api_req_started" }))
+				expect(updateSpy).toHaveBeenCalledWith(
+					task.taskId,
+					expect.objectContaining({ say: "api_req_started" }),
+					task.instanceId,
+				)
 			}
 		})
 	})
@@ -4209,7 +4228,7 @@ describe("Cline", () => {
 
 			const startPromise = taskAccess.startTask("new task")
 
-			expect(snapshotSpy).toHaveBeenCalledWith(task.taskId, { bumpSeq: true })
+			expect(snapshotSpy).toHaveBeenCalledWith(task.taskId, { bumpSeq: true, taskInstanceId: task.instanceId })
 			expect(mockProvider.postStateToWebviewThrottled).not.toHaveBeenCalled()
 			expect(saySpy).not.toHaveBeenCalled()
 

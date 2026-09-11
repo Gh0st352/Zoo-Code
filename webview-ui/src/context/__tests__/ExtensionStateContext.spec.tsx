@@ -1,5 +1,13 @@
 import { providerIdentifiers } from "@roo-code/types"
-import { render, renderHook, screen, act, appendClineMessage, hydrateExtensionState } from "@/utils/test-utils"
+import {
+	render,
+	renderHook,
+	screen,
+	act,
+	appendClineMessage,
+	dispatchExtensionMessage,
+	hydrateExtensionState,
+} from "@/utils/test-utils"
 import React from "react"
 
 import {
@@ -17,10 +25,6 @@ import {
 
 import { ExtensionStateContextProvider, useExtensionState, mergeExtensionState } from "../ExtensionStateContext"
 import { vscode } from "@/utils/vscode"
-
-const dispatchExtensionMessage = (message: ExtensionMessage) => {
-	window.dispatchEvent(new MessageEvent("message", { data: message }))
-}
 
 const makeMessage = (ts: number, text: string): ClineMessage => ({ ts, type: "say", say: "text", text })
 
@@ -116,6 +120,7 @@ const InitialStateTestComponent = () => {
 const TranscriptTestComponent = () => {
 	const {
 		currentTaskId,
+		currentTaskInstanceId,
 		currentTaskItem,
 		currentTaskTodos,
 		messageQueue,
@@ -128,6 +133,7 @@ const TranscriptTestComponent = () => {
 		<div data-testid="transcript-state">
 			{JSON.stringify({
 				currentTaskId: currentTaskId ?? null,
+				currentTaskInstanceId,
 				currentTaskItem: currentTaskItem ?? null,
 				currentTaskTodos: currentTaskTodos ?? [],
 				messageQueue: messageQueue ?? [],
@@ -440,6 +446,10 @@ describe("ExtensionStateContext", () => {
 			const { currentTaskId, clineMessages, clineMessagesSeq } = readTranscript()
 			return { currentTaskId, clineMessages, clineMessagesSeq }
 		}
+		const readScopedTranscriptFields = () => ({
+			...readTranscriptFields(),
+			currentTaskInstanceId: readTranscript().currentTaskInstanceId,
+		})
 		const renderTranscript = (initialState: Partial<ExtensionState> = {}) =>
 			render(
 				<ExtensionStateContextProvider initialState={{ currentTaskId: "task-1", ...initialState }}>
@@ -488,6 +498,531 @@ describe("ExtensionStateContext", () => {
 		afterEach(() => {
 			vi.restoreAllMocks()
 			vi.useRealTimers()
+		})
+
+		describe("instance-scoped focus", () => {
+			beforeEach(() => vi.useFakeTimers())
+
+			it("does not reopen setup or replace settings when early focus is published", () => {
+				const { result } = renderHook(() => useExtensionState(), {
+					wrapper: ({ children }) => (
+						<ExtensionStateContextProvider>{children}</ExtensionStateContextProvider>
+					),
+				})
+				const apiConfiguration: ProviderSettings = { apiProvider: providerIdentifiers.fakeAi }
+				act(() =>
+					dispatchExtensionMessage({
+						type: "state",
+						state: {
+							apiConfiguration,
+							currentTaskId: "task-1",
+							currentTaskInstanceId: "old",
+							soundEnabled: true,
+						},
+					}),
+				)
+				expect(result.current.showWelcome).toBe(false)
+				expect(result.current.didHydrateState).toBe(true)
+				act(() =>
+					dispatchExtensionMessage({
+						type: "clineMessagesFocus",
+						taskId: "task-1",
+						taskInstanceId: "new",
+					}),
+				)
+				expect(result.current.currentTaskInstanceId).toBe("new")
+				expect(result.current.apiConfiguration).toBe(apiConfiguration)
+				expect(result.current.soundEnabled).toBe(true)
+				expect(result.current.showWelcome).toBe(false)
+			})
+
+			it("does not mark initial settings hydrated on early focus publication", () => {
+				const { result } = renderHook(() => useExtensionState(), {
+					wrapper: ({ children }) => (
+						<ExtensionStateContextProvider>{children}</ExtensionStateContextProvider>
+					),
+				})
+				expect(result.current.didHydrateState).toBe(false)
+				act(() =>
+					dispatchExtensionMessage({
+						type: "clineMessagesFocus",
+						taskId: "task-1",
+						taskInstanceId: "new",
+					}),
+				)
+				expect(result.current.currentTaskInstanceId).toBe("new")
+				expect(result.current.didHydrateState).toBe(false)
+			})
+
+			it("preserves hydrated settings across focus clear and repeated publication", () => {
+				const { result } = renderHook(() => useExtensionState(), {
+					wrapper: ({ children }) => (
+						<ExtensionStateContextProvider>{children}</ExtensionStateContextProvider>
+					),
+				})
+				act(() =>
+					dispatchExtensionMessage({
+						type: "state",
+						state: {
+							apiConfiguration: { apiProvider: providerIdentifiers.fakeAi },
+							currentTaskId: "task-1",
+							currentTaskInstanceId: "old",
+							soundEnabled: true,
+						},
+					}),
+				)
+				act(() => dispatchExtensionMessage({ type: "clineMessagesFocus" }))
+				expect(result.current.currentTaskId).toBeNull()
+				expect(result.current.currentTaskInstanceId).toBeNull()
+				expect(result.current.clineMessages).toEqual([])
+				expect(result.current.clineMessagesSeq).toBe(0)
+				expect(result.current.showWelcome).toBe(false)
+				expect(result.current.didHydrateState).toBe(true)
+				expect(result.current.soundEnabled).toBe(true)
+				act(() =>
+					dispatchExtensionMessage({ type: "clineMessagesFocus", taskId: "task-1", taskInstanceId: "new" }),
+				)
+				act(() =>
+					dispatchExtensionMessage({
+						type: "clineMessageAppended",
+						taskId: "task-1",
+						taskInstanceId: "new",
+						clineMessagesSeq: 1,
+						clineMessage: makeMessage(1, "new"),
+					}),
+				)
+				const messages = result.current.clineMessages
+				act(() =>
+					dispatchExtensionMessage({ type: "clineMessagesFocus", taskId: "task-1", taskInstanceId: "new" }),
+				)
+				expect(result.current.clineMessages).toBe(messages)
+				expect(result.current.clineMessagesSeq).toBe(1)
+				expect(result.current.showWelcome).toBe(false)
+			})
+
+			it("changes both focus refs before processing frames in the same event batch", () => {
+				const postMessage = renderTranscriptWithPostMessageSpy({
+					currentTaskInstanceId: "instance-1",
+					clineMessages: [makeMessage(10, "old transcript")],
+					clineMessagesSeq: 8,
+				})
+				const updated = makeMessage(20, "current update")
+				act(() => {
+					dispatchExtensionMessage({
+						type: "clineMessagesFocus",
+						taskId: "task-1",
+						taskInstanceId: "instance-2",
+					})
+					dispatchExtensionMessage({
+						type: "clineMessageAppended",
+						taskId: "task-1",
+						taskInstanceId: "instance-1",
+						clineMessagesSeq: 1,
+						clineMessage: makeMessage(10, "stale append"),
+					})
+					dispatchExtensionMessage({
+						type: "clineMessageAppended",
+						taskId: "task-1",
+						taskInstanceId: "instance-2",
+						clineMessagesSeq: 1,
+						clineMessage: makeMessage(20, "current append"),
+					})
+					dispatchExtensionMessage({
+						type: "state",
+						state: { version: "2.0.0", clineMessages: [makeMessage(10, "stale metadata transcript")] },
+					})
+					dispatchExtensionMessage({
+						type: "clineMessageUpdated",
+						taskId: "task-1",
+						taskInstanceId: "instance-2",
+						clineMessagesSeq: 2,
+						clineMessage: updated,
+					})
+				})
+				expect(readScopedTranscriptFields()).toEqual({
+					currentTaskId: "task-1",
+					currentTaskInstanceId: "instance-2",
+					clineMessages: [updated],
+					clineMessagesSeq: 2,
+				})
+				expect(postMessage.mock.calls).toEqual([])
+				expect(vi.getTimerCount()).toBe(0)
+			})
+
+			it.each<{
+				name: string
+				initialInstanceId?: string
+				state: Partial<ExtensionState>
+			}>([
+				{
+					name: "same-task replacement",
+					initialInstanceId: "instance-1",
+					state: { currentTaskId: "task-1", currentTaskInstanceId: "instance-2" },
+				},
+				{
+					name: "first instance metadata after legacy initialization",
+					state: { currentTaskId: "task-1", currentTaskInstanceId: "instance-2" },
+				},
+				{
+					name: "instance-only replacement metadata",
+					initialInstanceId: "instance-1",
+					state: { currentTaskInstanceId: "instance-2" },
+				},
+				{
+					name: "explicit instance clear",
+					initialInstanceId: "instance-1",
+					state: { currentTaskInstanceId: null },
+				},
+			])(
+				"resets messages, sequence, index, snapshot, and resync timers on $name",
+				({ initialInstanceId, state }) => {
+					const postMessage = renderTranscriptWithPostMessageSpy({
+						currentTaskInstanceId: initialInstanceId,
+						clineMessages: [
+							makeMessage(10, "old first"),
+							makeMessage(20, "old middle"),
+							makeMessage(30, "old last"),
+						],
+						clineMessagesSeq: 7,
+					})
+					act(() => {
+						dispatchExtensionMessage({
+							type: "clineMessageAppended",
+							taskId: "task-1",
+							taskInstanceId: initialInstanceId,
+							clineMessagesSeq: 9,
+							clineMessage: makeMessage(40, "old gap"),
+						})
+						startSnapshot({ taskInstanceId: initialInstanceId, clineMessagesSeq: 10 })
+						appendSnapshotChunk({ taskInstanceId: initialInstanceId, clineMessagesSeq: 10 })
+					})
+					expect(postMessage.mock.calls).toEqual([
+						[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 8, receivedSeq: 9 }],
+					])
+					expect(vi.getTimerCount()).toBe(2)
+					postMessage.mockClear()
+
+					act(() => dispatchExtensionMessage({ type: "state", state }))
+					const cleared = {
+						currentTaskId: "task-1",
+						currentTaskInstanceId: state.currentTaskInstanceId,
+						clineMessages: [],
+						clineMessagesSeq: 0,
+					}
+					expect(readScopedTranscriptFields()).toEqual(cleared)
+					expect(vi.getTimerCount()).toBe(0)
+					act(() => vi.advanceTimersByTime(30_000))
+					expect(postMessage.mock.calls).toEqual([])
+
+					// The old timestamp index must not turn this unknown update into an append.
+					const scope = { taskId: "task-1", taskInstanceId: state.currentTaskInstanceId ?? undefined }
+					act(() =>
+						dispatchExtensionMessage({
+							type: "clineMessageUpdated",
+							...scope,
+							clineMessagesSeq: 1,
+							clineMessage: makeMessage(20, "removed timestamp"),
+						}),
+					)
+					expect(readScopedTranscriptFields()).toEqual(cleared)
+					expect(postMessage.mock.calls).toEqual([
+						[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 1, receivedSeq: 1 }],
+					])
+
+					const updated = makeMessage(30, "new position")
+					act(() => {
+						dispatchExtensionMessage({
+							type: "clineMessageAppended",
+							...scope,
+							clineMessagesSeq: 1,
+							clineMessage: makeMessage(30, "reused timestamp"),
+						})
+						dispatchExtensionMessage({
+							type: "clineMessageUpdated",
+							...scope,
+							clineMessagesSeq: 2,
+							clineMessage: updated,
+						})
+					})
+					expect(readScopedTranscriptFields()).toEqual({
+						...cleared,
+						clineMessages: [updated],
+						clineMessagesSeq: 2,
+					})
+					expect(postMessage.mock.calls).toEqual([
+						[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 1, receivedSeq: 1 }],
+					])
+				},
+			)
+
+			const frameTypes = [
+				"clineMessageAppended",
+				"clineMessageUpdated",
+				"clineMessagesSnapshotStart",
+				"clineMessagesSnapshotChunk",
+				"clineMessagesSnapshotEnd",
+			] as const
+			const rejectedScopes = [
+				{ identity: "old instance", taskId: "task-1", taskInstanceId: "instance-1" },
+				{ identity: "missing instance", taskId: "task-1", taskInstanceId: undefined },
+				{ identity: "wrong task", taskId: "task-2", taskInstanceId: "instance-2" },
+				{ identity: "missing task", taskId: undefined, taskInstanceId: "instance-2" },
+			]
+			it.each(
+				frameTypes.flatMap((type) =>
+					["before", "during", "after"].flatMap((stage) =>
+						rejectedScopes.map((scope) => ({ type, stage, ...scope })),
+					),
+				),
+			)("ignores $identity $type $stage the replacement snapshot", ({ type, stage, taskId, taskInstanceId }) => {
+				const postMessage = renderTranscriptWithPostMessageSpy({
+					currentTaskInstanceId: "instance-1",
+					clineMessages: [makeMessage(10, "old transcript")],
+					clineMessagesSeq: 8,
+				})
+				const replacement = makeMessage(20, "replacement")
+				const snapshot = { taskInstanceId: "instance-2", snapshotId: "replacement", clineMessagesSeq: 2 }
+				const buffered = stage === "during" && type === "clineMessagesSnapshotEnd"
+				act(() => {
+					dispatchExtensionMessage({
+						type: "clineMessagesFocus",
+						taskId: "task-1",
+						taskInstanceId: "instance-2",
+					})
+					if (stage !== "before") {
+						startSnapshot(snapshot)
+						if (stage === "after" || buffered) {
+							appendSnapshotChunk({ ...snapshot, clineMessages: [replacement] })
+						}
+						if (stage === "after") {
+							endSnapshot(snapshot)
+						}
+					}
+				})
+				const expected = {
+					currentTaskId: "task-1",
+					currentTaskInstanceId: "instance-2",
+					clineMessages: stage === "after" ? [replacement] : [],
+					clineMessagesSeq: stage === "after" ? 2 : 0,
+				}
+				expect(readScopedTranscriptFields()).toEqual(expected)
+
+				// Chunks/end match the current transaction; starts/deltas are newer so
+				// a missing scope guard would poison it rather than merely look stale.
+				const matchesSnapshot = type === "clineMessagesSnapshotChunk" || type === "clineMessagesSnapshotEnd"
+				const clineMessagesSeq = stage === "before" ? 1 : stage === "during" && matchesSnapshot ? 2 : 3
+				const stale = makeMessage(stage === "after" ? 20 : 10, "stale frame")
+				const frame: ExtensionMessage =
+					type === "clineMessageAppended" || type === "clineMessageUpdated"
+						? { type, taskId, taskInstanceId, clineMessagesSeq, clineMessage: stale }
+						: {
+								type,
+								taskId,
+								taskInstanceId,
+								clineMessagesSeq,
+								snapshotId: "replacement",
+								...(type === "clineMessagesSnapshotChunk"
+									? { snapshotStartIndex: 0, clineMessages: [stale] }
+									: { snapshotTotal: 1 }),
+							}
+				act(() => dispatchExtensionMessage(frame))
+				expect(readScopedTranscriptFields()).toEqual(expected)
+				expect(postMessage.mock.calls).toEqual([])
+				expect(vi.getTimerCount()).toBe(stage === "during" ? 1 : 0)
+
+				act(() => {
+					if (stage === "before") {
+						startSnapshot(snapshot)
+					}
+					if (stage !== "after") {
+						if (!buffered) {
+							appendSnapshotChunk({ ...snapshot, clineMessages: [replacement] })
+						}
+						endSnapshot(snapshot)
+					}
+				})
+				expect(readScopedTranscriptFields()).toEqual({
+					...expected,
+					clineMessages: [replacement],
+					clineMessagesSeq: 2,
+				})
+
+				const appended = makeMessage(30, "current append")
+				const updated = makeMessage(20, "current update")
+				act(() => {
+					dispatchExtensionMessage({
+						type: "clineMessageAppended",
+						taskId: "task-1",
+						taskInstanceId: "instance-2",
+						clineMessagesSeq: 3,
+						clineMessage: appended,
+					})
+					dispatchExtensionMessage({
+						type: "clineMessageUpdated",
+						taskId: "task-1",
+						taskInstanceId: "instance-2",
+						clineMessagesSeq: 4,
+						clineMessage: updated,
+					})
+				})
+				expect(readScopedTranscriptFields()).toEqual({
+					...expected,
+					clineMessages: [updated, appended],
+					clineMessagesSeq: 4,
+				})
+				expect(vi.getTimerCount()).toBe(0)
+				expect(postMessage.mock.calls).toEqual([])
+			})
+
+			it.each<Partial<ExtensionState>>([
+				{ version: "2.0.0" },
+				{ currentTaskId: "task-1", version: "2.0.0" },
+				{ currentTaskId: "task-1", currentTaskInstanceId: undefined },
+				{ currentTaskId: "task-1", currentTaskInstanceId: "instance-1" },
+				{ currentTaskInstanceId: "instance-1" },
+			])("preserves the focus, transcript, pending snapshot, and resync through metadata %j", (state) => {
+				const existing = makeMessage(10, "existing")
+				const replacement = makeMessage(20, "replacement")
+				const postMessage = renderTranscriptWithPostMessageSpy({
+					currentTaskInstanceId: "instance-1",
+					clineMessages: [existing],
+					clineMessagesSeq: 3,
+				})
+				const snapshot = { taskInstanceId: "instance-1", clineMessagesSeq: 6 }
+				act(() => {
+					dispatchExtensionMessage({
+						type: "clineMessageAppended",
+						taskId: "task-1",
+						taskInstanceId: "instance-1",
+						clineMessagesSeq: 5,
+						clineMessage: makeMessage(30, "gap"),
+					})
+					startSnapshot(snapshot)
+					appendSnapshotChunk({ ...snapshot, clineMessages: [replacement] })
+				})
+				expect(vi.getTimerCount()).toBe(2)
+				const clearTimeout = vi.spyOn(window, "clearTimeout")
+				act(() => {
+					dispatchExtensionMessage({
+						type: "state",
+						state: {
+							...state,
+							clineMessages: [makeMessage(99, "ignored generic transcript")],
+							clineMessagesSeq: 99,
+						},
+					})
+					dispatchExtensionMessage({ type: "messageUpdated", clineMessagesSeq: 99 })
+				})
+				expect(readScopedTranscriptFields()).toEqual({
+					currentTaskId: "task-1",
+					currentTaskInstanceId: "instance-1",
+					clineMessages: [existing],
+					clineMessagesSeq: 3,
+				})
+				expect(clearTimeout.mock.calls).toEqual([])
+				expect(vi.getTimerCount()).toBe(2)
+				expect(postMessage.mock.calls).toEqual([
+					[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 4, receivedSeq: 5 }],
+				])
+
+				const updated = makeMessage(20, "updated replacement")
+				act(() => {
+					endSnapshot(snapshot)
+					dispatchExtensionMessage({
+						type: "clineMessageUpdated",
+						taskId: "task-1",
+						taskInstanceId: "instance-1",
+						clineMessagesSeq: 7,
+						clineMessage: updated,
+					})
+				})
+				expect(readScopedTranscriptFields()).toEqual({
+					currentTaskId: "task-1",
+					currentTaskInstanceId: "instance-1",
+					clineMessages: [updated],
+					clineMessagesSeq: 7,
+				})
+				expect(vi.getTimerCount()).toBe(0)
+				expect(postMessage.mock.calls).toEqual([
+					[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 4, receivedSeq: 5 }],
+				])
+			})
+
+			it.each(["task-2", null])("clears an omitted instance on a switch to %s", (currentTaskId) => {
+				const postMessage = renderTranscriptWithPostMessageSpy({
+					currentTaskInstanceId: "instance-1",
+					clineMessages: [makeMessage(10, "old")],
+					clineMessagesSeq: 8,
+				})
+				act(() => dispatchExtensionMessage({ type: "state", state: { currentTaskId } }))
+				const cleared = {
+					currentTaskId,
+					currentTaskInstanceId: currentTaskId === null ? null : undefined,
+					clineMessages: [],
+					clineMessagesSeq: 0,
+				}
+				expect(readScopedTranscriptFields()).toEqual(cleared)
+				act(() => dispatchExtensionMessage({ type: "state", state: { version: "2.0.0" } }))
+				expect(readScopedTranscriptFields()).toEqual(cleared)
+
+				const snapshot = { taskId: currentTaskId ?? undefined, clineMessagesSeq: 0, snapshotTotal: 0 }
+				act(() => startSnapshot({ ...snapshot, taskInstanceId: "instance-1" }))
+				expect(vi.getTimerCount()).toBe(0)
+				act(() => startSnapshot(snapshot))
+				expect(vi.getTimerCount()).toBe(1)
+				act(() => endSnapshot(snapshot))
+				expect(vi.getTimerCount()).toBe(0)
+				expect(readScopedTranscriptFields()).toEqual(cleared)
+				expect(postMessage.mock.calls).toEqual([])
+			})
+
+			it.each<{
+				name: string
+				initialState: Partial<ExtensionState>
+				expectedInstanceId: string | null | undefined
+			}>([
+				{ name: "initial partial state", initialState: {}, expectedInstanceId: undefined },
+				{ name: "legacy task", initialState: { currentTaskId: "task-1" }, expectedInstanceId: undefined },
+				{
+					name: "scoped task",
+					initialState: { currentTaskId: "task-1", currentTaskInstanceId: "instance-1" },
+					expectedInstanceId: "instance-1",
+				},
+				{
+					name: "explicit no-task with an obsolete instance",
+					initialState: { currentTaskId: null, currentTaskInstanceId: "instance-1" },
+					expectedInstanceId: null,
+				},
+			])("initializes and preserves the scope for $name", ({ initialState, expectedInstanceId }) => {
+				const { result } = renderHook(() => useExtensionState(), {
+					wrapper: ({ children }) => (
+						<ExtensionStateContextProvider initialState={initialState}>
+							{children}
+						</ExtensionStateContextProvider>
+					),
+				})
+				expect(result.current.currentTaskId).toBe(initialState.currentTaskId)
+				expect(result.current.currentTaskInstanceId).toBe(expectedInstanceId)
+				const messages = result.current.clineMessages
+				act(() => dispatchExtensionMessage({ type: "state", state: { version: "2.0.0" } }))
+				expect(result.current.currentTaskId).toBe(initialState.currentTaskId)
+				expect(result.current.currentTaskInstanceId).toBe(expectedInstanceId)
+				expect(result.current.clineMessages).toBe(messages)
+				expect(result.current.version).toBe("2.0.0")
+
+				const snapshot = {
+					taskId: initialState.currentTaskId ?? undefined,
+					taskInstanceId: expectedInstanceId ?? undefined,
+					clineMessagesSeq: 0,
+					snapshotTotal: 0,
+				}
+				act(() => startSnapshot(snapshot))
+				expect(vi.getTimerCount()).toBe(1)
+				act(() => endSnapshot(snapshot))
+				expect(vi.getTimerCount()).toBe(0)
+				expect(result.current.clineMessages).toEqual([])
+				expect(result.current.clineMessagesSeq).toBe(0)
+			})
 		})
 
 		it.each(["initial state", "appends", "snapshot"])(
@@ -1645,6 +2180,7 @@ describe("ExtensionStateContext", () => {
 
 			expect(readTranscript()).toEqual({
 				currentTaskId: null,
+				currentTaskInstanceId: null,
 				currentTaskItem: null,
 				currentTaskTodos: [],
 				messageQueue: [],
@@ -1672,6 +2208,7 @@ describe("ExtensionStateContext", () => {
 			)
 			expect(readTranscript()).toEqual({
 				currentTaskId: null,
+				currentTaskInstanceId: null,
 				currentTaskItem: null,
 				currentTaskTodos: [],
 				messageQueue: [],
@@ -2104,7 +2641,13 @@ describe("ExtensionStateContext", () => {
 					})
 				})
 
-				expect(postMessage).toHaveBeenCalledTimes(5)
+				expect(postMessage.mock.calls).toEqual([
+					[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 2, receivedSeq: 2 }],
+					[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 2, receivedSeq: 4 }],
+					[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 2, receivedSeq: 5 }],
+					[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 2, receivedSeq: 6 }],
+					[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 2, receivedSeq: 7 }],
+				])
 				expect(readTranscriptFields()).toEqual({
 					currentTaskId: "task-1",
 					clineMessages: [],

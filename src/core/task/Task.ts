@@ -676,7 +676,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					return
 				}
 
-				void provider.postClineMessageUpdated(this.taskId, message).catch((error) => {
+				void provider.postClineMessageUpdated(this.taskId, message, this.instanceId).catch((error) => {
 					console.error("[Task#updateClineMessage] incremental post failed:", error)
 				})
 			},
@@ -1290,7 +1290,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this.clineMessages.push(message)
 		const provider = this.providerRef.deref()
 		try {
-			await provider?.postClineMessageAppended(this.taskId, message)
+			await provider?.postClineMessageAppended(this.taskId, message, this.instanceId)
 		} catch (error) {
 			console.error("[Task#addToClineMessages] incremental post failed:", error)
 		}
@@ -1319,7 +1319,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		if (persist) {
 			await this.saveClineMessages(false)
 		}
-		await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, { bumpSeq: true })
+		await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, {
+			bumpSeq: true,
+			taskInstanceId: this.instanceId,
+		})
 	}
 
 	private hydrateClineMessages(messages: ClineMessage[]) {
@@ -1349,7 +1352,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			this.debouncedPostPartialMessageUpdate(message)
 		} else {
 			this.debouncedPostPartialMessageUpdate.cancel()
-			await this.providerRef.deref()?.postClineMessageUpdated(this.taskId, message)
+			await this.providerRef.deref()?.postClineMessageUpdated(this.taskId, message, this.instanceId)
 		}
 		this.emit(RooCodeEventName.Message, { action: "updated", message })
 
@@ -2211,7 +2214,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// The todo list is already set in the constructor if initialTodos were provided
 			// No need to add any messages - the todoList property is already set
 
-			await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, { bumpSeq: true })
+			await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, {
+				bumpSeq: true,
+				taskInstanceId: this.instanceId,
+			})
 
 			await this.say("text", task, images)
 
@@ -2361,7 +2367,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 
 			// Publish the transcript after both histories hydrate, before any resume prompt or pending-action replay.
-			await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, { bumpSeq: true })
+			await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, {
+				bumpSeq: true,
+				taskInstanceId: this.instanceId,
+			})
 
 			if (this.abort || this.abandoned) {
 				return

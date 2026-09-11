@@ -228,6 +228,7 @@ export class ClineProvider
 		(message) => this.postMessageToWebview(message),
 		(error) =>
 			this.log(`[clineMessages] transport failure: ${error instanceof Error ? error.message : String(error)}`),
+		() => this.getCurrentTask()?.instanceId,
 	)
 	private readonly _postStateToWebviewThrottled = debounce(
 		async () => {
@@ -578,6 +579,7 @@ export class ClineProvider
 		// Add this cline instance into the stack that represents the order of
 		// all the called tasks.
 		this.taskRegistry.push(task)
+		await this.publishFocusedTaskScope()
 		task.emit(RooCodeEventName.TaskFocused)
 
 		// Perform special setup provider specific tasks.
@@ -621,11 +623,12 @@ export class ClineProvider
 		// Remove the focused Cline instance from the stack.
 		let task = this.taskRegistry.current
 		if (task) {
+			this.clineMessagesTransport.forgetTask(task.taskId)
 			task = this.taskRegistry.remove(task.taskId)
 		}
+		await this.publishFocusedTaskScope()
 
 		if (task) {
-			this.clineMessagesTransport.forgetTask(task.taskId)
 			task.emit(RooCodeEventName.TaskUnfocused)
 
 			try {
@@ -1389,6 +1392,11 @@ export class ClineProvider
 			const oldTask = this.taskRegistry.current
 
 			if (oldTask) {
+				// Publish replacement ownership before cleanup can yield. Old Task producers
+				// must already be stale during abort, not just after model preparation.
+				this.taskRegistry.replace(oldTask.taskId, task)
+				await this.publishFocusedTaskScope()
+
 				// Abort the old task to stop running processes and mark as abandoned
 				try {
 					await oldTask.abortTask(true)
@@ -1404,9 +1412,6 @@ export class ClineProvider
 					cleanupFunctions.forEach((cleanup) => cleanup())
 					this.taskEventListeners.delete(oldTask)
 				}
-
-				// Replace in-place: preserves stack index and current pointer
-				this.taskRegistry.replace(oldTask.taskId, task)
 			}
 
 			task.emit(RooCodeEventName.TaskFocused)
@@ -1485,6 +1490,21 @@ export class ClineProvider
 			return
 		}
 
+		if (message.type === "state" && message.state) {
+			// State assembly awaits optional services after capturing its Task. Never let
+			// such a late post restore an old scope (or attach old metadata to a new one).
+			// Partial, unscoped metadata remains valid, including for CLI consumers.
+			const currentTask = this.getCurrentTask()
+			if (
+				(message.state.currentTaskId !== undefined &&
+					message.state.currentTaskId !== (currentTask?.taskId ?? null)) ||
+				(message.state.currentTaskInstanceId !== undefined &&
+					message.state.currentTaskInstanceId !== (currentTask?.instanceId ?? null))
+			) {
+				return
+			}
+		}
+
 		// Browser webviews use the dedicated transcript transport below. The CLI
 		// still consumes transcript state and legacy updates until its clients adopt
 		// the sequence-aware protocol.
@@ -1504,34 +1524,49 @@ export class ClineProvider
 		return this.clineMessagesTransport.invalidate()
 	}
 
-	public postClineMessageAppended(taskId: string, message: ClineMessage): Promise<void> {
-		if (this.getCurrentTask()?.taskId !== taskId) {
+	private async publishFocusedTaskScope(): Promise<number> {
+		const generation = this.invalidateClineMessagesTransport()
+		const currentTask = this.getCurrentTask()
+		// No asynchronous state assembly before this post: held old frames must see
+		// the replacement scope even while abort/preparation or generic state is pending.
+		await this.postMessageToWebview({
+			type: "clineMessagesFocus",
+			taskId: currentTask?.taskId,
+			taskInstanceId: currentTask?.instanceId,
+		})
+		return generation
+	}
+
+	public postClineMessageAppended(taskId: string, message: ClineMessage, taskInstanceId?: string): Promise<void> {
+		const currentTask = this.getCurrentTask()
+		if (currentTask?.taskId !== taskId || currentTask?.instanceId !== taskInstanceId) {
 			return Promise.resolve()
 		}
 		if (process.env.ROO_CLI_RUNTIME === "1") {
 			return this.postStateToWebviewWithoutTaskHistory()
 		}
 
-		return this.clineMessagesTransport.enqueue({ kind: "append", taskId }, [message])
+		return this.clineMessagesTransport.enqueue({ kind: "append", taskId, taskInstanceId }, [message])
 	}
 
-	public postClineMessageUpdated(taskId: string, message: ClineMessage): Promise<void> {
-		if (this.getCurrentTask()?.taskId !== taskId) {
+	public postClineMessageUpdated(taskId: string, message: ClineMessage, taskInstanceId?: string): Promise<void> {
+		const currentTask = this.getCurrentTask()
+		if (currentTask?.taskId !== taskId || currentTask?.instanceId !== taskInstanceId) {
 			return Promise.resolve()
 		}
 		if (process.env.ROO_CLI_RUNTIME === "1") {
 			return this.postMessageToWebview({ type: "messageUpdated", clineMessage: structuredClone(message) })
 		}
 
-		return this.clineMessagesTransport.enqueue({ kind: "update", taskId }, [message])
+		return this.clineMessagesTransport.enqueue({ kind: "update", taskId, taskInstanceId }, [message])
 	}
 
 	public postClineMessagesSnapshot(
 		taskId: string | undefined = this.getCurrentTask()?.taskId,
-		options: { bumpSeq?: boolean; generation?: number } = {},
+		options: { bumpSeq?: boolean; generation?: number; taskInstanceId?: string } = {},
 	): Promise<void> {
 		const currentTask = this.getCurrentTask()
-		if ((currentTask?.taskId ?? undefined) !== taskId) {
+		if (currentTask?.taskId !== taskId || currentTask?.instanceId !== options.taskInstanceId) {
 			return Promise.resolve()
 		}
 		if (process.env.ROO_CLI_RUNTIME === "1") {
@@ -1545,7 +1580,8 @@ export class ClineProvider
 	}
 
 	public resyncClineMessagesToWebview(taskId?: string, expectedSeq?: unknown, receivedSeq?: unknown): Promise<void> {
-		const currentTaskId = this.getCurrentTask()?.taskId
+		const currentTask = this.getCurrentTask()
+		const currentTaskId = currentTask?.taskId
 		if (currentTaskId !== taskId) {
 			return Promise.resolve()
 		}
@@ -1569,11 +1605,12 @@ export class ClineProvider
 				receivedSeq: diagnosticSequence(receivedSeq),
 			})}`,
 		)
-		return this.postClineMessagesSnapshot(taskId, { generation })
+		return this.postClineMessagesSnapshot(taskId, { generation, taskInstanceId: currentTask?.instanceId })
 	}
 
 	public async syncFocusedTaskToWebview(options: { includeTaskHistory?: boolean } = {}): Promise<void> {
-		const generation = this.invalidateClineMessagesTransport()
+		const currentTask = this.getCurrentTask()
+		const generation = await this.publishFocusedTaskScope()
 		if (options.includeTaskHistory) {
 			await this.postStateToWebview()
 		} else {
@@ -1582,7 +1619,10 @@ export class ClineProvider
 		if (generation !== this.clineMessagesTransport.generation) {
 			return
 		}
-		await this.postClineMessagesSnapshot(this.getCurrentTask()?.taskId, { generation })
+		await this.postClineMessagesSnapshot(currentTask?.taskId, {
+			generation,
+			taskInstanceId: currentTask?.instanceId,
+		})
 	}
 
 	public requestWebviewThemeFixture(timeoutMs = 5_000): Promise<WebviewThemeFixture> {
@@ -2859,6 +2899,7 @@ export class ClineProvider
 			autoCondenseContextPercent: autoCondenseContextPercent ?? 100,
 			uriScheme: vscode.env.uriScheme,
 			currentTaskId: currentTask?.taskId ?? null,
+			currentTaskInstanceId: currentTask?.instanceId ?? null,
 			currentTaskItem: currentTask?.taskId ? this.taskHistoryStore.get(currentTask.taskId) : undefined,
 			clineMessages: currentTask?.clineMessages || [],
 			currentTaskTodos: currentTask?.todoList || [],
