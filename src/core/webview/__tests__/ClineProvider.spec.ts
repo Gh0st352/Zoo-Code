@@ -934,7 +934,14 @@ describe("ClineProvider", () => {
 							return readText()
 						},
 					}
-					setCurrentTask({ taskId: "task-1", instanceId: "new", clineMessages: [message] })
+					const readTranscript = vi.fn(() => [message])
+					setCurrentTask({
+						taskId: "task-1",
+						instanceId: "new",
+						get clineMessages() {
+							return readTranscript()
+						},
+					})
 					const post = vi.spyOn(provider, "postMessageToWebview")
 					const state = vi.spyOn(provider, "postStateToWebviewWithoutTaskHistory")
 					const transport = provider["clineMessagesTransport"]
@@ -949,6 +956,7 @@ describe("ClineProvider", () => {
 						})
 					}
 					expect(readText).not.toHaveBeenCalled()
+					expect(readTranscript).not.toHaveBeenCalled()
 					expect(post).not.toHaveBeenCalled()
 					expect(state).not.toHaveBeenCalled()
 					expect(transport["state"]).toBe(before)

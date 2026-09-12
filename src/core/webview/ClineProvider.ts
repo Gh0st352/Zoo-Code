@@ -132,7 +132,7 @@ import { getUri } from "./getUri"
 import { REQUESTY_BASE_URL } from "../../shared/utils/requesty"
 import { validateAndFixToolResultIds } from "../task/validateToolResultIds"
 import { PendingEditOperationStore, type PendingEditOperationInput } from "./PendingEditOperationStore"
-import { TranscriptTransport } from "./transcriptTransport"
+import { TranscriptTransport, type TranscriptRequest } from "./transcriptTransport"
 
 /**
  * https://github.com/microsoft/vscode-webview-ui-toolkit-samples/blob/main/default/weather-webview/src/providers/WeatherViewProvider.ts
@@ -1503,14 +1503,18 @@ export class ClineProvider
 			) {
 				return
 			}
-		}
 
-		// Browser webviews use the dedicated transcript transport below. The CLI
-		// still consumes transcript state and legacy updates until its clients adopt
-		// the sequence-aware protocol.
-		if (process.env.ROO_CLI_RUNTIME !== "1" && message.type === "state" && message.state) {
-			const { clineMessages: _omitMessages, clineMessagesSeq: _omitMessagesSeq, ...metadataState } = message.state
-			message = { ...message, state: metadataState }
+			// Browser webviews use the dedicated transcript transport below. The CLI
+			// still consumes transcript state and legacy updates until its clients adopt
+			// the sequence-aware protocol.
+			if (process.env.ROO_CLI_RUNTIME !== "1") {
+				const {
+					clineMessages: _omitMessages,
+					clineMessagesSeq: _omitMessagesSeq,
+					...metadataState
+				} = message.state
+				message = { ...message, state: metadataState }
+			}
 		}
 
 		try {
@@ -1538,44 +1542,38 @@ export class ClineProvider
 	}
 
 	public postClineMessageAppended(taskId: string, message: ClineMessage, taskInstanceId?: string): Promise<void> {
-		const currentTask = this.getCurrentTask()
-		if (currentTask?.taskId !== taskId || currentTask?.instanceId !== taskInstanceId) {
-			return Promise.resolve()
-		}
-		if (process.env.ROO_CLI_RUNTIME === "1") {
-			return this.postStateToWebviewWithoutTaskHistory()
-		}
-
-		return this.clineMessagesTransport.enqueue({ kind: "append", taskId, taskInstanceId }, [message])
+		return this.postTranscript({ kind: "append", taskId, taskInstanceId, message })
 	}
 
 	public postClineMessageUpdated(taskId: string, message: ClineMessage, taskInstanceId?: string): Promise<void> {
-		const currentTask = this.getCurrentTask()
-		if (currentTask?.taskId !== taskId || currentTask?.instanceId !== taskInstanceId) {
-			return Promise.resolve()
-		}
-		if (process.env.ROO_CLI_RUNTIME === "1") {
-			return this.postMessageToWebview({ type: "messageUpdated", clineMessage: structuredClone(message) })
-		}
-
-		return this.clineMessagesTransport.enqueue({ kind: "update", taskId, taskInstanceId }, [message])
+		return this.postTranscript({ kind: "update", taskId, taskInstanceId, message })
 	}
 
 	public postClineMessagesSnapshot(
 		taskId: string | undefined = this.getCurrentTask()?.taskId,
 		options: { bumpSeq?: boolean; generation?: number; taskInstanceId?: string } = {},
 	): Promise<void> {
+		return this.postTranscript({ kind: "snapshot", taskId, ...options })
+	}
+
+	private postTranscript(
+		request: TranscriptRequest & ({ kind: "snapshot" } | { kind: "append" | "update"; message: ClineMessage }),
+	): Promise<void> {
 		const currentTask = this.getCurrentTask()
-		if (currentTask?.taskId !== taskId || currentTask?.instanceId !== options.taskInstanceId) {
+		// Every producer, including the legacy CLI path, must pass the same identity
+		// check before reading or cloning payloads from the focused task.
+		if (currentTask?.taskId !== request.taskId || currentTask?.instanceId !== request.taskInstanceId) {
 			return Promise.resolve()
 		}
 		if (process.env.ROO_CLI_RUNTIME === "1") {
-			return this.postStateToWebviewWithoutTaskHistory()
+			return request.kind === "update"
+				? this.postMessageToWebview({ type: "messageUpdated", clineMessage: structuredClone(request.message) })
+				: this.postStateToWebviewWithoutTaskHistory()
 		}
 
 		return this.clineMessagesTransport.enqueue(
-			{ kind: "snapshot", taskId, ...options },
-			currentTask?.clineMessages ?? [],
+			request,
+			request.kind === "snapshot" ? (currentTask?.clineMessages ?? []) : [request.message],
 		)
 	}
 
