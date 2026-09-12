@@ -66,6 +66,7 @@ test("allows theme transitions to be canceled while settling", async ({ mount, p
 for (const theme of visualThemes) {
 	test(`audits representative controls in the VS Code ${theme.name} theme`, async ({ mount, page }) => {
 		const component = mountedStory(await mount("accessibility-contrast"))
+		await page.addStyleTag({ content: "* { transition: none !important; }" })
 		await applyVisualTheme(page, theme)
 		const gallery = component
 
