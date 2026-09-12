@@ -969,12 +969,92 @@ describe("ExtensionStateContext", () => {
 				act(() => startSnapshot({ ...snapshot, taskInstanceId: "instance-1" }))
 				expect(vi.getTimerCount()).toBe(0)
 				act(() => startSnapshot(snapshot))
-				expect(vi.getTimerCount()).toBe(1)
+				expect(vi.getTimerCount()).toBe(currentTaskId === null ? 0 : 1)
 				act(() => endSnapshot(snapshot))
 				expect(vi.getTimerCount()).toBe(0)
 				expect(readScopedTranscriptFields()).toEqual(cleared)
 				expect(postMessage.mock.calls).toEqual([])
 			})
+
+			it.each(
+				frameTypes.flatMap((type) => ["state", "clineMessagesFocus"].map((clearType) => ({ type, clearType }))),
+			)("ignores an unscoped $type after task clearing via $clearType", ({ type, clearType }) => {
+				const postMessage = renderTranscriptWithPostMessageSpy({
+					currentTaskInstanceId: "instance-1",
+					clineMessages: [makeMessage(10, "old transcript")],
+					clineMessagesSeq: 8,
+				})
+				const stale = makeMessage(10, "unscoped frame")
+				act(() => {
+					dispatchExtensionMessage(
+						clearType === "state"
+							? { type: "state", state: { currentTaskId: null } }
+							: { type: "clineMessagesFocus" },
+					)
+					// Omit both identity fields and deliver before React renders the clear.
+					dispatchExtensionMessage(
+						type === "clineMessageAppended" || type === "clineMessageUpdated"
+							? { type, clineMessagesSeq: 1, clineMessage: stale }
+							: {
+									type,
+									clineMessagesSeq: 1,
+									snapshotId: "unscoped",
+									...(type === "clineMessagesSnapshotChunk"
+										? { snapshotStartIndex: 0, clineMessages: [stale] }
+										: { snapshotTotal: 1 }),
+								},
+					)
+				})
+
+				expect(readScopedTranscriptFields()).toEqual({
+					currentTaskId: null,
+					currentTaskInstanceId: null,
+					clineMessages: [],
+					clineMessagesSeq: 0,
+				})
+				expect(vi.getTimerCount()).toBe(0)
+				act(() => vi.advanceTimersByTime(30_000))
+				expect(postMessage).not.toHaveBeenCalled()
+			})
+
+			it.each(["state", "clineMessagesFocus"])(
+				"rejects a nonempty unscoped snapshot after task clearing via %s",
+				(clearType) => {
+					const postMessage = renderTranscriptWithPostMessageSpy({
+						currentTaskInstanceId: "instance-1",
+						clineMessages: [makeMessage(10, "old transcript")],
+						clineMessagesSeq: 8,
+					})
+					const pending = { taskInstanceId: "instance-1", clineMessagesSeq: 9 }
+					act(() => {
+						startSnapshot(pending)
+						appendSnapshotChunk(pending)
+					})
+					expect(vi.getTimerCount()).toBe(1)
+
+					act(() => {
+						dispatchExtensionMessage(
+							clearType === "state"
+								? { type: "state", state: { currentTaskId: null } }
+								: { type: "clineMessagesFocus" },
+						)
+						const unscoped = { taskId: undefined, clineMessagesSeq: 1, snapshotId: "unscoped" }
+						startSnapshot(unscoped)
+						appendSnapshotChunk({ ...unscoped, clineMessages: [makeMessage(20, "unscoped snapshot")] })
+						endSnapshot(unscoped)
+					})
+
+					expect(readScopedTranscriptFields()).toEqual({
+						currentTaskId: null,
+						currentTaskInstanceId: null,
+						clineMessages: [],
+						clineMessagesSeq: 0,
+					})
+					expect(vi.getTimerCount()).toBe(0)
+					act(() => vi.advanceTimersByTime(30_000))
+					expect(postMessage).not.toHaveBeenCalled()
+				},
+			)
 
 			it.each<{
 				name: string
@@ -1017,11 +1097,11 @@ describe("ExtensionStateContext", () => {
 					snapshotTotal: 0,
 				}
 				act(() => startSnapshot(snapshot))
-				expect(vi.getTimerCount()).toBe(1)
+				expect(vi.getTimerCount()).toBe(initialState.currentTaskId ? 1 : 0)
 				act(() => endSnapshot(snapshot))
 				expect(vi.getTimerCount()).toBe(0)
 				expect(result.current.clineMessages).toEqual([])
-				expect(result.current.clineMessagesSeq).toBe(0)
+				expect(result.current.clineMessagesSeq).toBe(initialState.currentTaskId ? 0 : undefined)
 			})
 		})
 
@@ -1176,18 +1256,23 @@ describe("ExtensionStateContext", () => {
 					clineMessages: [],
 					clineMessagesSeq: 0,
 				})
-				expect(postMessage.mock.calls).toEqual([
-					[{ type: "requestClineMessagesResync", taskId, expectedSeq: 1, receivedSeq: 1 }],
-				])
+				expect(postMessage.mock.calls).toEqual(
+					nextTaskId === null
+						? []
+						: [[{ type: "requestClineMessagesResync", taskId, expectedSeq: 1, receivedSeq: 1 }]],
+				)
 				postMessage.mockClear()
 
+				// Transcript delivery resumes only after a task becomes active again.
+				const activeTaskId = nextTaskId ?? "task-2"
 				const updated = makeMessage(30, "updated at new position")
 				act(() => {
-					appendClineMessage(makeMessage(30, "reused timestamp"), 1, taskId)
-					updateClineMessage(updated, 2, taskId)
+					dispatchExtensionMessage({ type: "state", state: { currentTaskId: activeTaskId } })
+					appendClineMessage(makeMessage(30, "reused timestamp"), 1, activeTaskId)
+					updateClineMessage(updated, 2, activeTaskId)
 				})
 				expect(readTranscriptFields()).toEqual({
-					currentTaskId: nextTaskId,
+					currentTaskId: activeTaskId,
 					clineMessages: [updated],
 					clineMessagesSeq: 2,
 				})
@@ -2191,6 +2276,7 @@ describe("ExtensionStateContext", () => {
 		})
 
 		it("does not retain a pending transcript when the authoritative state clears the task", () => {
+			vi.useFakeTimers()
 			const postMessage = renderTranscriptWithPostMessageSpy({
 				clineMessages: [makeMessage(1, "existing")],
 				clineMessagesSeq: 1,
@@ -2202,10 +2288,9 @@ describe("ExtensionStateContext", () => {
 				appendSnapshotChunk({ taskId: undefined, clineMessagesSeq: 2, snapshotId: "pending" })
 			})
 
-			expect(postMessage).toHaveBeenCalledTimes(1)
-			expect(postMessage).toHaveBeenCalledWith(
-				expect.objectContaining({ type: "requestClineMessagesResync", taskId: undefined, receivedSeq: 2 }),
-			)
+			expect(vi.getTimerCount()).toBe(0)
+			act(() => vi.advanceTimersByTime(30_000))
+			expect(postMessage).not.toHaveBeenCalled()
 			expect(readTranscript()).toEqual({
 				currentTaskId: null,
 				currentTaskInstanceId: null,

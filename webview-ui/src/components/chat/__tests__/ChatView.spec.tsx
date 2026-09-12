@@ -354,7 +354,7 @@ vi.mock("@vscode/webview-ui-toolkit/react", () => ({
 const vscodePostMessageMock = mockVscodePostMessage(vi.mocked(vscode.postMessage))
 
 const mockPostMessage = (state: Record<string, unknown>) => {
-	hydrateExtensionState(makeExtensionState(state))
+	hydrateExtensionState(makeExtensionState({ currentTaskId: "test-task-id", ...state }))
 }
 
 const dispatchExtensionMessage = async (data: Record<string, unknown>) => {
@@ -794,6 +794,7 @@ describe("ChatView - Version Indicator Tests", () => {
 		// Hydrate state with no active task
 		mockPostMessage({
 			version: "1.0.0",
+			currentTaskId: null,
 			clineMessages: [],
 		})
 
@@ -815,6 +816,7 @@ describe("ChatView - Version Indicator Tests", () => {
 		// Hydrate state
 		mockPostMessage({
 			version: "1.0.0",
+			currentTaskId: null,
 			clineMessages: [],
 		})
 
@@ -849,6 +851,7 @@ describe("ChatView - Version Indicator Tests", () => {
 		// Hydrate state
 		mockPostMessage({
 			version: "1.0.0",
+			currentTaskId: null,
 			clineMessages: [],
 		})
 
@@ -874,6 +877,7 @@ describe("ChatView - Version Indicator Tests", () => {
 		// Hydrate state
 		mockPostMessage({
 			version: "1.0.0",
+			currentTaskId: null,
 			clineMessages: [],
 		})
 
@@ -914,6 +918,7 @@ describe("ChatView - Version Indicator Tests", () => {
 		// Hydrate state with no active task
 		mockPostMessage({
 			version: "1.0.0",
+			currentTaskId: null,
 			clineMessages: [],
 		})
 
@@ -929,6 +934,7 @@ describe("ChatView - Welcome Screen Display Tests", () => {
 		const { getByTestId, queryByTestId } = renderChatView()
 
 		mockPostMessage({
+			currentTaskId: null,
 			cloudIsAuthenticated: false,
 			taskHistory: [
 				{ id: "1", ts: Date.now() - 6000 },
@@ -1017,17 +1023,10 @@ describe("ChatView - Message Queueing Tests", () => {
 	it("shows sending is enabled when no task is active", async () => {
 		const { getByTestId } = renderChatView()
 
-		// Hydrate state with completed task
+		// Hydrate the authoritative no-task state.
 		mockPostMessage({
-			clineMessages: [
-				{
-					type: "ask",
-					ask: "completion_result",
-					ts: Date.now(),
-					text: "Task completed",
-					partial: false,
-				},
-			],
+			currentTaskId: null,
+			clineMessages: [],
 		})
 
 		// Wait for state to be updated

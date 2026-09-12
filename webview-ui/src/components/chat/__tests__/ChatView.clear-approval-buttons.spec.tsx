@@ -105,6 +105,7 @@ const RESTORE_CHANGES_BUTTON_LABEL = "chat:restoreChanges.title"
 const hydrateState = (clineMessages: ClineMessage[]) => {
 	hydrateExtensionState({
 		version: "1.0.0",
+		currentTaskId: "test-task-id",
 		clineMessages,
 		taskHistory: [],
 		shouldShowAnnouncement: false,

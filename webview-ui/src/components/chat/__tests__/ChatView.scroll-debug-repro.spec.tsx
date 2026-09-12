@@ -222,6 +222,7 @@ const resolveFollowOutput = (isAtBottom: boolean): "auto" | false => {
 const postState = (clineMessages: ClineMessage[]) => {
 	hydrateExtensionState({
 		version: "1.0.0",
+		currentTaskId: "test-task-id",
 		clineMessages,
 		taskHistory: [],
 		shouldShowAnnouncement: false,
