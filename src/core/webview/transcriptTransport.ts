@@ -97,14 +97,15 @@ export function reduceTranscriptTransport(
 	switch (action.type) {
 		case "enqueue": {
 			const { request, total, focusedTaskId, focusedTaskInstanceId } = action
-			if (request.kind !== "snapshot" && total === 0) return result
+			const snapshot = request.kind === "snapshot"
+			if (!snapshot && total === 0) return result
 			if (!isTranscriptRequestCurrent(state, request, focusedTaskId, focusedTaskInstanceId)) return result
 			const sequences = new Map(state.sequences)
 			const seq = request.taskId
-				? (sequences.get(request.taskId) ?? 0) + (request.kind !== "snapshot" || request.bumpSeq ? 1 : 0)
+				? (sequences.get(request.taskId) ?? 0) + (!snapshot || request.bumpSeq ? 1 : 0)
 				: 0
 			if (request.taskId) sequences.set(request.taskId, seq)
-			const nextSnapshotId = state.nextSnapshotId + (request.kind === "snapshot" ? 1 : 0)
+			const nextSnapshotId = state.nextSnapshotId + (snapshot ? 1 : 0)
 			const job: TranscriptJob = {
 				id: state.nextJobId + 1,
 				generation: state.generation,
@@ -113,7 +114,7 @@ export function reduceTranscriptTransport(
 				seq,
 				kind: request.kind,
 				total,
-				...(request.kind === "snapshot" ? { snapshotId: `${request.taskId ?? "none"}:${nextSnapshotId}` } : {}),
+				...(snapshot ? { snapshotId: `${request.taskId ?? "none"}:${nextSnapshotId}` } : {}),
 			}
 			result.accepted = job
 			result.state = { ...state, sequences, nextSnapshotId, nextJobId: job.id, queue: [...state.queue, job] }
@@ -182,29 +183,38 @@ export function reduceTranscriptTransport(
 	}
 }
 
+const transcriptMessageTypes = {
+	append: "clineMessageAppended",
+	update: "clineMessageUpdated",
+	start: "clineMessagesSnapshotStart",
+	chunk: "clineMessagesSnapshotChunk",
+	end: "clineMessagesSnapshotEnd",
+} as const satisfies Record<TranscriptFrame["phase"], ExtensionMessage["type"]>
+
 export function transcriptFrameMessage(frame: TranscriptFrame, messages: readonly ClineMessage[]): ExtensionMessage {
 	const { job, phase } = frame
-	const common = { taskId: job.taskId, taskInstanceId: job.taskInstanceId, clineMessagesSeq: job.seq }
+	const common = {
+		type: transcriptMessageTypes[phase],
+		taskId: job.taskId,
+		taskInstanceId: job.taskInstanceId,
+		clineMessagesSeq: job.seq,
+	}
 	if (phase === "append" || phase === "update") {
 		return {
 			...common,
-			type: phase === "append" ? "clineMessageAppended" : "clineMessageUpdated",
 			clineMessage: messages[0],
 		}
 	}
+	const snapshot = { ...common, snapshotId: job.snapshotId }
 	if (phase === "chunk") {
 		return {
-			...common,
-			type: "clineMessagesSnapshotChunk",
-			snapshotId: job.snapshotId,
+			...snapshot,
 			snapshotStartIndex: frame.start,
 			clineMessages: messages.slice(frame.start, frame.start + frame.count),
 		}
 	}
 	return {
-		...common,
-		type: phase === "start" ? "clineMessagesSnapshotStart" : "clineMessagesSnapshotEnd",
-		snapshotId: job.snapshotId,
+		...snapshot,
 		snapshotTotal: job.total,
 	}
 }

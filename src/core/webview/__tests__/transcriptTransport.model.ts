@@ -836,7 +836,7 @@ export const TRANSPORT_MUTATIONS: Mutation[] = [
 	},
 ]
 
-export function checkTranscriptTransportModel() {
+export function checkTranscriptTransportScenarios() {
 	const results = TRANSPORT_SCENARIOS.map((scenario) => ({
 		name: scenario.name,
 		...exploreTranscriptTransport(scenario),
@@ -852,23 +852,31 @@ export function checkTranscriptTransportModel() {
 	for (const action of TRANSPORT_ACTIONS) requireInvariant(actions.has(action), `unreachable action: ${action}`)
 	for (const landmark of Object.keys(TRANSPORT_LANDMARKS))
 		requireInvariant(landmarks.has(landmark), `unreachable landmark: ${landmark}`)
-	const counterexamples = TRANSPORT_MUTATIONS.map((mutation) => {
-		const failures = TRANSPORT_SCENARIOS.map((scenario) => ({
-			scenario: scenario.name,
-			...exploreTranscriptTransport(scenario, mutation.reduce, TRANSPORT_MODEL_BOUNDS, mutation),
-		})).filter((result) => result.violation)
-		const result = failures.sort((a, b) => a.witness!.length - b.witness!.length)[0]
-		requireInvariant(result, `${mutation.name}: expected a counterexample`)
-		requireInvariant(
-			result.violation === mutation.expected,
-			`${mutation.name}: expected ${mutation.expected}; got ${result.violation}`,
-		)
-		return {
-			name: mutation.name,
-			scenario: result.scenario,
-			violation: result.violation,
-			trace: result.witness!.map((entry) => entry.event),
-		}
-	})
-	return { results, actions: [...actions].sort(), landmarks: [...landmarks].sort(), counterexamples }
+	return { results, actions: [...actions].sort(), landmarks: [...landmarks].sort() }
+}
+
+export function checkTranscriptTransportMutation(mutation: Mutation) {
+	const failures = TRANSPORT_SCENARIOS.map((scenario) => ({
+		scenario: scenario.name,
+		...exploreTranscriptTransport(scenario, mutation.reduce, TRANSPORT_MODEL_BOUNDS, mutation),
+	})).filter((result) => result.violation)
+	const result = failures.sort((a, b) => a.witness!.length - b.witness!.length)[0]
+	requireInvariant(result, `${mutation.name}: expected a counterexample`)
+	requireInvariant(
+		result.violation === mutation.expected,
+		`${mutation.name}: expected ${mutation.expected}; got ${result.violation}`,
+	)
+	return {
+		name: mutation.name,
+		scenario: result.scenario,
+		violation: result.violation,
+		trace: result.witness!.map((entry) => entry.event),
+	}
+}
+
+export function checkTranscriptTransportModel() {
+	return {
+		...checkTranscriptTransportScenarios(),
+		counterexamples: TRANSPORT_MUTATIONS.map(checkTranscriptTransportMutation),
+	}
 }

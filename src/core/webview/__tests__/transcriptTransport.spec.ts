@@ -7,7 +7,8 @@ import {
 	type TranscriptFrame,
 } from "../transcriptTransport"
 import {
-	checkTranscriptTransportModel,
+	checkTranscriptTransportMutation,
+	checkTranscriptTransportScenarios,
 	exploreTranscriptTransport,
 	TRANSPORT_ACTIONS,
 	TRANSPORT_LANDMARKS,
@@ -16,12 +17,20 @@ import {
 } from "./transcriptTransport.model"
 
 describe("transcript transport bounded model", () => {
-	test("exhausts all scenarios, actions and landmarks and rejects every mutant", () => {
-		const result = checkTranscriptTransportModel()
+	test("exhausts all scenarios, actions and landmarks", () => {
+		const result = checkTranscriptTransportScenarios()
 		expect(result.results).toHaveLength(TRANSPORT_SCENARIOS.length)
 		expect(result.actions).toEqual([...TRANSPORT_ACTIONS].sort())
 		expect(result.landmarks).toEqual(Object.keys(TRANSPORT_LANDMARKS).sort())
-		expect(result.counterexamples).toHaveLength(TRANSPORT_MUTATIONS.length)
+	})
+
+	// Keep every scenario and fault, but give each exhaustive fault search its own test timeout.
+	test.each(TRANSPORT_MUTATIONS)("rejects $name with its shortest counterexample", (mutation) => {
+		const result = checkTranscriptTransportMutation(mutation)
+		expect(result.name).toBe(mutation.name)
+		expect(result.violation).toBe(mutation.expected)
+		expect(result.trace[0]).toBe("initial")
+		expect(result.trace.length).toBeGreaterThan(1)
 	})
 
 	test("fails closed on depth and state truncation", () => {
