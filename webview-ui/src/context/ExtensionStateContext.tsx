@@ -424,6 +424,7 @@ export const ExtensionStateContextProvider: React.FC<{
 			const seq = message.clineMessagesSeq as number
 			const clineMessage = message.clineMessage
 			if (
+				activeTaskIdRef.current === undefined ||
 				message.taskId !== activeTaskIdRef.current ||
 				message.taskInstanceId !== activeTaskInstanceIdRef.current
 			) {
@@ -617,6 +618,7 @@ export const ExtensionStateContextProvider: React.FC<{
 				}
 				case "clineMessagesSnapshotStart": {
 					if (
+						activeTaskIdRef.current === undefined ||
 						message.taskId !== activeTaskIdRef.current ||
 						message.taskInstanceId !== activeTaskInstanceIdRef.current
 					) {
@@ -660,6 +662,7 @@ export const ExtensionStateContextProvider: React.FC<{
 				}
 				case "clineMessagesSnapshotChunk": {
 					if (
+						activeTaskIdRef.current === undefined ||
 						message.taskId !== activeTaskIdRef.current ||
 						message.taskInstanceId !== activeTaskInstanceIdRef.current
 					) {
@@ -706,6 +709,7 @@ export const ExtensionStateContextProvider: React.FC<{
 				}
 				case "clineMessagesSnapshotEnd": {
 					if (
+						activeTaskIdRef.current === undefined ||
 						message.taskId !== activeTaskIdRef.current ||
 						message.taskInstanceId !== activeTaskInstanceIdRef.current
 					) {

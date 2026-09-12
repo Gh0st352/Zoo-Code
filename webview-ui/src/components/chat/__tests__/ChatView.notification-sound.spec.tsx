@@ -169,6 +169,7 @@ vi.mock("../ChatTextArea", () => {
 const mockPostMessage = (state: Partial<ExtensionState>) => {
 	hydrateExtensionState({
 		version: "1.0.0",
+		currentTaskId: "test-task-id",
 		clineMessages: [],
 		taskHistory: [],
 		shouldShowAnnouncement: false,
