@@ -1928,8 +1928,8 @@ describe("ExtensionStateContext", () => {
 				appendSnapshotChunk()
 			})
 
-			expect(postMessage).toHaveBeenCalledTimes(2)
-			expect(postMessage.mock.calls.map(([message]) => message.receivedSeq)).toEqual([undefined, 2])
+			expect(postMessage).toHaveBeenCalledTimes(1)
+			expect(postMessage.mock.calls.map(([message]) => message.receivedSeq)).toEqual([undefined])
 		})
 
 		it.each([
@@ -2057,8 +2057,8 @@ describe("ExtensionStateContext", () => {
 				appendSnapshotChunk()
 			})
 
-			expect(postMessage).toHaveBeenCalledTimes(2)
-			expect(postMessage.mock.calls.map(([message]) => message.receivedSeq)).toEqual([undefined, 2])
+			expect(postMessage).toHaveBeenCalledTimes(1)
+			expect(postMessage.mock.calls.map(([message]) => message.receivedSeq)).toEqual([undefined])
 		})
 
 		it.each([
@@ -2463,6 +2463,98 @@ describe("ExtensionStateContext", () => {
 			}
 		})
 
+		it.each([
+			{ name: "an invalid start sequence", fail: () => startSnapshot({ clineMessagesSeq: "invalid" }) },
+			{ name: "invalid start metadata", fail: () => startSnapshot({ snapshotTotal: -1 }) },
+			{ name: "an invalid chunk sequence", fail: () => appendSnapshotChunk({ clineMessagesSeq: "invalid" }) },
+			{ name: "a noncontiguous chunk", fail: () => appendSnapshotChunk({ snapshotStartIndex: 1 }) },
+			{ name: "an invalid end sequence", fail: () => endSnapshot({ clineMessagesSeq: "invalid" }) },
+			{ name: "an incomplete end", fail: () => endSnapshot() },
+			{ name: "an interleaved delta", fail: () => appendClineMessage(makeMessage(3, "gap"), 3, "task-1") },
+			{ name: "a snapshot timeout", fail: () => vi.advanceTimersByTime(30_000) },
+		])("coalesces orphaned snapshot frames after $name and retries a new failed attempt", ({ fail }) => {
+			vi.useFakeTimers()
+			const existing = makeMessage(1, "existing")
+			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessages: [existing], clineMessagesSeq: 1 })
+
+			act(() => {
+				appendClineMessage(makeMessage(3, "initial gap"), 3, "task-1")
+				startSnapshot()
+				fail()
+			})
+			expect(postMessage).toHaveBeenCalledTimes(2)
+
+			act(() => {
+				for (let index = 0; index < 3; index++) {
+					startSnapshot({ clineMessagesSeq: "invalid" })
+					startSnapshot({ snapshotTotal: -1 })
+					appendSnapshotChunk()
+					appendSnapshotChunk({ clineMessagesSeq: "invalid" })
+					endSnapshot()
+					endSnapshot({ clineMessagesSeq: "invalid" })
+					appendClineMessage(makeMessage(3, "still pending"), 3, "task-1")
+				}
+			})
+			expect(postMessage).toHaveBeenCalledTimes(2)
+			expect(vi.getTimerCount()).toBe(1)
+			expect(readTranscriptFields()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: [existing],
+				clineMessagesSeq: 1,
+			})
+
+			act(() => {
+				startSnapshot({ snapshotId: "replacement" })
+				appendSnapshotChunk({ snapshotId: "replacement", snapshotStartIndex: 1 })
+				endSnapshot({ snapshotId: "replacement" })
+			})
+			expect(postMessage).toHaveBeenCalledTimes(3)
+			expect(postMessage).toHaveBeenLastCalledWith({
+				type: "requestClineMessagesResync",
+				taskId: "task-1",
+				expectedSeq: 2,
+				receivedSeq: 2,
+			})
+
+			const recovered = makeMessage(2, "recovered")
+			const appended = makeMessage(3, "after recovery")
+			act(() => {
+				startSnapshot({ snapshotId: "recovery" })
+				appendSnapshotChunk({ snapshotId: "recovery", clineMessages: [recovered] })
+				endSnapshot({ snapshotId: "recovery" })
+				appendClineMessage(appended, 3, "task-1")
+			})
+			expect(postMessage).toHaveBeenCalledTimes(3)
+			expect(vi.getTimerCount()).toBe(0)
+			expect(readTranscriptFields()).toEqual({
+				currentTaskId: "task-1",
+				clineMessages: [recovered, appended],
+				clineMessagesSeq: 3,
+			})
+		})
+
+		it("coalesces orphaned frames without extending the lost-response timeout", () => {
+			vi.useFakeTimers()
+			const postMessage = renderTranscriptWithPostMessageSpy({ clineMessagesSeq: 1 })
+
+			act(() => appendSnapshotChunk())
+			expect(postMessage).toHaveBeenCalledTimes(1)
+			act(() => {
+				vi.advanceTimersByTime(4_999)
+				startSnapshot({ snapshotTotal: -1 })
+				appendSnapshotChunk()
+				endSnapshot()
+			})
+			expect(postMessage).toHaveBeenCalledTimes(1)
+			act(() => {
+				vi.advanceTimersByTime(1)
+				endSnapshot()
+				appendSnapshotChunk()
+			})
+			expect(postMessage).toHaveBeenCalledTimes(2)
+			expect(vi.getTimerCount()).toBe(1)
+		})
+
 		it("allows another resync when a response is lost", async () => {
 			vi.useFakeTimers()
 			const postMessage = vi.spyOn(vscode, "postMessage").mockImplementation(() => undefined)
@@ -2730,7 +2822,6 @@ describe("ExtensionStateContext", () => {
 					[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 2, receivedSeq: 2 }],
 					[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 2, receivedSeq: 4 }],
 					[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 2, receivedSeq: 5 }],
-					[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 2, receivedSeq: 6 }],
 					[{ type: "requestClineMessagesResync", taskId: "task-1", expectedSeq: 2, receivedSeq: 7 }],
 				])
 				expect(readTranscriptFields()).toEqual({
@@ -2790,6 +2881,50 @@ describe("ExtensionStateContext", () => {
 			} finally {
 				postMessage.mockRestore()
 			}
+		})
+
+		it.each(["metadata", "options"] as const)("hydrates instance-scoped snapshots from %s", (source) => {
+			vi.useFakeTimers()
+			const existing = makeMessage(1, "existing")
+			const hydrated = makeMessage(2, "hydrated")
+			const postMessage = renderTranscriptWithPostMessageSpy({
+				currentTaskInstanceId: "instance-1",
+				clineMessages: [existing],
+				clineMessagesSeq: 1,
+			})
+			const scope = { currentTaskId: "task-1", currentTaskInstanceId: "instance-1" }
+			const metadata = source === "metadata" ? scope : {}
+			const options = source === "options" ? { taskId: "task-1", taskInstanceId: "instance-1" } : {}
+
+			act(() => hydrateExtensionState({ ...metadata, clineMessages: [hydrated], clineMessagesSeq: 2 }, options))
+			expect(readScopedTranscriptFields()).toEqual({ ...scope, clineMessages: [hydrated], clineMessagesSeq: 2 })
+			act(() => hydrateExtensionState({ ...metadata, clineMessages: [], clineMessagesSeq: 3 }, options))
+			expect(readScopedTranscriptFields()).toEqual({ ...scope, clineMessages: [], clineMessagesSeq: 3 })
+			expect(postMessage).not.toHaveBeenCalled()
+			expect(vi.getTimerCount()).toBe(0)
+		})
+
+		it("prefers the explicit snapshot instance override over metadata", () => {
+			const dispatch = vi.spyOn(window, "dispatchEvent")
+			hydrateExtensionState(
+				{
+					currentTaskId: "task-1",
+					currentTaskInstanceId: "metadata-instance",
+					clineMessages: [makeMessage(1, "snapshot")],
+				},
+				{ taskInstanceId: "override-instance" },
+			)
+
+			expect(
+				dispatch.mock.calls.map(([event]) => (event instanceof MessageEvent ? event.data : undefined)),
+			).toEqual([
+				{ type: "state", state: { currentTaskId: "task-1", currentTaskInstanceId: "metadata-instance" } },
+				...(
+					["clineMessagesSnapshotStart", "clineMessagesSnapshotChunk", "clineMessagesSnapshotEnd"] as const
+				).map((type) =>
+					expect.objectContaining({ type, taskId: "task-1", taskInstanceId: "override-instance" }),
+				),
+			])
 		})
 
 		it("hydrates metadata, non-empty transcripts, and empty transcripts through shared helpers", () => {

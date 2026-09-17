@@ -45,10 +45,11 @@ export const dispatchExtensionMessage = (message: ExtensionMessage) => {
 
 export const hydrateExtensionState = (
 	state: Partial<ExtensionState>,
-	options: { taskId?: string; clineMessagesSeq?: number } = {},
+	options: { taskId?: string; taskInstanceId?: string; clineMessagesSeq?: number } = {},
 ) => {
 	const { clineMessages, clineMessagesSeq: stateSeq, ...metadataState } = state
 	const taskId = options.taskId ?? metadataState.currentTaskId ?? undefined
+	const taskInstanceId = options.taskInstanceId ?? metadataState.currentTaskInstanceId ?? undefined
 	const clineMessagesSeq = options.clineMessagesSeq ?? stateSeq ?? 0
 
 	dispatchExtensionMessage({
@@ -64,6 +65,7 @@ export const hydrateExtensionState = (
 	dispatchExtensionMessage({
 		type: "clineMessagesSnapshotStart",
 		taskId,
+		taskInstanceId,
 		clineMessagesSeq,
 		snapshotId,
 		snapshotTotal: clineMessages.length,
@@ -73,6 +75,7 @@ export const hydrateExtensionState = (
 		dispatchExtensionMessage({
 			type: "clineMessagesSnapshotChunk",
 			taskId,
+			taskInstanceId,
 			clineMessagesSeq,
 			snapshotId,
 			snapshotStartIndex: 0,
@@ -83,6 +86,7 @@ export const hydrateExtensionState = (
 	dispatchExtensionMessage({
 		type: "clineMessagesSnapshotEnd",
 		taskId,
+		taskInstanceId,
 		clineMessagesSeq,
 		snapshotId,
 		snapshotTotal: clineMessages.length,

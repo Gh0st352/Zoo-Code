@@ -393,11 +393,16 @@ export const ExtensionStateContextProvider: React.FC<{
 
 	const retryClineMessagesResync = useCallback(
 		(receivedSeq?: number) => {
-			clearClineMessagesResync()
+			// Only a failed accepted snapshot retires the pending recovery attempt.
+			// Its orphaned frames must share the next request instead of each retrying.
+			if (activeSnapshotRef.current) {
+				clearClineMessagesSnapshot()
+				clearClineMessagesResync()
+			}
 			requestClineMessagesResync(receivedSeq)
 		},
-		// Stryker disable next-line ArrayDeclaration: both dependencies are stable callbacks; omitting them cannot alter callback identity or captured values.
-		[clearClineMessagesResync, requestClineMessagesResync],
+		// Stryker disable next-line ArrayDeclaration: the dependencies are stable callbacks; omitting them cannot alter callback identity or captured values.
+		[clearClineMessagesSnapshot, clearClineMessagesResync, requestClineMessagesResync],
 	)
 
 	const startClineMessagesSnapshotTimeout = useCallback(
@@ -410,7 +415,6 @@ export const ExtensionStateContextProvider: React.FC<{
 				if (snapshot?.snapshotId !== snapshotId || snapshot.seq !== seq) {
 					return
 				}
-				activeSnapshotRef.current = null
 				snapshotTimeoutRef.current = undefined
 				retryClineMessagesResync(seq)
 			}, CLINE_MESSAGES_SNAPSHOT_TIMEOUT_MS)
@@ -442,7 +446,6 @@ export const ExtensionStateContextProvider: React.FC<{
 				if (seq <= snapshot.seq) {
 					return
 				}
-				clearClineMessagesSnapshot()
 				retryClineMessagesResync(seq)
 				return
 			}
@@ -478,7 +481,7 @@ export const ExtensionStateContextProvider: React.FC<{
 			}))
 		},
 		// Stryker disable next-line ArrayDeclaration: the index and callbacks are stable; an empty dependency list produces the same closure for the provider lifetime.
-		[clearClineMessagesSnapshot, clineMessagesIndex, requestClineMessagesResync, retryClineMessagesResync],
+		[clineMessagesIndex, requestClineMessagesResync, retryClineMessagesResync],
 	)
 
 	const handleMessage = useCallback(
@@ -627,7 +630,6 @@ export const ExtensionStateContextProvider: React.FC<{
 
 					const seq = message.clineMessagesSeq as number
 					if (!Number.isSafeInteger(seq) || seq < 0) {
-						clearClineMessagesSnapshot()
 						retryClineMessagesResync(typeof seq === "number" ? seq : undefined)
 						break
 					}
@@ -637,7 +639,6 @@ export const ExtensionStateContextProvider: React.FC<{
 
 					const total = message.snapshotTotal as number
 					if (!message.snapshotId || !Number.isSafeInteger(total) || total < 0) {
-						clearClineMessagesSnapshot()
 						retryClineMessagesResync(seq)
 						break
 					}
@@ -672,7 +673,6 @@ export const ExtensionStateContextProvider: React.FC<{
 					const seq = message.clineMessagesSeq as number
 					const snapshot = activeSnapshotRef.current
 					if (!Number.isSafeInteger(seq) || seq < 0) {
-						clearClineMessagesSnapshot()
 						retryClineMessagesResync(typeof seq === "number" ? seq : undefined)
 						break
 					}
@@ -684,7 +684,6 @@ export const ExtensionStateContextProvider: React.FC<{
 					}
 					if (message.snapshotId !== snapshot.snapshotId || seq !== snapshot.seq) {
 						if (seq > snapshot.seq) {
-							clearClineMessagesSnapshot()
 							retryClineMessagesResync(seq)
 						}
 						break
@@ -699,7 +698,6 @@ export const ExtensionStateContextProvider: React.FC<{
 						startIndex !== snapshot.messages.length ||
 						snapshot.messages.length + chunk.length > snapshot.total
 					) {
-						clearClineMessagesSnapshot()
 						retryClineMessagesResync(seq)
 						break
 					}
@@ -719,7 +717,6 @@ export const ExtensionStateContextProvider: React.FC<{
 					const seq = message.clineMessagesSeq as number
 					const snapshot = activeSnapshotRef.current
 					if (!Number.isSafeInteger(seq) || seq < 0) {
-						clearClineMessagesSnapshot()
 						retryClineMessagesResync(typeof seq === "number" ? seq : undefined)
 						break
 					}
@@ -731,13 +728,11 @@ export const ExtensionStateContextProvider: React.FC<{
 					}
 					if (message.snapshotId !== snapshot.snapshotId || seq !== snapshot.seq) {
 						if (seq > snapshot.seq) {
-							clearClineMessagesSnapshot()
 							retryClineMessagesResync(seq)
 						}
 						break
 					}
 					if (message.snapshotTotal !== snapshot.total || snapshot.messages.length !== snapshot.total) {
-						clearClineMessagesSnapshot()
 						retryClineMessagesResync(seq)
 						break
 					}
