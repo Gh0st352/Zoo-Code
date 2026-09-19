@@ -2852,6 +2852,8 @@ describe("Cline", () => {
 				task: "test task",
 				startTask: false,
 			})
+			// Settle constructor state reads before observing transport errors or losing the provider.
+			await Promise.all([task.waitForModeInitialization(), task.waitForApiConfigInitialization()])
 			const taskAccess = getTaskTestAccess(task)
 			const saveSpy = vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
 			const messageListener = vi.fn()
@@ -2863,14 +2865,17 @@ describe("Cline", () => {
 			task.on(RooCodeEventName.Message, messageListener)
 			const message = { ts: 1, type: "say" as const, say: "text" as const, text: "message" }
 
-			await expect(taskAccess.addToClineMessages(message)).resolves.toBeUndefined()
+			try {
+				await expect(taskAccess.addToClineMessages(message)).resolves.toBeUndefined()
 
-			expect(consoleErrorSpy).not.toHaveBeenCalled()
-			expect(task.clineMessages).toEqual([message])
-			expect(messageListener).toHaveBeenCalledWith({ action: "created", message })
-			expect(saveSpy).toHaveBeenCalledOnce()
-
-			consoleErrorSpy.mockRestore()
+				expect(consoleErrorSpy).not.toHaveBeenCalled()
+				expect(task.clineMessages).toEqual([message])
+				expect(messageListener).toHaveBeenCalledWith({ action: "created", message })
+				expect(saveSpy).toHaveBeenCalledOnce()
+				expect(mockProvider.postClineMessageAppended).not.toHaveBeenCalled()
+			} finally {
+				consoleErrorSpy.mockRestore()
+			}
 		})
 
 		it("waits for an incremental append before emitting the message", async () => {
@@ -3637,7 +3642,7 @@ describe("Cline", () => {
 					})
 					const taskAccess = getTaskTestAccess(task)
 					const saveSpy = vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
-					vi.spyOn(taskAccess, "safeEnsureModelFetched").mockResolvedValue(undefined)
+					vi.spyOn(taskAccess, "safeEnsureModelFetched").mockResolvedValue(stubModelInfo)
 					vi.spyOn(task.diffViewProvider, "reset").mockResolvedValue(undefined)
 					vi.spyOn(task, "abortTask").mockResolvedValue(undefined)
 					vi.spyOn(task.api, "getModel").mockReturnValue({
@@ -3701,7 +3706,7 @@ describe("Cline", () => {
 					})
 					const taskAccess = getTaskTestAccess(task)
 					const saveSpy = vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
-					vi.spyOn(taskAccess, "safeEnsureModelFetched").mockResolvedValue(undefined)
+					vi.spyOn(taskAccess, "safeEnsureModelFetched").mockResolvedValue(stubModelInfo)
 					vi.spyOn(task.diffViewProvider, "reset").mockResolvedValue(undefined)
 					vi.spyOn(task, "abortTask").mockResolvedValue(undefined)
 					vi.spyOn(task.api, "getModel").mockReturnValue({
@@ -4591,7 +4596,7 @@ describe("Cline", () => {
 			})
 			vi.spyOn(task.diffViewProvider, "reset").mockResolvedValue(undefined as never)
 			vi.spyOn(taskAccess, "addToApiConversationHistory").mockResolvedValue(undefined)
-			vi.spyOn(taskAccess, "safeEnsureModelFetched").mockResolvedValue(undefined)
+			vi.spyOn(taskAccess, "safeEnsureModelFetched").mockResolvedValue(stubModelInfo)
 			vi.spyOn(task.api, "getModel").mockReturnValue({
 				id: mockApiConfig.apiModelId!,
 				info: {
