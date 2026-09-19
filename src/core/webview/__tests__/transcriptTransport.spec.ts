@@ -58,6 +58,36 @@ describe("transcript transport bounded model", () => {
 })
 
 describe("transcript transport reducer", () => {
+	test.each(["job", "generation", "phase", "start"] as const)("ignores a mismatched %s completion token", (field) => {
+		const admitted = reduceTranscriptTransport(createTranscriptTransportState(), {
+			type: "enqueue",
+			request: { kind: "snapshot", taskId: "a" },
+			total: 1,
+			focusedTaskId: "a",
+		})
+		const sent = reduceTranscriptTransport(admitted.state, { type: "pump", focusedTaskId: "a" })
+		const frame = structuredClone(sent.post!)
+		if (field === "job") frame.job.id++
+		if (field === "generation") frame.job.generation++
+		if (field === "phase") frame.phase = "end"
+		if (field === "start") frame.start++
+		for (const success of [true, false]) {
+			const ignored = reduceTranscriptTransport(sent.state, { type: "settle", frame, success })
+			expect(ignored).toEqual({ state: sent.state, release: [], settle: [] })
+			expect(ignored.state).toBe(sent.state)
+		}
+	})
+
+	test("closed pump and repeated boundaries are no-ops", () => {
+		const open = createTranscriptTransportState()
+		expect(reduceTranscriptTransport(open, { type: "reopen" }).state).toBe(open)
+		const closed = reduceTranscriptTransport(open, { type: "shutdown" }).state
+		expect(reduceTranscriptTransport(closed, { type: "shutdown" }).state).toBe(closed)
+		const pump = reduceTranscriptTransport(closed, { type: "pump", focusedTaskId: undefined })
+		expect(pump).toEqual({ state: closed, release: [], settle: [] })
+		expect(pump.state).toBe(closed)
+	})
+
 	test.each(["append", "update"] as const)("rejects an empty %s without allocating protocol state", (kind) => {
 		const state = createTranscriptTransportState()
 		const focus = { focusedTaskId: "a", focusedTaskInstanceId: "instance-1" }
@@ -119,7 +149,11 @@ describe("transcript transport reducer", () => {
 			let state = admitted.state
 			for (let index = 0; index < completedFrames; index++) {
 				state = reduceTranscriptTransport(state, { type: "pump", ...oldFocus }).state
-				state = reduceTranscriptTransport(state, { type: "settle", success: true }).state
+				state = reduceTranscriptTransport(state, {
+					type: "settle",
+					frame: state.inFlight!,
+					success: true,
+				}).state
 			}
 			const current = reduceTranscriptTransport(state, {
 				type: "enqueue",
@@ -138,7 +172,14 @@ describe("transcript transport reducer", () => {
 
 	test.each([true, false])("ignores settlement without a physical send (success=%s)", (success) => {
 		const state = createTranscriptTransportState()
-		const transition = reduceTranscriptTransport(state, { type: "settle", success })
+		const admitted = reduceTranscriptTransport(state, {
+			type: "enqueue",
+			request: { kind: "append", taskId: "a" },
+			total: 1,
+			focusedTaskId: "a",
+		})
+		const frame: TranscriptFrame = { job: admitted.accepted!, phase: "append", start: 0, count: 0 }
+		const transition = reduceTranscriptTransport(state, { type: "settle", frame, success })
 		expect(transition).toEqual({ state, release: [], settle: [] })
 		expect(transition.state).toBe(state)
 	})
@@ -153,7 +194,7 @@ describe("transcript transport reducer", () => {
 		let state = admitted.state
 		if (location === "active") {
 			state = reduceTranscriptTransport(state, { type: "pump", focusedTaskId: "a" }).state
-			state = reduceTranscriptTransport(state, { type: "settle", success: true }).state
+			state = reduceTranscriptTransport(state, { type: "settle", frame: state.inFlight!, success: true }).state
 		}
 		// Adversarial reducer input: normal invalidation also releases this work. Keep
 		// the pre-send guard defensive if stale ownership ever reaches this boundary.
@@ -207,7 +248,11 @@ describe("transcript transport reducer", () => {
 			const transition = reduceTranscriptTransport(state, { type: "pump", focusedTaskId: "a" })
 			expect(transition.post).toBeDefined()
 			frames.push(transition.post!)
-			state = reduceTranscriptTransport(transition.state, { type: "settle", success: true }).state
+			state = reduceTranscriptTransport(transition.state, {
+				type: "settle",
+				frame: transition.post!,
+				success: true,
+			}).state
 		}
 
 		expect(state.queue).toEqual([])
@@ -226,6 +271,232 @@ describe("transcript transport reducer", () => {
 
 describe("transcript transport driver", () => {
 	const message: ClineMessage = { ts: 1, type: "say", text: "initial", images: ["image"] }
+
+	test.each(
+		(["start", "chunk", "end", "append", "update"] as const).flatMap((phase) =>
+			[true, false].map((success) => ({ phase, success })),
+		),
+	)(
+		"shutdown detaches held $phase and permits a fresh renderer (late success=$success)",
+		async ({ phase, success }) => {
+			const types = {
+				start: "clineMessagesSnapshotStart",
+				chunk: "clineMessagesSnapshotChunk",
+				end: "clineMessagesSnapshotEnd",
+				append: "clineMessageAppended",
+				update: "clineMessageUpdated",
+			} as const
+			let resolveOld!: () => void
+			let rejectOld!: (error: Error) => void
+			const oldPhysical = new Promise<void>((resolve, reject) => {
+				resolveOld = resolve
+				rejectOld = reject
+			})
+			const oldPost = vi.fn((frame: ExtensionMessage) =>
+				frame.type === types[phase] ? oldPhysical : Promise.resolve(),
+			)
+			const log = vi.fn()
+			const transport = new TranscriptTransport(
+				() => "a",
+				oldPost,
+				log,
+				() => "instance-1",
+			)
+			const resolved = vi.fn()
+			const rejected = vi.fn()
+			const active = transport
+				.enqueue(
+					{
+						kind: phase === "append" || phase === "update" ? phase : "snapshot",
+						taskId: "a",
+						taskInstanceId: "instance-1",
+						bumpSeq: true,
+					},
+					[message],
+				)
+				.then(resolved, rejected)
+			await vi.waitFor(() =>
+				expect(oldPost).toHaveBeenCalledWith(expect.objectContaining({ type: types[phase] })),
+			)
+			const waiting = ["append", "update", "snapshot"].map((kind) =>
+				transport.enqueue(
+					{ kind: kind as "append" | "update" | "snapshot", taskId: "a", taskInstanceId: "instance-1" },
+					[message],
+				),
+			)
+			const completion = transport["pendingSend"]!
+			const before = transport["state"]
+			const oldFrames = oldPost.mock.calls.length
+			transport.shutdown()
+			transport.shutdown()
+			await Promise.all([active, ...waiting])
+			expect(resolved).toHaveBeenCalledOnce()
+			expect(rejected).not.toHaveBeenCalled()
+			expect(completion.finish).toBeUndefined()
+			expect(transport["callbacks"]).toBeUndefined()
+			expect(transport["pendingSend"]).toBeUndefined()
+			expect(transport["payloads"].size).toBe(0)
+			expect(transport["callers"].size).toBe(0)
+			expect(transport["state"]).toMatchObject({
+				closed: true,
+				generation: before.generation + 1,
+				queue: [],
+				active: undefined,
+				inFlight: undefined,
+			})
+			expect(transport["state"].nextJobId).toBe(before.nextJobId)
+			expect(transport.getSequence("a")).toBe(before.sequences.get("a"))
+
+			let releaseNew!: () => void
+			const newPhysical = new Promise<void>((resolve) => {
+				releaseNew = resolve
+			})
+			const newPost = vi
+				.fn<(frame: ExtensionMessage) => Promise<void>>()
+				.mockReturnValueOnce(newPhysical)
+				.mockResolvedValue(undefined)
+			transport.reopen(
+				() => "a",
+				newPost,
+				log,
+				() => "instance-2",
+			)
+			const recovered = vi.fn()
+			const fresh = transport
+				.enqueue({ kind: "snapshot", taskId: "a", taskInstanceId: "instance-2" }, [message])
+				.then(recovered)
+			const delta = transport.enqueue({ kind: "append", taskId: "a", taskInstanceId: "instance-2" }, [message])
+			expect(newPost).toHaveBeenCalledOnce()
+			const newState = transport["state"]
+			expect(newState.inFlight?.job.id).toBe(before.nextJobId + 1)
+			expect(newState.inFlight?.job.snapshotId).toBe(`a:${before.nextSnapshotId + 1}`)
+			// A repeated reopen cannot replace callbacks or reset an already-live barrier.
+			transport.reopen(() => "b", oldPost, log)
+			if (success) resolveOld()
+			else rejectOld(new Error("dead renderer rejected"))
+			await oldPhysical.catch(() => {})
+			await Promise.resolve()
+			expect(transport["state"]).toBe(newState)
+			expect(recovered).not.toHaveBeenCalled()
+			expect(newPost).toHaveBeenCalledOnce()
+			expect(log).not.toHaveBeenCalled()
+			releaseNew()
+			await Promise.all([fresh, delta])
+			expect(resolved).toHaveBeenCalledOnce()
+			expect(recovered).toHaveBeenCalledOnce()
+			expect(oldPost).toHaveBeenCalledTimes(oldFrames)
+			expect(
+				newPost.mock.calls.map(([frame]) => [frame.type, frame.taskInstanceId, frame.clineMessagesSeq]),
+			).toEqual([
+				["clineMessagesSnapshotStart", "instance-2", before.sequences.get("a")],
+				["clineMessagesSnapshotChunk", "instance-2", before.sequences.get("a")],
+				["clineMessagesSnapshotEnd", "instance-2", before.sequences.get("a")],
+				["clineMessageAppended", "instance-2", before.sequences.get("a")! + 1],
+			])
+		},
+	)
+
+	test.each([true, false])(
+		"shutdown after invalidation settles the detached caller (success=%s)",
+		async (success) => {
+			let resolve!: () => void
+			let reject!: (error: Error) => void
+			const held = new Promise<void>((yes, no) => {
+				resolve = yes
+				reject = no
+			})
+			const log = vi.fn()
+			const transport = new TranscriptTransport(
+				() => undefined,
+				() => held,
+				log,
+			)
+			const settled = vi.fn()
+			const active = transport.enqueue({ kind: "snapshot", taskId: undefined }, []).then(settled)
+			transport.invalidate()
+			transport.shutdown()
+			await active
+			expect(settled).toHaveBeenCalledOnce()
+			if (success) resolve()
+			else reject(new Error("late failure"))
+			await held.catch(() => {})
+			const post = vi.fn<(frame: ExtensionMessage) => Promise<void>>().mockResolvedValue(undefined)
+			transport.reopen(() => undefined, post, log)
+			await transport.enqueue({ kind: "snapshot", taskId: undefined }, [])
+			expect(post.mock.calls.map(([frame]) => [frame.type, frame.snapshotId, frame.clineMessagesSeq])).toEqual([
+				["clineMessagesSnapshotStart", "none:2", 0],
+				["clineMessagesSnapshotEnd", "none:2", 0],
+			])
+			expect(log).not.toHaveBeenCalled()
+		},
+	)
+
+	test.each(["append", "update", "snapshot"] as const)(
+		"drops closed %s before capture and rejects old generations after reopen",
+		async (kind) => {
+			const focus = vi.fn(() => "a")
+			const post = vi.fn<(frame: ExtensionMessage) => Promise<void>>().mockResolvedValue(undefined)
+			const transport = new TranscriptTransport(focus, post, vi.fn())
+			const oldGeneration = transport.generation
+			transport.shutdown()
+			const closedState = transport["state"]
+			const clone = vi.spyOn(globalThis, "structuredClone")
+			try {
+				await transport.enqueue({ kind, taskId: "a" }, [message])
+				expect(focus).not.toHaveBeenCalled()
+				expect(transport["state"]).toBe(closedState)
+				transport.reopen(focus, post, vi.fn())
+				await transport.enqueue({ kind, taskId: "a", generation: oldGeneration }, [message])
+				await transport.enqueue({ kind, taskId: "a", generation: closedState.generation }, [message])
+				expect(clone).not.toHaveBeenCalled()
+				expect(post).not.toHaveBeenCalled()
+				await transport.enqueue({ kind, taskId: "a" }, [message])
+				expect(post).toHaveBeenCalled()
+			} finally {
+				clone.mockRestore()
+			}
+		},
+	)
+
+	test("does not adopt a reopened renderer if capture reenters shutdown", async () => {
+		const post = vi.fn<(frame: ExtensionMessage) => Promise<void>>().mockResolvedValue(undefined)
+		const transport = new TranscriptTransport(() => "a", post, vi.fn())
+		await transport.enqueue({ kind: "snapshot", taskId: "a" }, [
+			{
+				ts: 1,
+				type: "say",
+				get text() {
+					transport.shutdown()
+					transport.reopen(() => "a", post, vi.fn())
+					return "obsolete"
+				},
+			},
+		])
+		expect(post).not.toHaveBeenCalled()
+		expect(transport["state"].nextJobId).toBe(0)
+		await transport.enqueue({ kind: "append", taskId: "a" }, [message])
+		expect(post).toHaveBeenCalledOnce()
+	})
+
+	test("handles shutdown reentered by a physical post that then throws", async () => {
+		const log = vi.fn()
+		const freshPost = vi.fn<(frame: ExtensionMessage) => Promise<void>>().mockResolvedValue(undefined)
+		const transport = new TranscriptTransport(
+			() => "a",
+			() => {
+				transport.shutdown()
+				transport.reopen(() => "a", freshPost, log)
+				throw new Error("disposed synchronously")
+			},
+			log,
+		)
+		await transport.enqueue({ kind: "snapshot", taskId: "a" }, [message])
+		await transport.enqueue({ kind: "append", taskId: "a" }, [message])
+		expect(log).not.toHaveBeenCalled()
+		expect(freshPost).toHaveBeenCalledOnce()
+		expect(transport["payloads"].size).toBe(0)
+		expect(transport["callers"].size).toBe(0)
+	})
 
 	test.each(["append", "update"] as const)(
 		"rejects empty %s before cloning or admission, then recovers",

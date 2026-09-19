@@ -4,6 +4,7 @@ import os from "os"
 import crypto from "crypto"
 import { v7 as uuidv7 } from "uuid"
 import EventEmitter from "events"
+import { isDeepStrictEqual } from "util"
 
 import { AskIgnoredError } from "./AskIgnoredError"
 import { RateLimitClock, createRateLimitClock } from "./RateLimitClock"
@@ -206,6 +207,17 @@ type AssistantMessagePersistenceCancellation = {
 	resolve: () => void
 }
 
+/** A transcript and its derived task history are separate, non-transactional writes. */
+export class ClineMessagesPersistenceError extends Error {
+	constructor(
+		cause: unknown,
+		public readonly transcriptPersisted: boolean,
+	) {
+		super(cause instanceof Error ? cause.message : String(cause), { cause })
+		this.name = "ClineMessagesPersistenceError"
+	}
+}
+
 export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	readonly taskId: string
 	readonly rootTaskId?: string
@@ -347,6 +359,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	// LLM Messages & Chat Messages
 	apiConversationHistory: ApiMessage[] = []
 	clineMessages: ClineMessage[] = []
+	private clineMessagesSaveVersion = 0
+	private pendingClineMessageReplacements = 0
 
 	// Ask
 	private askResponse?: ClineAskResponse
@@ -1312,13 +1326,56 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	/**
 	 * Replaces the entire Cline message history, restores todo state, and persists.
 	 * Also resets cloud sync tracking to avoid re-syncing previously synced messages.
+	 * Rejects without publishing a snapshot on persistence failure. Only a failed
+	 * transcript write can restore the previous in-memory state, and only while no
+	 * newer save or mutation has superseded it. Metadata/history failures retain the
+	 * already-persisted replacement; these writes cannot be rolled back atomically.
 	 */
 	public async overwriteClineMessages(newMessages: ClineMessage[], persist = true) {
 		this.debouncedPostPartialMessageUpdate.cancel()
-		this.hydrateClineMessages(newMessages)
+		const previousMessages = this.clineMessages
+		const previousTodos = this.todoList
+		const previousCloudSyncedTimestamps = new Set(this.cloudSyncedMessageTimestamps)
+		// Give every replacement its own identity, even when a caller passes the live array.
+		this.hydrateClineMessages([...newMessages])
+		const replacement = this.clineMessages
 		if (persist) {
-			await this.saveClineMessages(false)
+			const replacementTodos = this.todoList
+			const snapshot = structuredClone({
+				messages: replacement,
+				todos: replacementTodos,
+				cloudSyncedTimestamps: this.cloudSyncedMessageTimestamps,
+			})
+			const saveVersion = this.clineMessagesSaveVersion + 1
+			// A previous pending replacement is not a safe rollback target: its own
+			// write may fail while this write is in flight. Keep live state in that case.
+			const canRestorePrevious = this.pendingClineMessageReplacements++ === 0
+			try {
+				await this.persistClineMessages(false)
+			} catch (error) {
+				if (
+					canRestorePrevious &&
+					error instanceof ClineMessagesPersistenceError &&
+					!error.transcriptPersisted &&
+					this.clineMessagesSaveVersion === saveVersion &&
+					this.clineMessages === replacement &&
+					this.todoList === replacementTodos &&
+					isDeepStrictEqual(this.clineMessages, snapshot.messages) &&
+					isDeepStrictEqual(this.todoList, snapshot.todos) &&
+					isDeepStrictEqual(this.cloudSyncedMessageTimestamps, snapshot.cloudSyncedTimestamps)
+				) {
+					this.clineMessages = previousMessages
+					this.todoList = previousTodos
+					this.cloudSyncedMessageTimestamps = previousCloudSyncedTimestamps
+				}
+				throw error
+			} finally {
+				this.pendingClineMessageReplacements--
+			}
 		}
+		// The provider snapshots live state. An older save must not publish a newer,
+		// still-pending replacement on its behalf (that replacement may fail).
+		if (this.clineMessages !== replacement) return
 		await this.providerRef.deref()?.postClineMessagesSnapshot(this.taskId, {
 			bumpSeq: true,
 			taskInstanceId: this.instanceId,
@@ -1373,12 +1430,27 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	/** Persists Cline messages and updates task metadata in the history store. Returns false on failure. */
 	private async saveClineMessages(merge = true): Promise<boolean> {
 		try {
+			await this.persistClineMessages(merge)
+			return true
+		} catch (error) {
+			console.error("Failed to save Roo messages:", error)
+			return false
+		}
+	}
+
+	/** Strict persistence boundary for replacements; streaming saves keep their boolean contract. */
+	private async persistClineMessages(merge = true): Promise<void> {
+		this.clineMessagesSaveVersion++
+		let transcriptPersisted = false
+		try {
+			const messages = structuredClone(this.clineMessages)
 			await saveTaskMessages({
-				messages: structuredClone(this.clineMessages),
+				messages,
 				taskId: this.taskId,
 				globalStoragePath: this.globalStoragePath,
 				merge,
 			})
+			transcriptPersisted = true
 
 			if (this._taskApiConfigName === undefined) {
 				await this.taskApiConfigReady
@@ -1389,7 +1461,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				rootTaskId: this.rootTaskId,
 				parentTaskId: this.parentTaskId,
 				taskNumber: this.taskNumber,
-				messages: this.clineMessages,
+				messages,
 				globalStoragePath: this.globalStoragePath,
 				workspace: this.cwd,
 				mode: this._taskMode || defaultModeSlug, // Use the task's own mode, not the current provider mode.
@@ -1407,10 +1479,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			const provider = this.providerRef.deref()
 			const existingStatus = provider?.taskHistoryStore.get(this.taskId)?.status
 			await provider?.updateTaskHistory(existingStatus ? { ...historyItem, status: existingStatus } : historyItem)
-			return true
 		} catch (error) {
-			console.error("Failed to save Roo messages:", error)
-			return false
+			throw new ClineMessagesPersistenceError(error, transcriptPersisted)
 		}
 	}
 

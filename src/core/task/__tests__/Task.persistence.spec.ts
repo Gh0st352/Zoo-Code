@@ -2,6 +2,7 @@
 
 import * as os from "os"
 import * as path from "path"
+import * as fs from "fs/promises"
 import * as vscode from "vscode"
 
 import {
@@ -10,12 +11,14 @@ import {
 	type GlobalState,
 	type PendingTaskAction,
 	type ProviderSettings,
+	type TodoItem,
 } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 import type { Anthropic } from "@anthropic-ai/sdk"
 
-import { Task } from "../Task"
+import { ClineMessagesPersistenceError, Task } from "../Task"
 import { ClineProvider } from "../../webview/ClineProvider"
+import { webviewMessageHandler } from "../../webview/webviewMessageHandler"
 import { ContextProxy } from "../../config/ContextProxy"
 import { providerIdentifiers } from "@roo-code/types/provider-identifiers"
 import { attemptCompletionTool, type AttemptCompletionCallbacks } from "../../tools/AttemptCompletionTool"
@@ -471,10 +474,11 @@ describe("Task persistence", () => {
 			vi.useFakeTimers()
 			const oldTask = createTask()
 			const replacement = createTask()
-			const saved = createDeferred<boolean>()
+			const saved = createDeferred<void>()
 			try {
 				await mockProvider.addClineToStack(oldTask)
-				oldTask["saveClineMessages"] = vi.fn().mockReturnValueOnce(saved.promise).mockResolvedValue(true)
+				mockSaveTaskMessages.mockReturnValueOnce(saved.promise)
+				oldTask["saveClineMessages"] = vi.fn().mockResolvedValue(true)
 				replacement["saveClineMessages"] = vi.fn().mockResolvedValue(true)
 				await oldTask["updateClineMessage"]({ ...message("leading"), partial: true })
 				await oldTask["updateClineMessage"]({ ...message("delayed trailing"), partial: true })
@@ -487,7 +491,7 @@ describe("Task persistence", () => {
 				post.mockClear()
 				const transport = mockProvider["clineMessagesTransport"]
 				const before = transport["state"]
-				saved.resolve(true)
+				saved.resolve()
 				await overwrite
 				await vi.advanceTimersByTimeAsync(500)
 				await oldTask["addToClineMessages"](message("late append"))
@@ -521,7 +525,7 @@ describe("Task persistence", () => {
 					seq + 3,
 				])
 			} finally {
-				saved.resolve(true)
+				saved.resolve()
 				oldTask["debouncedPostPartialMessageUpdate"].cancel()
 				replacement["debouncedPostPartialMessageUpdate"].cancel()
 				vi.useRealTimers()
@@ -1197,6 +1201,314 @@ describe("Task persistence", () => {
 	})
 
 	// ── saveClineMessages ────────────────────────────────────────────────
+
+	describe("replacement persistence integrity", () => {
+		const message = (ts: number, text: string): ClineMessage => ({ ts, type: "say", say: "text", text })
+		const todos: TodoItem[] = [{ id: "todo", content: "Replacement todo", status: "in_progress" }]
+		const replacement = (): ClineMessage[] => [
+			{ ts: 2, type: "ask", ask: "tool", text: JSON.stringify({ tool: "updateTodoList", todos }) },
+			{ ...message(3, "partial"), partial: true },
+		]
+		const createTask = () => {
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			task["hydrateClineMessages"]([message(1, "original")])
+			return task
+		}
+
+		it("rejects a transcript write error without a snapshot and restores the untouched prior state", async () => {
+			const task = createTask()
+			const original = task.clineMessages
+			const originalTodos = task.todoList
+			// Cloud tracking need not be identical to all non-partial transcript timestamps.
+			task["cloudSyncedMessageTimestamps"].add(99)
+			const onMessage = vi.fn()
+			task.on(RooCodeEventName.Message, onMessage)
+			const cause = new Error("disk full")
+			mockSaveTaskMessages.mockRejectedValueOnce(cause)
+
+			await expect(task.overwriteClineMessages(replacement())).rejects.toMatchObject({
+				name: "ClineMessagesPersistenceError",
+				cause,
+				transcriptPersisted: false,
+			})
+
+			expect(task.clineMessages).toBe(original)
+			expect(task.todoList).toBe(originalTodos)
+			expect(task["cloudSyncedMessageTimestamps"]).toEqual(new Set([1, 99]))
+			expect(mockTaskMetadata).not.toHaveBeenCalled()
+			expect(mockProvider.updateTaskHistory).not.toHaveBeenCalled()
+			expect(mockProvider.postClineMessagesSnapshot).not.toHaveBeenCalled()
+			expect(onMessage).not.toHaveBeenCalled()
+		})
+
+		it.each(["metadata", "history"] as const)(
+			"retains the persisted replacement but rejects without a snapshot on %s failure",
+			async (phase) => {
+				const task = createTask()
+				const messages = replacement()
+				const cause = new Error(`${phase} failed`)
+				if (phase === "metadata") mockTaskMetadata.mockRejectedValueOnce(cause)
+				else vi.mocked(mockProvider.updateTaskHistory).mockRejectedValueOnce(cause)
+
+				await expect(task.overwriteClineMessages(messages)).rejects.toMatchObject({
+					name: "ClineMessagesPersistenceError",
+					cause,
+					transcriptPersisted: true,
+				})
+
+				expect(mockSaveTaskMessages).toHaveBeenCalledExactlyOnceWith(
+					expect.objectContaining({ messages, merge: false }),
+				)
+				expect(task.clineMessages).toEqual(messages)
+				expect(task.todoList).toEqual(todos)
+				expect(task["cloudSyncedMessageTimestamps"]).toEqual(new Set([2]))
+				expect(mockProvider.postClineMessagesSnapshot).not.toHaveBeenCalled()
+				expect(mockProvider.updateTaskHistory).toHaveBeenCalledTimes(phase === "history" ? 1 : 0)
+			},
+		)
+
+		it.each(["transcript", "metadata", "history"] as const)(
+			"keeps the correct on-disk transcript after a real-file %s failure",
+			async (phase) => {
+				const actualFs = await vi.importActual<typeof import("fs/promises")>("fs/promises")
+				const { saveTaskMessages } = await vi.importActual<
+					typeof import("../../task-persistence/taskMessages")
+				>("../../task-persistence/taskMessages")
+				const { GlobalFileNames } = await import("../../../shared/globalFileNames")
+				const storage = await actualFs.mkdtemp(path.join(os.tmpdir(), "replacement-integrity-"))
+				const task = createTask()
+				const original = task.clineMessages
+				const messages = replacement()
+				const transcriptPath = path.join(storage, "tasks", task.taskId, GlobalFileNames.uiMessages)
+				try {
+					await vi.mocked(fs.mkdir).withImplementation(actualFs.mkdir, async () => {
+						await saveTaskMessages({ messages: original, taskId: task.taskId, globalStoragePath: storage })
+						let failedStorage = storage
+						if (phase === "transcript") {
+							// A regular file cannot be a storage directory: exercise a real filesystem rejection.
+							failedStorage = path.join(storage, "not-a-directory")
+							await actualFs.writeFile(failedStorage, "blocked")
+						} else if (phase === "metadata") {
+							mockTaskMetadata.mockRejectedValueOnce(new Error("metadata failed"))
+						} else {
+							vi.mocked(mockProvider.updateTaskHistory).mockRejectedValueOnce(new Error("history failed"))
+						}
+						mockSaveTaskMessages.mockImplementationOnce((options) =>
+							saveTaskMessages({ ...options, globalStoragePath: failedStorage }),
+						)
+						await expect(task.overwriteClineMessages(messages)).rejects.toMatchObject({
+							name: "ClineMessagesPersistenceError",
+							transcriptPersisted: phase !== "transcript",
+						})
+					})
+
+					const diskMessages: unknown = JSON.parse(await actualFs.readFile(transcriptPath, "utf8"))
+					expect(diskMessages).toEqual(phase === "transcript" ? original : messages)
+					expect(task.clineMessages).toEqual(diskMessages)
+					expect(mockProvider.postClineMessagesSnapshot).not.toHaveBeenCalled()
+				} finally {
+					await actualFs.rm(storage, { recursive: true, force: true })
+				}
+			},
+		)
+
+		it.each([true, false])("preserves hydration and publication semantics with persist=%s", async (persist) => {
+			const task = createTask()
+			const messages = replacement()
+			const onMessage = vi.fn()
+			task.on(RooCodeEventName.Message, onMessage)
+
+			await expect(task.overwriteClineMessages(messages, persist)).resolves.toBeUndefined()
+
+			expect(task.clineMessages).toEqual(messages)
+			expect(task.todoList).toEqual(todos)
+			expect(task["cloudSyncedMessageTimestamps"]).toEqual(new Set([2]))
+			expect(mockSaveTaskMessages).toHaveBeenCalledTimes(persist ? 1 : 0)
+			expect(mockTaskMetadata).toHaveBeenCalledTimes(persist ? 1 : 0)
+			expect(mockProvider.updateTaskHistory).toHaveBeenCalledTimes(persist ? 1 : 0)
+			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledExactlyOnceWith(task.taskId, {
+				bumpSeq: true,
+				taskInstanceId: task.instanceId,
+			})
+			expect(onMessage).not.toHaveBeenCalled()
+		})
+
+		it.each(["append", "update", "save", "overwrite", "hydrate", "todos", "cloud"] as const)(
+			"does not roll back a concurrent %s when an older transcript write fails",
+			async (operation) => {
+				const task = createTask()
+				const held = createDeferred<void>()
+				const cause = new Error("delayed write failure")
+				mockSaveTaskMessages.mockImplementationOnce(async () => {
+					await held.promise
+					throw cause
+				})
+				const failed = expect(task.overwriteClineMessages(replacement())).rejects.toMatchObject({
+					cause,
+					transcriptPersisted: false,
+				})
+				try {
+					if (operation === "append") {
+						await task["addToClineMessages"](message(4, "concurrent append"))
+					} else if (operation === "update") {
+						task.clineMessages[1].text = "concurrent update"
+						await task["updateClineMessage"](task.clineMessages[1])
+					} else if (operation === "save") {
+						// Even an identical successful save prevents rollback to pre-replacement memory.
+						await expect(task["saveClineMessages"]()).resolves.toBe(true)
+					} else if (operation === "todos") {
+						task.todoList![0].status = "completed"
+					} else if (operation === "cloud") {
+						task["cloudSyncedMessageTimestamps"].add(3)
+					} else {
+						// Passing the same array must still establish a new replacement owner.
+						await task.overwriteClineMessages(task.clineMessages, operation === "overwrite")
+					}
+					const current = task.clineMessages
+					const currentTodos = task.todoList
+					const currentSynced = new Set(task["cloudSyncedMessageTimestamps"])
+					const snapshots = vi.mocked(mockProvider.postClineMessagesSnapshot).mock.calls.length
+					held.resolve()
+					await failed
+
+					expect(task.clineMessages).toBe(current)
+					expect(task.todoList).toBe(currentTodos)
+					expect(task["cloudSyncedMessageTimestamps"]).toEqual(currentSynced)
+					expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledTimes(snapshots)
+				} finally {
+					held.resolve()
+					await failed
+					task["debouncedPostPartialMessageUpdate"].cancel()
+				}
+			},
+		)
+
+		it("does not publish a newer pending replacement when an older save succeeds", async () => {
+			const task = createTask()
+			const firstWrite = createDeferred<void>()
+			const secondWrite = createDeferred<void>()
+			const cause = new Error("newer write failed")
+			mockSaveTaskMessages.mockReturnValueOnce(firstWrite.promise).mockImplementationOnce(async () => {
+				await secondWrite.promise
+				throw cause
+			})
+			const first = task.overwriteClineMessages([message(2, "persisted")])
+			const second = expect(task.overwriteClineMessages([message(3, "not persisted")])).rejects.toMatchObject({
+				cause,
+				transcriptPersisted: false,
+			})
+			try {
+				firstWrite.resolve()
+				await first
+				expect(mockTaskMetadata).toHaveBeenCalledExactlyOnceWith(
+					expect.objectContaining({ messages: [expect.objectContaining({ text: "persisted" })] }),
+				)
+				expect(mockProvider.postClineMessagesSnapshot).not.toHaveBeenCalled()
+				secondWrite.resolve()
+				await second
+				// The prior replacement was pending at admission, not a safe rollback target.
+				expect(task.clineMessages).toEqual([expect.objectContaining({ text: "not persisted" })])
+				expect(mockProvider.postClineMessagesSnapshot).not.toHaveBeenCalled()
+			} finally {
+				firstWrite.resolve()
+				secondWrite.resolve()
+				await Promise.all([first, second])
+			}
+		})
+
+		it("does not resurrect an earlier failed replacement when overlapping writes both fail", async () => {
+			const task = createTask()
+			const held = createDeferred<void>()
+			mockSaveTaskMessages.mockImplementationOnce(async () => {
+				await held.promise
+				throw new Error("first write failed")
+			})
+			const first = expect(task.overwriteClineMessages([message(2, "first")])).rejects.toThrow(
+				"first write failed",
+			)
+			mockSaveTaskMessages.mockImplementationOnce(async () => {
+				await first
+				throw new Error("second write failed")
+			})
+			const second = expect(task.overwriteClineMessages([message(3, "second")])).rejects.toThrow(
+				"second write failed",
+			)
+			held.resolve()
+			await Promise.all([first, second])
+
+			expect(task.clineMessages).toEqual([expect.objectContaining({ text: "second" })])
+			expect(mockProvider.postClineMessagesSnapshot).not.toHaveBeenCalled()
+		})
+
+		it("propagates the strict failure while ordinary saves keep returning false", async () => {
+			const task = createTask()
+			mockTaskMetadata.mockRejectedValueOnce(new Error("metadata failed"))
+			await expect(task["saveClineMessages"]()).resolves.toBe(false)
+			mockSaveTaskMessages.mockRejectedValueOnce(new Error("write failed"))
+			await expect(task.overwriteClineMessages(replacement())).rejects.toBeInstanceOf(
+				ClineMessagesPersistenceError,
+			)
+		})
+
+		describe.each(["deleteMessageConfirm", "editMessageConfirm"] as const)("%s", (type) => {
+			const setup = () => {
+				const task = createTask()
+				const kept: ClineMessage = {
+					...message(1, "kept"),
+					checkpoint: { hash: "checkpoint-hash" },
+				}
+				task["hydrateClineMessages"]([kept, { ...message(2, "remove"), say: "user_feedback" }])
+				task.apiConversationHistory = [
+					{ ts: 1, role: "user", content: "kept" },
+					{ ts: 2, role: "user", content: "remove" },
+				]
+				vi.spyOn(mockProvider, "getCurrentTask").mockReturnValue(task)
+				const submit = vi.spyOn(task, "submitUserMessage").mockResolvedValue(undefined)
+				return { task, kept, submit }
+			}
+
+			it.each(["transcript", "metadata", "history"] as const)(
+				"reports a %s failure and stops before API rewind or edited-message submission",
+				async (phase) => {
+					const { task, kept, submit } = setup()
+					const original = task.clineMessages
+					const cause = new Error(`${phase} failed`)
+					if (phase === "transcript") mockSaveTaskMessages.mockRejectedValueOnce(cause)
+					else if (phase === "metadata") mockTaskMetadata.mockRejectedValueOnce(cause)
+					else vi.mocked(mockProvider.updateTaskHistory).mockRejectedValueOnce(cause)
+
+					await webviewMessageHandler(mockProvider, { type, messageTs: 2, text: "edited" })
+
+					expect(vscode.window.showErrorMessage).toHaveBeenCalledOnce()
+					expect(mockSaveTaskMessages).toHaveBeenCalledTimes(1)
+					expect(mockSaveApiMessages).not.toHaveBeenCalled()
+					expect(mockProvider.postClineMessagesSnapshot).not.toHaveBeenCalled()
+					expect(submit).not.toHaveBeenCalled()
+					expect(task.clineMessages).toEqual(phase === "transcript" ? original : [kept])
+				},
+			)
+
+			it("persists and snapshots once, retaining checkpoint metadata", async () => {
+				const { task, kept, submit } = setup()
+
+				await webviewMessageHandler(mockProvider, { type, messageTs: 2, text: "edited" })
+
+				expect(vscode.window.showErrorMessage).not.toHaveBeenCalled()
+				expect(task.clineMessages).toEqual([kept])
+				expect(mockSaveTaskMessages).toHaveBeenCalledExactlyOnceWith(
+					expect.objectContaining({ messages: [kept], merge: false }),
+				)
+				expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledOnce()
+				expect(mockSaveApiMessages).toHaveBeenCalledOnce()
+				expect(submit).toHaveBeenCalledTimes(type === "editMessageConfirm" ? 1 : 0)
+			})
+		})
+	})
 
 	describe("saveClineMessages", () => {
 		it("returns true on success", async () => {

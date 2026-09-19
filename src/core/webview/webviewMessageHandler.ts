@@ -36,7 +36,6 @@ import { CloudService } from "@roo-code/cloud"
 import { TelemetryService } from "@roo-code/telemetry"
 
 import { type ApiMessage } from "../task-persistence/apiMessages"
-import { saveTaskMessages } from "../task-persistence"
 import { importRooTaskHistory } from "../task-persistence/importRooTaskHistory"
 
 import { ClineProvider } from "./ClineProvider"
@@ -341,37 +340,9 @@ export const webviewMessageHandler = async (
 					vscode.window.showWarningMessage("No checkpoint found before this message")
 				}
 			} else {
-				// For non-checkpoint deletes, preserve checkpoint associations for remaining messages
-				// Store checkpoints from messages that will be preserved
-				const preservedCheckpoints = new Map<number, any>()
-				for (let i = 0; i < messageIndex; i++) {
-					const msg = currentCline.clineMessages[i]
-					if (msg?.checkpoint && msg.ts) {
-						preservedCheckpoints.set(msg.ts, msg.checkpoint)
-					}
-				}
-
-				// Delete this message and all subsequent messages using MessageManager
+				// Rewind preserves the complete retained messages, including checkpoints,
+				// and owns persistence and snapshot publication. Do not pre-mutate or re-save.
 				await currentCline.messageManager.rewindToTimestamp(targetMessage.ts!, { includeTargetMessage: false })
-
-				// Restore checkpoint associations for preserved messages
-				for (const [ts, checkpoint] of preservedCheckpoints) {
-					const msgIndex = currentCline.clineMessages.findIndex((msg) => msg.ts === ts)
-					if (msgIndex !== -1) {
-						currentCline.clineMessages[msgIndex].checkpoint = checkpoint
-					}
-				}
-
-				// Save the updated messages with restored checkpoints
-				await saveTaskMessages({
-					messages: currentCline.clineMessages,
-					taskId: currentCline.taskId,
-					globalStoragePath: provider.contextProxy.globalStorageUri.fsPath,
-				})
-
-				// Rewind posts before checkpoint metadata is restored. Publish the
-				// persisted transcript so checkpoint filtering and controls stay current.
-				await currentCline.overwriteClineMessages(currentCline.clineMessages)
 			}
 		} catch (error) {
 			console.error("Error in delete message:", error)
@@ -510,39 +481,13 @@ export const webviewMessageHandler = async (
 				}
 			}
 
-			// Store checkpoints from messages that will be preserved
-			const preservedCheckpoints = new Map<number, any>()
-			for (let i = 0; i < deleteFromMessageIndex; i++) {
-				const msg = currentCline.clineMessages[i]
-				if (msg?.checkpoint && msg.ts) {
-					preservedCheckpoints.set(msg.ts, msg.checkpoint)
-				}
-			}
-
-			// Delete the original (user) message and all subsequent messages using MessageManager
+			// Rewind preserves checkpoint metadata and publishes only after persistence.
+			// A rejection must stop the edit before submitting a new user message.
 			const rewindTs = currentCline.clineMessages[deleteFromMessageIndex]?.ts
 			if (rewindTs) {
 				await currentCline.messageManager.rewindToTimestamp(rewindTs, { includeTargetMessage: false })
 			}
 
-			// Restore checkpoint associations for preserved messages
-			for (const [ts, checkpoint] of preservedCheckpoints) {
-				const msgIndex = currentCline.clineMessages.findIndex((msg) => msg.ts === ts)
-				if (msgIndex !== -1) {
-					currentCline.clineMessages[msgIndex].checkpoint = checkpoint
-				}
-			}
-
-			// Save the updated messages with restored checkpoints
-			await saveTaskMessages({
-				messages: currentCline.clineMessages,
-				taskId: currentCline.taskId,
-				globalStoragePath: provider.contextProxy.globalStorageUri.fsPath,
-			})
-
-			// Rewind posts before checkpoint metadata is restored. Publish that
-			// restored state before the edited message starts a new delta stream.
-			await currentCline.overwriteClineMessages(currentCline.clineMessages)
 			await currentCline.submitUserMessage(editedContent, images)
 		} catch (error) {
 			console.error("Error in edit message:", error)

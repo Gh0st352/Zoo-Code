@@ -30,6 +30,7 @@ export type TranscriptFrame = {
 
 /** Payloads and Promise resolvers deliberately live outside the pure protocol state. */
 export type TranscriptTransportState = {
+	closed: boolean
 	generation: number
 	nextJobId: number
 	nextSnapshotId: number
@@ -49,9 +50,11 @@ export type TranscriptAction =
 			focusedTaskInstanceId?: string
 	  }
 	| { type: "invalidate" }
+	| { type: "shutdown" }
+	| { type: "reopen" }
 	| { type: "forget-task"; taskId: string }
 	| { type: "pump"; focusedTaskId: string | undefined; focusedTaskInstanceId?: string }
-	| { type: "settle"; success: boolean }
+	| { type: "settle"; frame: TranscriptFrame; success: boolean }
 
 export type TranscriptTransition = {
 	state: TranscriptTransportState
@@ -59,7 +62,7 @@ export type TranscriptTransition = {
 	post?: TranscriptFrame
 	/** Drop all owned payload references, including an invalidated snapshot's unsent suffix. */
 	release: number[]
-	/** Active physical sends settle only at their actual completion boundary. */
+	/** Invalidation waits for physical completion; renderer shutdown settles every caller immediately. */
 	settle: Array<{ id: number; failed?: boolean }>
 }
 
@@ -67,7 +70,7 @@ export function createTranscriptTransportState(chunkSize = 200): TranscriptTrans
 	if (!Number.isSafeInteger(chunkSize) || chunkSize < 1) {
 		throw new Error("Transcript chunk size must be a positive safe integer")
 	}
-	return { generation: 0, nextJobId: 0, nextSnapshotId: 0, sequences: new Map(), chunkSize, queue: [] }
+	return { closed: false, generation: 0, nextJobId: 0, nextSnapshotId: 0, sequences: new Map(), chunkSize, queue: [] }
 }
 
 export function isTranscriptRequestCurrent(
@@ -77,6 +80,7 @@ export function isTranscriptRequestCurrent(
 	focusedTaskInstanceId?: string,
 ): boolean {
 	return (
+		!state.closed &&
 		(request.generation ?? state.generation) === state.generation &&
 		request.taskId === focusedTaskId &&
 		request.taskInstanceId === focusedTaskInstanceId &&
@@ -126,6 +130,28 @@ export function reduceTranscriptTransport(
 			// Never reset inFlight: an already invoked physical send cannot be unsent.
 			result.state = { ...state, generation: state.generation + 1, queue: [], active: undefined }
 			return result
+		case "shutdown": {
+			if (state.closed) return result
+			const ids = new Set(state.queue.map((job) => job.id))
+			if (state.active) ids.add(state.active.job.id)
+			if (state.inFlight) ids.add(state.inFlight.job.id)
+			result.release = [...ids]
+			result.settle = [...ids].map((id) => ({ id }))
+			result.state = {
+				...state,
+				closed: true,
+				generation: state.generation + 1,
+				queue: [],
+				active: undefined,
+				inFlight: undefined,
+			}
+			return result
+		}
+		case "reopen":
+			// Preserve sequences and IDs. Work captured before/during closure must never
+			// acquire the new renderer's generation, even if the task is unchanged.
+			if (state.closed) result.state = { ...state, closed: false, generation: state.generation + 1 }
+			return result
 		case "forget-task": {
 			const sequences = new Map(state.sequences)
 			sequences.delete(action.taskId)
@@ -133,7 +159,7 @@ export function reduceTranscriptTransport(
 			return result
 		}
 		case "pump": {
-			if (state.inFlight) return result
+			if (state.closed || state.inFlight) return result
 			let active = state.active
 			const queue = [...state.queue]
 			while (active || queue.length) {
@@ -166,7 +192,14 @@ export function reduceTranscriptTransport(
 			return result
 		}
 		case "settle": {
-			if (!state.inFlight) return result
+			if (
+				!state.inFlight ||
+				state.inFlight.job.id !== action.frame.job.id ||
+				state.inFlight.job.generation !== action.frame.job.generation ||
+				state.inFlight.phase !== action.frame.phase ||
+				state.inFlight.start !== action.frame.start
+			)
+				return result
 			const { job, phase } = state.inFlight
 			const finished = !action.success || !state.active || phase === "end" || job.kind !== "snapshot"
 			if (finished) {
@@ -219,18 +252,62 @@ export function transcriptFrameMessage(frame: TranscriptFrame, messages: readonl
 	}
 }
 
-/** One driver owns all physical transcript sends, even across repeated invalidations. */
+type TranscriptCallbacks = {
+	focusedTaskId: () => string | undefined
+	postMessage: (message: ExtensionMessage) => Promise<void>
+	onError: (error: unknown) => void
+	focusedTaskInstanceId: () => string | undefined
+}
+
+type SendCompletion = { finish?: (success: boolean, error?: unknown) => void }
+
+// The physical Promise retains only this detachable slot, not the driver, provider,
+// frame, payload or caller. Keep these handlers outside the driver's lexical scope.
+function observePhysicalSend(promise: Promise<void>, completion: SendCompletion): void {
+	void promise.then(
+		() => completion.finish?.(true),
+		(error: unknown) => completion.finish?.(false, error),
+	)
+}
+
+/** One physical-send barrier per renderer, preserved across ordinary invalidations. */
 export class TranscriptTransport {
 	private state = createTranscriptTransportState()
 	private readonly payloads = new Map<number, readonly ClineMessage[]>()
 	private readonly callers = new Map<number, { resolve: () => void; reject: (error: unknown) => void }>()
+	private callbacks?: TranscriptCallbacks
+	private pendingSend?: SendCompletion
 
 	constructor(
-		private readonly focusedTaskId: () => string | undefined,
-		private readonly postMessage: (message: ExtensionMessage) => Promise<void>,
-		private readonly onError: (error: unknown) => void,
-		private readonly focusedTaskInstanceId: () => string | undefined = () => undefined,
-	) {}
+		focusedTaskId: () => string | undefined,
+		postMessage: (message: ExtensionMessage) => Promise<void>,
+		onError: (error: unknown) => void,
+		focusedTaskInstanceId: () => string | undefined = () => undefined,
+	) {
+		this.callbacks = { focusedTaskId, postMessage, onError, focusedTaskInstanceId }
+	}
+
+	get closed(): boolean {
+		return this.state.closed
+	}
+
+	shutdown(): void {
+		if (this.pendingSend) this.pendingSend.finish = undefined
+		this.pendingSend = undefined
+		this.callbacks = undefined
+		this.apply({ type: "shutdown" })
+	}
+
+	reopen(
+		focusedTaskId: () => string | undefined,
+		postMessage: (message: ExtensionMessage) => Promise<void>,
+		onError: (error: unknown) => void,
+		focusedTaskInstanceId: () => string | undefined = () => undefined,
+	): void {
+		if (!this.closed) return
+		this.callbacks = { focusedTaskId, postMessage, onError, focusedTaskInstanceId }
+		this.apply({ type: "reopen" })
+	}
 
 	get generation(): number {
 		return this.state.generation
@@ -252,13 +329,20 @@ export class TranscriptTransport {
 	}
 
 	enqueue(request: TranscriptRequest, messages: readonly ClineMessage[]): Promise<void> {
+		const callbacks = this.callbacks
+		if (!callbacks || this.closed) return Promise.resolve()
 		// An empty delta must not consume a sequence or enter admission at all.
 		if (request.kind !== "snapshot" && messages.length === 0) return Promise.resolve()
 		// Guard before deep cloning (and allocating a sequence/ID). A delayed focus sync
 		// must not traverse a large, already-obsolete transcript.
 		const capturedRequest = { ...request, generation: request.generation ?? this.generation }
 		if (
-			!isTranscriptRequestCurrent(this.state, capturedRequest, this.focusedTaskId(), this.focusedTaskInstanceId())
+			!isTranscriptRequestCurrent(
+				this.state,
+				capturedRequest,
+				callbacks.focusedTaskId(),
+				callbacks.focusedTaskInstanceId(),
+			)
 		)
 			return Promise.resolve()
 		// Task mutates message objects AND nested fields while posts are queued. Capture
@@ -268,8 +352,8 @@ export class TranscriptTransport {
 			type: "enqueue",
 			request: capturedRequest,
 			total: payload.length,
-			focusedTaskId: this.focusedTaskId(),
-			focusedTaskInstanceId: this.focusedTaskInstanceId(),
+			focusedTaskId: callbacks.focusedTaskId(),
+			focusedTaskInstanceId: callbacks.focusedTaskInstanceId(),
 		})
 		if (!accepted) return Promise.resolve()
 		this.payloads.set(accepted.id, payload)
@@ -294,24 +378,35 @@ export class TranscriptTransport {
 	}
 
 	private drain(): void {
+		const callbacks = this.callbacks
+		if (!callbacks) return
 		const { post } = this.apply({
 			type: "pump",
-			focusedTaskId: this.focusedTaskId(),
-			focusedTaskInstanceId: this.focusedTaskInstanceId(),
+			focusedTaskId: callbacks.focusedTaskId(),
+			focusedTaskInstanceId: callbacks.focusedTaskInstanceId(),
 		})
-		if (post) void this.send(post)
+		if (post) this.send(post)
 	}
 
-	private async send(frame: TranscriptFrame): Promise<void> {
-		try {
-			// Do not retain the full payload in this async frame. Invalidation can release
-			// the unsent snapshot suffix while only this physical message remains held.
-			await this.postMessage(transcriptFrameMessage(frame, this.payloads.get(frame.job.id)!))
-			this.apply({ type: "settle", success: true })
-		} catch (error) {
-			this.onError(error)
-			this.apply({ type: "settle", success: false }, error)
+	private send(frame: TranscriptFrame): void {
+		const completion: SendCompletion = {
+			finish: (success, error) => {
+				completion.finish = undefined
+				if (this.pendingSend !== completion) return
+				this.pendingSend = undefined
+				this.apply({ type: "settle", frame, success }, error)
+				if (!success) this.callbacks?.onError(error)
+				this.drain()
+			},
 		}
-		this.drain()
+		this.pendingSend = completion
+		try {
+			observePhysicalSend(
+				this.callbacks!.postMessage(transcriptFrameMessage(frame, this.payloads.get(frame.job.id)!)),
+				completion,
+			)
+		} catch (error) {
+			completion.finish?.(false, error)
+		}
 	}
 }

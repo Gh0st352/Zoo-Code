@@ -3,6 +3,7 @@ import { webviewMessageHandler } from "../webviewMessageHandler"
 import * as vscode from "vscode"
 import { ClineProvider } from "../ClineProvider"
 import { MessageManager } from "../../message-manager"
+import { saveTaskMessages } from "../../task-persistence"
 
 // Mock the saveTaskMessages function
 vi.mock("../../task-persistence", async (importOriginal) => ({
@@ -247,7 +248,7 @@ describe("webviewMessageHandler delete functionality", () => {
 			])
 		})
 
-		it("publishes restored checkpoint metadata after deleting messages", async () => {
+		it("rewinds once with preserved checkpoint metadata after deleting messages", async () => {
 			const checkpoint = { hash: "checkpoint-hash", type: "user_message" }
 			const preservedMessage = { ts: 1000, say: "user", text: "First message", checkpoint }
 			getCurrentTaskMock.clineMessages = [preservedMessage, { ts: 2000, say: "user", text: "Delete this" }]
@@ -257,10 +258,7 @@ describe("webviewMessageHandler delete functionality", () => {
 			]
 			getCurrentTaskMock.overwriteClineMessages.mockImplementation(
 				async (messages: (typeof preservedMessage)[]) => {
-					getCurrentTaskMock.clineMessages = structuredClone(messages).map((message) => {
-						const { checkpoint: _checkpoint, ...withoutCheckpoint } = message
-						return withoutCheckpoint
-					})
+					getCurrentTaskMock.clineMessages = structuredClone(messages)
 				},
 			)
 
@@ -269,10 +267,10 @@ describe("webviewMessageHandler delete functionality", () => {
 				messageTs: 2000,
 			})
 
-			expect(getCurrentTaskMock.overwriteClineMessages).toHaveBeenCalledTimes(2)
-			expect(getCurrentTaskMock.overwriteClineMessages).toHaveBeenLastCalledWith([
-				expect.objectContaining({ ts: 1000, checkpoint }),
-			])
+			expect(getCurrentTaskMock.overwriteClineMessages).toHaveBeenCalledExactlyOnceWith([preservedMessage])
+			expect(getCurrentTaskMock.clineMessages).toEqual([preservedMessage])
+			expect(saveTaskMessages).not.toHaveBeenCalled()
+			expect(vscode.window.showErrorMessage).not.toHaveBeenCalled()
 		})
 
 		describe("condense preservation behavior", () => {

@@ -2194,11 +2194,12 @@ describe("Cline", () => {
 				task: "test task",
 				startTask: false,
 			})
-			let releaseSave!: (saved: boolean) => void
-			const pendingSave = new Promise<boolean>((resolve) => {
+			let releaseSave!: () => void
+			const pendingSave = new Promise<void>((resolve) => {
 				releaseSave = resolve
 			})
-			const saveSpy = vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockReturnValueOnce(pendingSave)
+			const saveSpy = vi.fn<Task["persistClineMessages"]>().mockReturnValueOnce(pendingSave)
+			task["persistClineMessages"] = saveSpy
 			const messages = [
 				{
 					ts: 1,
@@ -2215,7 +2216,7 @@ describe("Cline", () => {
 			expect(saveSpy).toHaveBeenCalledWith(false)
 			expect(mockProvider.postClineMessagesSnapshot).not.toHaveBeenCalled()
 
-			releaseSave(true)
+			releaseSave()
 			await overwritePromise
 
 			expect(saveSpy).toHaveBeenCalledOnce()
@@ -2233,7 +2234,8 @@ describe("Cline", () => {
 				task: "test task",
 				startTask: false,
 			})
-			const saveSpy = vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockResolvedValue(true)
+			const saveSpy = vi.fn<Task["persistClineMessages"]>().mockResolvedValue(undefined)
+			task["persistClineMessages"] = saveSpy
 			let releaseSnapshot!: () => void
 			const pendingSnapshot = new Promise<void>((resolve) => {
 				releaseSnapshot = resolve
@@ -2271,11 +2273,11 @@ describe("Cline", () => {
 				startTask: false,
 			})
 			const taskAccess = getTaskTestAccess(task)
-			let releaseSave!: (saved: boolean) => void
-			const pendingSave = new Promise<boolean>((resolve) => {
+			let releaseSave!: () => void
+			const pendingSave = new Promise<void>((resolve) => {
 				releaseSave = resolve
 			})
-			vi.spyOn(taskAccess, "saveClineMessages").mockReturnValueOnce(pendingSave)
+			task["persistClineMessages"] = vi.fn<Task["persistClineMessages"]>().mockReturnValueOnce(pendingSave)
 			const staleMessage = {
 				ts: 1,
 				type: "say" as const,
@@ -2298,7 +2300,7 @@ describe("Cline", () => {
 			expect(updatePostSpy.mock.calls).toEqual([[task.taskId, firstMessage, task.instanceId]])
 			expect(mockProvider.postClineMessagesSnapshot).toHaveBeenCalledTimes(persist ? 0 : 1)
 
-			releaseSave(true)
+			releaseSave()
 			await overwritePromise
 			await vi.advanceTimersByTimeAsync(500)
 
@@ -2326,7 +2328,8 @@ describe("Cline", () => {
 				task: "test task",
 				startTask: false,
 			})
-			const saveSpy = vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockResolvedValue(true)
+			const saveSpy = vi.fn<Task["persistClineMessages"]>().mockResolvedValue(undefined)
+			task["persistClineMessages"] = saveSpy
 			const snapshotError = new Error("snapshot failed")
 			vi.mocked(mockProvider.postClineMessagesSnapshot).mockRejectedValueOnce(snapshotError)
 			const messages = [{ ts: 1, type: "say" as const, say: "text" as const, text: "replacement" }]
@@ -2348,7 +2351,8 @@ describe("Cline", () => {
 				task: "test task",
 				startTask: false,
 			})
-			const saveSpy = vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockResolvedValue(true)
+			const saveSpy = vi.fn<Task["persistClineMessages"]>().mockResolvedValue(undefined)
+			task["persistClineMessages"] = saveSpy
 			Object.defineProperty(task, "providerRef", {
 				value: { deref: () => undefined },
 				configurable: true,

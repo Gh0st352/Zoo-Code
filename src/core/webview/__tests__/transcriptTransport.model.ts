@@ -27,8 +27,11 @@ type Intent =
 	| "empty-append"
 	| "empty-update"
 	| "empty-snapshot"
+	| "shutdown"
+	| "reopen"
 type Capture = {
 	job: TranscriptJob
+	renderer: number
 	taskInstanceId: string | undefined
 	scope: string
 	values: number[]
@@ -36,6 +39,13 @@ type Capture = {
 }
 type ModelState = {
 	transport: TranscriptTransportState
+	renderer: number
+	shutdowns: number
+	shutdownWithQueued: boolean
+	closedAdmissionRejected: boolean
+	retired: Array<{ frame: TranscriptFrame; message: ExtensionMessage }>
+	lateOutcomes: string[]
+	lateWhileSending: string[]
 	focus: TaskId | undefined
 	focusInstance: string | undefined
 	instanceSyncPending: boolean
@@ -106,6 +116,21 @@ export const TRANSPORT_SCENARIOS: Scenario[] = [
 		producer: ["empty-append", "empty-update", "append", "empty-snapshot"],
 		controller: [],
 	},
+	{
+		name: "renderer-disposal-and-reopen",
+		producer: ["snapshot", "append"],
+		controller: ["shutdown", "shutdown", "reopen", "snapshot"],
+	},
+	{
+		name: "renderer-reopen-without-task",
+		producer: ["snapshot"],
+		controller: ["clear", "shutdown", "reopen", "empty-snapshot"],
+	},
+	{
+		name: "renderer-reopen-with-new-instance",
+		producer: ["snapshot", "stale-instance-append"],
+		controller: ["shutdown", "replace-instance", "reopen", "sync-instance"],
+	},
 ]
 export const TRANSPORT_ACTIONS = [
 	"snapshot",
@@ -131,6 +156,10 @@ export const TRANSPORT_ACTIONS = [
 	"settle",
 	"fail",
 	"discard",
+	"shutdown",
+	"reopen",
+	"late-resolve",
+	"late-reject",
 ]
 export const TRANSPORT_LANDMARKS = {
 	"held-post-with-queued-delta": (s: ModelState) =>
@@ -175,11 +204,32 @@ export const TRANSPORT_LANDMARKS = {
 		s.committed.some((id) => s.captures[id - 1].job.taskInstanceId === "a:1") &&
 		s.appliedInstanceDeltas.includes("append") &&
 		s.appliedInstanceDeltas.includes("update"),
+	"shutdown-releases-held-and-queued-callers": (s: ModelState) =>
+		s.shutdownWithQueued && s.transport.closed && s.callers.length === 0 && s.payloads.length === 0,
+	"repeated-shutdown-with-held-send": (s: ModelState) => s.shutdowns === 2 && s.retired.length > 0,
+	"closed-admission-rejected": (s: ModelState) => s.closedAdmissionRejected,
+	"reopened-renderer-sends-before-dead-renderer-settles": (s: ModelState) =>
+		s.renderer > 0 && !!s.physical && s.retired.length > 0,
+	"late-resolve-does-not-settle-new-send": (s: ModelState) => s.lateWhileSending.includes("resolve"),
+	"late-reject-does-not-settle-new-send": (s: ModelState) => s.lateWhileSending.includes("reject"),
+	"reopened-snapshot-committed": (s: ModelState) => s.committed.some((id) => s.captures[id - 1].renderer > 0),
+	"reopened-no-task-snapshot-committed": (s: ModelState) =>
+		s.committed.some((id) => {
+			const capture = s.captures[id - 1]
+			return capture.renderer > 0 && capture.job.taskId === undefined
+		}),
 } satisfies Record<string, (s: ModelState) => boolean>
 
 function initialState(): ModelState {
 	return {
 		transport: createTranscriptTransportState(TRANSPORT_MODEL_BOUNDS.chunkSize),
+		renderer: 0,
+		shutdowns: 0,
+		shutdownWithQueued: false,
+		closedAdmissionRejected: false,
+		retired: [],
+		lateOutcomes: [],
+		lateWhileSending: [],
 		focus: "a",
 		focusInstance: "a:0",
 		instanceSyncPending: false,
@@ -220,9 +270,14 @@ function enabled(s: ModelState, scenario: Scenario): Event[] {
 		})
 	}
 	if (s.transport.inFlight) {
-		events.push({ name: "settle", action: { type: "settle", success: true } })
+		events.push({ name: "settle", action: { type: "settle", frame: s.transport.inFlight, success: true } })
 		if (s.failures < TRANSPORT_MODEL_BOUNDS.failures)
-			events.push({ name: "fail", action: { type: "settle", success: false } })
+			events.push({ name: "fail", action: { type: "settle", frame: s.transport.inFlight, success: false } })
+	}
+	for (const { frame } of s.retired) {
+		events.push({ name: "late-resolve", action: { type: "settle", frame, success: true } })
+		if (s.failures < TRANSPORT_MODEL_BOUNDS.failures)
+			events.push({ name: "late-reject", action: { type: "settle", frame, success: false } })
 	}
 	return events
 }
@@ -312,8 +367,12 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 		const before = s.transport
 		const transition = reducer(before, action)
 		s.transport = transition.state
+		const generationChange =
+			action.type === "invalidate" ||
+			(action.type === "shutdown" && !before.closed) ||
+			(action.type === "reopen" && before.closed)
 		requireInvariant(
-			s.transport.generation === before.generation + (action.type === "invalidate" ? 1 : 0),
+			s.transport.generation === before.generation + (generationChange ? 1 : 0),
 			"generation is not monotonic",
 		)
 		if (action.type === "enqueue") {
@@ -323,6 +382,10 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 				!transition.post &&
 				transition.release.length === 0 &&
 				transition.settle.length === 0
+			if (before.closed) {
+				requireInvariant(unchanged, "closed admission allocated work")
+				s.closedAdmissionRejected = true
+			}
 			if (action.request.kind !== "snapshot" && action.total === 0) {
 				requireInvariant(unchanged, "empty delta allocated work")
 			}
@@ -373,6 +436,7 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 			s.allocated[scope] = job.seq
 			s.captures.push({
 				job,
+				renderer: s.renderer,
 				taskInstanceId: action.request.taskInstanceId,
 				scope,
 				values: [...values],
@@ -405,35 +469,89 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 				"discarded caller did not settle immediately",
 			)
 		}
-		if (action.type === "settle") {
-			const physical = s.physical
-			requireInvariant(physical, "settled without physical send")
-			if (physical.job.generation < s.transport.generation) s.staleCompletions++
-			if (
-				action.success &&
-				physical.phase === "end" &&
-				physical.job.generation < s.transport.generation &&
-				physical.job.taskId === s.focus &&
-				physical.job.taskInstanceId === s.focusInstance
+		if (action.type === "shutdown" || action.type === "reopen") {
+			requireInvariant(
+				s.transport.nextJobId === before.nextJobId &&
+					s.transport.nextSnapshotId === before.nextSnapshotId &&
+					JSON.stringify([...s.transport.sequences]) === JSON.stringify([...before.sequences]),
+				"renderer boundary reset sequences or identities",
 			)
-				s.staleCommitCompletions++
-			if (action.success) {
-				requireInvariant(s.physicalMessage, "physical send lost its captured wire message")
+			if (action.type === "shutdown") {
+				s.shutdowns++
+				s.shutdownWithQueued ||= !!before.inFlight && before.queue.length > 0
 				requireInvariant(
-					s.physicalMessage.taskInstanceId === s.captures[physical.job.id - 1].taskInstanceId,
-					"wire lost originating instance identity",
+					s.transport.closed &&
+						!s.transport.inFlight &&
+						!s.transport.active &&
+						s.transport.queue.length === 0 &&
+						s.payloads.length === 0 &&
+						s.callers.length === 0,
+					"shutdown retained transport ownership",
 				)
-				deliver(s, physical, s.physicalMessage, faults)
-			} else {
-				s.captures[physical.job.id - 1].failed = true
-				s.failures++
+				if (s.physical) {
+					requireInvariant(s.physicalMessage, "physical send lost its wire message")
+					s.retired.push({ frame: s.physical, message: s.physicalMessage })
+				}
+				s.physical = undefined
+				s.physicalMessage = undefined
+			} else if (before.closed) {
+				requireInvariant(!s.transport.closed, "reopen did not enable renderer")
+				s.renderer++
+				s.visible = []
+				s.appliedSeq = 0
+				s.staging = undefined
 			}
-			s.physical = undefined
-			s.physicalMessage = undefined
+		}
+		if (action.type === "settle") {
+			const retired = s.retired.find(({ frame }) => frame.job.id === action.frame.job.id)
+			if (retired) {
+				requireInvariant(
+					transition.state === before &&
+						!transition.post &&
+						transition.release.length === 0 &&
+						transition.settle.length === 0,
+					"late completion changed live transport",
+				)
+				const outcome = action.success ? "resolve" : "reject"
+				s.lateOutcomes = [...new Set([...s.lateOutcomes, outcome])].sort()
+				if (s.physical) s.lateWhileSending = [...new Set([...s.lateWhileSending, outcome])].sort()
+				if (!action.success) s.failures++
+				// This wire belongs to the disposed renderer, never its replacement.
+				s.retired = s.retired.filter((entry) => entry !== retired)
+			} else {
+				const physical = s.physical
+				requireInvariant(physical, "settled without physical send")
+				if (physical.job.generation < s.transport.generation) s.staleCompletions++
+				if (
+					action.success &&
+					physical.phase === "end" &&
+					physical.job.generation < s.transport.generation &&
+					physical.job.taskId === s.focus &&
+					physical.job.taskInstanceId === s.focusInstance
+				)
+					s.staleCommitCompletions++
+				if (action.success) {
+					requireInvariant(s.physicalMessage, "physical send lost its captured wire message")
+					requireInvariant(
+						s.physicalMessage.taskInstanceId === s.captures[physical.job.id - 1].taskInstanceId,
+						"wire lost originating instance identity",
+					)
+					deliver(s, physical, s.physicalMessage, faults)
+				} else {
+					s.captures[physical.job.id - 1].failed = true
+					s.failures++
+				}
+				s.physical = undefined
+				s.physicalMessage = undefined
+			}
 		}
 		if (transition.post) {
 			const frame = transition.post
 			const capture = s.captures[frame.job.id - 1]
+			requireInvariant(
+				!s.transport.closed && capture.renderer === s.renderer,
+				"post initiated for a disposed renderer",
+			)
 			requireInvariant(!s.physical, "overlapping physical sends")
 			requireInvariant(
 				capture.job.generation === s.transport.generation && frame.job.taskId === s.focus,
@@ -502,6 +620,10 @@ function executeStep(s: ModelState, event: Event, reducer: Reducer, coverage: Se
 		s[event.actor]++
 		coverage.add(event.intent)
 		const intent = event.intent
+		if (intent === "shutdown" || intent === "reopen") {
+			apply({ type: intent })
+			return s
+		}
 		if (intent === "switch" || intent === "clear" || intent === "focus" || intent === "replace-instance") {
 			const previous = s.focus
 			s.focus = intent === "replace-instance" ? "a" : intent === "clear" ? undefined : "b"
@@ -625,6 +747,44 @@ export function exploreTranscriptTransport(
 }
 
 export const TRANSPORT_MUTATIONS: Mutation[] = [
+	{
+		name: "shutdown-retains-physical-caller",
+		expected: "shutdown retained transport ownership",
+		reduce: (state, action) => {
+			if (action.type !== "shutdown" || state.closed) return reduceTranscriptTransport(state, action)
+			const result = reduceTranscriptTransport(state, { type: "invalidate" })
+			result.state = { ...result.state, closed: true }
+			return result
+		},
+	},
+	{
+		name: "admit-after-shutdown",
+		expected: "closed admission allocated work",
+		reduce: (state, action) =>
+			reduceTranscriptTransport(
+				action.type === "enqueue" && state.closed ? { ...state, closed: false } : state,
+				action,
+			),
+	},
+	{
+		name: "reopen-resets-identities",
+		expected: "renderer boundary reset sequences or identities",
+		reduce: (state, action) => {
+			const result = reduceTranscriptTransport(state, action)
+			if (action.type === "reopen")
+				result.state = { ...result.state, nextJobId: 0, nextSnapshotId: 0, sequences: new Map() }
+			return result
+		},
+	},
+	{
+		name: "late-completion-settles-live-send",
+		expected: "late completion changed live transport",
+		reduce: (state, action) =>
+			reduceTranscriptTransport(
+				state,
+				action.type === "settle" && state.inFlight ? { ...action, frame: state.inFlight } : action,
+			),
+	},
 	{
 		name: "stale-completion-starts-end",
 		expected: "post or commit initiated after invalidation",

@@ -102,7 +102,7 @@ import { getWorkspaceGitInfo } from "../../utils/git"
 import { getWorkspacePath } from "../../utils/path"
 import { OrganizationAllowListViolationError } from "../../utils/errors"
 
-import { setPanel } from "../../activate/registerCommands"
+import { getPanel, setPanel } from "../../activate/registerCommands"
 
 import { t } from "../../i18n"
 
@@ -187,6 +187,18 @@ type GetStateOptions = {
 	includeTaskHistory?: boolean
 }
 
+// Do not suspend a provider method on an editor-owned Promise: a dead renderer
+// can hold it forever. These result handlers retain neither provider nor payload.
+function ignorePostResult(): void {}
+
+function postToWebview(webview: vscode.Webview | undefined, message: ExtensionMessage): Promise<void> {
+	try {
+		return Promise.resolve(webview?.postMessage(message)).then(ignorePostResult, ignorePostResult)
+	} catch {
+		return Promise.resolve()
+	}
+}
+
 export class ClineProvider
 	extends EventEmitter<TaskProviderEvents>
 	implements vscode.WebviewViewProvider, TelemetryPropertiesProvider, TaskProviderLike
@@ -209,6 +221,7 @@ export class ClineProvider
 	>()
 	private nextThemeFixtureProbeId = 0
 	private view?: vscode.WebviewView | vscode.WebviewPanel
+	private webviewSession = 0
 	private taskRegistry = new TaskRegistry()
 	private taskScheduler = new TaskScheduler()
 	private static readonly delegationTransitionLocks = new Map<string, Promise<void>>()
@@ -824,6 +837,14 @@ export class ClineProvider
 	- https://github.com/microsoft/vscode-extension-samples/blob/main/webview-sample/src/extension.ts
 	*/
 	private clearWebviewResources() {
+		this.clineMessagesTransport.shutdown()
+		this._postStateToWebviewThrottled.cancel()
+		this.webviewSession++
+		if (this.view && getPanel() === this.view) {
+			setPanel(undefined, this.renderContext === "editor" ? "tab" : "sidebar")
+		}
+		this.view = undefined
+		this.isViewLaunched = false
 		this.rejectPendingThemeFixtureProbes(new Error("Webview was disposed before the theme fixture probe completed"))
 		while (this.webviewDisposables.length) {
 			const x = this.webviewDisposables.pop()
@@ -831,6 +852,8 @@ export class ClineProvider
 				x.dispose()
 			}
 		}
+		this.codeIndexStatusSubscription = undefined
+		this.codeIndexManager = undefined
 	}
 
 	/** Drain one task's memoized cleanup without preventing the remaining provider shutdown work. */
@@ -850,7 +873,11 @@ export class ClineProvider
 		}
 
 		this._disposed = true
-		this._postStateToWebviewThrottled.cancel()
+		let view = this.view
+		// Close renderer ownership before any task cleanup can await a held post.
+		this.clearWebviewResources()
+		if (view && "dispose" in view) view.dispose()
+		view = undefined
 		this.log("Disposing ClineProvider...")
 
 		// Reject any tasks still waiting for a scheduler permit so they don't
@@ -876,13 +903,6 @@ export class ClineProvider
 		// Clear all pending edit operations to prevent memory leaks
 		this.clearAllPendingEditOperations()
 		this.log("Cleared pending operations")
-
-		if (this.view && "dispose" in this.view) {
-			this.view.dispose()
-			this.log("Disposed webview")
-		}
-
-		this.clearWebviewResources()
 
 		// Clean up cloud service event listener
 		if (CloudService.hasInstance()) {
@@ -1029,8 +1049,35 @@ export class ClineProvider
 	}
 
 	async resolveWebviewView(webviewView: vscode.WebviewView | vscode.WebviewPanel) {
+		if (this._disposed) return
+		this.clearWebviewResources()
 		this.view = webviewView
+		const session = this.webviewSession
+		const isCurrentView = () => !this._disposed && this.webviewSession === session && this.view === webviewView
+		this.clineMessagesTransport.reopen(
+			() => this.getCurrentTask()?.taskId,
+			(message) => (isCurrentView() ? this.postMessageToWebview(message, webviewView) : Promise.resolve()),
+			(error) =>
+				this.log(
+					`[clineMessages] transport failure: ${error instanceof Error ? error.message : String(error)}`,
+				),
+			() => this.getCurrentTask()?.instanceId,
+		)
 		const inTabMode = "onDidChangeViewState" in webviewView
+		// Register before initialization yields. The listener belongs to this renderer,
+		// not the provider's lifetime, and a late old listener cannot close its successor.
+		this.webviewDisposables.push(
+			webviewView.onDidDispose(async () => {
+				if (!isCurrentView()) return
+				if (inTabMode) {
+					this.log("Disposing ClineProvider instance for tab view")
+					await this.dispose()
+				} else {
+					this.log("Clearing webview resources for sidebar view")
+					this.clearWebviewResources()
+				}
+			}),
+		)
 
 		if (inTabMode) {
 			setPanel(webviewView, "tab")
@@ -1051,11 +1098,13 @@ export class ClineProvider
 			localResourceRoots: resourceRoots,
 		}
 
-		webviewView.webview.html =
+		const html =
 			this.contextProxy.extensionMode === vscode.ExtensionMode.Development &&
 			process.env.ROO_CODE_THEME_FIXTURE_PROBE !== "1"
 				? await this.getHMRHtmlContent(webviewView.webview)
 				: await this.getHtmlContent(webviewView.webview)
+		if (!isCurrentView()) return
+		webviewView.webview.html = html
 
 		// Initialize out-of-scope variables that need to receive persistent
 		// global state values.
@@ -1073,6 +1122,7 @@ export class ClineProvider
 				ttsEnabled,
 				ttsSpeed,
 			}) => {
+				if (!isCurrentView()) return
 				Terminal.setShellIntegrationTimeout(terminalShellIntegrationTimeout)
 				Terminal.setShellIntegrationDisabled(terminalShellIntegrationDisabled)
 				Terminal.setCommandDelay(terminalCommandDelay)
@@ -1086,6 +1136,7 @@ export class ClineProvider
 				setTtsSpeed(ttsSpeed ?? 1)
 			},
 		)
+		if (!isCurrentView()) return
 
 		// Sets up an event listener to listen for messages passed from the webview view context
 		// and executes code based on the message that is received.
@@ -1098,7 +1149,7 @@ export class ClineProvider
 		// current workspace.
 		const activeEditorSubscription = vscode.window.onDidChangeActiveTextEditor(() => {
 			// Update subscription when workspace might have changed.
-			this.updateCodeIndexStatusSubscription()
+			if (isCurrentView()) this.updateCodeIndexStatusSubscription()
 		})
 		this.webviewDisposables.push(activeEditorSubscription)
 
@@ -1108,6 +1159,7 @@ export class ClineProvider
 			// WebviewView and WebviewPanel have all the same properties except
 			// for this visibility listener panel.
 			const viewStateDisposable = webviewView.onDidChangeViewState(() => {
+				if (!isCurrentView()) return
 				if (this.view?.visible) {
 					void this.postMessageToWebview({ type: "action", action: "didBecomeVisible" })
 				} else {
@@ -1119,6 +1171,7 @@ export class ClineProvider
 		} else if ("onDidChangeVisibility" in webviewView) {
 			// sidebar
 			const visibilityDisposable = webviewView.onDidChangeVisibility(() => {
+				if (!isCurrentView()) return
 				if (this.view?.visible) {
 					void this.postMessageToWebview({ type: "action", action: "didBecomeVisible" })
 				} else {
@@ -1129,29 +1182,12 @@ export class ClineProvider
 			this.webviewDisposables.push(visibilityDisposable)
 		}
 
-		// Listen for when the view is disposed
-		// This happens when the user closes the view or when the view is closed programmatically
-		webviewView.onDidDispose(
-			async () => {
-				if (inTabMode) {
-					this.log("Disposing ClineProvider instance for tab view")
-					await this.dispose()
-				} else {
-					this.log("Clearing webview resources for sidebar view")
-					this.clearWebviewResources()
-					// Reset current workspace manager reference when view is disposed
-					this.codeIndexManager = undefined
-				}
-			},
-			null,
-			this.disposables,
-		)
-
 		// Listen for when color changes
 		const configDisposable = vscode.workspace.onDidChangeConfiguration(async (e) => {
-			if (e && e.affectsConfiguration("workbench.colorTheme")) {
+			if (isCurrentView() && e && e.affectsConfiguration("workbench.colorTheme")) {
 				// Sends latest theme name to webview
-				await this.postMessageToWebview({ type: "theme", text: JSON.stringify(await getTheme()) })
+				const text = JSON.stringify(await getTheme())
+				if (isCurrentView()) await this.postMessageToWebview({ type: "theme", text }, webviewView)
 			}
 		})
 		this.webviewDisposables.push(configDisposable)
@@ -1162,6 +1198,7 @@ export class ClineProvider
 		if (!currentTask || currentTask.abandoned || currentTask.abort) {
 			await this.removeClineFromStack()
 		}
+		if (!isCurrentView()) return
 
 		// Ensure zoo-gateway profile is seeded for users who signed in before this feature existed.
 		// Without this, users with a valid cached token but no zoo-gateway profile would need to
@@ -1486,9 +1523,9 @@ export class ClineProvider
 		return task
 	}
 
-	public async postMessageToWebview(message: ExtensionMessage) {
-		if (this._disposed) {
-			return
+	public postMessageToWebview(message: ExtensionMessage, view = this.view): Promise<void> {
+		if (this._disposed || view !== this.view) {
+			return Promise.resolve()
 		}
 
 		if (message.type === "state" && message.state) {
@@ -1502,7 +1539,7 @@ export class ClineProvider
 				(message.state.currentTaskInstanceId !== undefined &&
 					message.state.currentTaskInstanceId !== (currentTask?.instanceId ?? null))
 			) {
-				return
+				return Promise.resolve()
 			}
 
 			// Browser webviews use the dedicated transcript transport below. The CLI
@@ -1518,11 +1555,7 @@ export class ClineProvider
 			}
 		}
 
-		try {
-			await this.view?.webview.postMessage(message)
-		} catch {
-			// View disposed, drop message silently
-		}
+		return postToWebview(view?.webview, message)
 	}
 
 	private invalidateClineMessagesTransport(): number {
@@ -1560,6 +1593,7 @@ export class ClineProvider
 	private postTranscript(
 		request: TranscriptRequest & ({ kind: "snapshot" } | { kind: "append" | "update"; message: ClineMessage }),
 	): Promise<void> {
+		if (this._disposed || this.clineMessagesTransport.closed) return Promise.resolve()
 		const currentTask = this.getCurrentTask()
 		// Every producer, including the legacy CLI path, must pass the same identity
 		// check before reading or cloning payloads from the focused task.
@@ -1579,6 +1613,7 @@ export class ClineProvider
 	}
 
 	public resyncClineMessagesToWebview(taskId?: string, expectedSeq?: unknown, receivedSeq?: unknown): Promise<void> {
+		if (this._disposed || this.clineMessagesTransport.closed) return Promise.resolve()
 		const currentTask = this.getCurrentTask()
 		const currentTaskId = currentTask?.taskId
 		if (currentTaskId !== taskId) {
@@ -1608,8 +1643,11 @@ export class ClineProvider
 	}
 
 	public async syncFocusedTaskToWebview(options: { includeTaskHistory?: boolean } = {}): Promise<void> {
+		if (this._disposed || this.clineMessagesTransport.closed) return
 		const currentTask = this.getCurrentTask()
+		const session = this.webviewSession
 		const generation = await this.publishFocusedTaskScope()
+		if (this.webviewSession !== session || this._disposed) return
 		if (options.includeTaskHistory) {
 			await this.postStateToWebview()
 		} else {
@@ -1849,8 +1887,11 @@ export class ClineProvider
 	 * @param webview A reference to the extension webview
 	 */
 	private setWebviewMessageListener(webview: vscode.Webview) {
-		const onReceiveMessage = async (message: WebviewMessage) =>
-			webviewMessageHandler(this, message, this.marketplaceManager)
+		const session = this.webviewSession
+		const onReceiveMessage = async (message: WebviewMessage) => {
+			if (this._disposed || this.webviewSession !== session) return
+			await webviewMessageHandler(this, message, this.marketplaceManager)
+		}
 
 		const messageDisposable = webview.onDidReceiveMessage(onReceiveMessage)
 		this.webviewDisposables.push(messageDisposable)
@@ -2571,7 +2612,9 @@ export class ClineProvider
 	}
 
 	async postStateToWebview() {
+		const session = this.webviewSession
 		const state = await this.getStateToPostToWebview()
+		if (this.webviewSession !== session) return
 		await this.postMessageToWebview({ type: "state", state })
 	}
 
@@ -2584,7 +2627,9 @@ export class ClineProvider
 	 *   `taskHistoryUpdated` / `taskHistoryItemUpdated`.
 	 */
 	async postStateToWebviewWithoutTaskHistory(): Promise<void> {
+		const session = this.webviewSession
 		const state = await this.getStateToPostToWebview({ includeTaskHistory: false })
+		if (this.webviewSession !== session) return
 		const { taskHistory: _omitHistory, ...metadataState } = state
 		await this.postMessageToWebview({ type: "state", state: metadataState })
 	}
